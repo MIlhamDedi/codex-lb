@@ -8,6 +8,10 @@ TLA_VERSION="v1.7.4"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/${TLA_VERSION}/tla2tools.jar"
 TLA2TOOLS_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
+# Each weakening must fail with the invariant it was built to demonstrate.
+# A "PROPERTY:<Name>" expectation means the weakening must keep every invariant
+# and instead violate that one named temporal property; the property name is
+# bound by asserting the config declares exactly that property.
 declare -A EXPECTED_VIOLATION=(
   ["weak-ignore-owner-epoch.cfg"]="Inv1AnchorCurrent"
   ["weak-single-shared-timeout.cfg"]="Inv2DeadlineOrdering"
@@ -19,6 +23,9 @@ declare -A EXPECTED_VIOLATION=(
   ["weak-shutdown-admit.cfg"]="Inv8ShutdownDrain"
   ["weak-leak-owner-on-terminal.cfg"]="Inv9TerminalOwnerReleased"
   ["weak-popped-not-finalized.cfg"]="Inv3ReservationSettledExactlyOnce"
+  ["weak-cross-account-anchor.cfg"]="Inv10AnchorAccountOwnership"
+  ["weak-conflated-timers.cfg"]="Inv11PreResponseBudget"
+  ["weak-unbounded-backoff.cfg"]="PROPERTY:TearEventuallyRecovers"
 )
 
 sha256() {
@@ -112,6 +119,40 @@ expect_weakening_fails() {
     echo "Weakening ${label} passed; expected ${expected} counterexample." >&2
     exit 1
   fi
+
+  if [[ "$expected" == PROPERTY:* ]]; then
+    local property declared
+    property="${expected#PROPERTY:}"
+    declared="$(sed -n '/^PROPERTY/,$p' "$cfg" | tail -n +2 | tr -d '[:space:]')"
+    if [[ "$declared" != "$property" ]]; then
+      echo "Weakening ${label} must declare exactly PROPERTY ${property}; found '${declared}'." >&2
+      exit 1
+    fi
+    if grep -qE 'Error: Invariant [A-Za-z0-9]+ is violated\.' "$out"; then
+      cat "$out"
+      echo "Weakening ${label} violated an invariant; expected only ${property}." >&2
+      exit 1
+    fi
+    if ! grep -q 'Error: Temporal properties were violated\.' "$out"; then
+      cat "$out"
+      echo "Weakening ${label} failed without a temporal-property violation." >&2
+      exit 1
+    fi
+    if ! grep -q 'Error: The following behavior constitutes a counter-example:' "$out"; then
+      cat "$out"
+      echo "Weakening ${label} failed without a TLC counterexample trace." >&2
+      exit 1
+    fi
+    distinct="$(state_count "$out")"
+    if [[ -z "$distinct" ]]; then
+      cat "$out"
+      echo "Could not parse weakening ${label} state count." >&2
+      exit 1
+    fi
+    echo "COUNTEREXAMPLE ${label}: Error: Temporal property ${property} is violated.; distinct states=${distinct}."
+    return
+  fi
+
   if ! grep -q 'Error: The behavior up to this point is:' "$out"; then
     cat "$out"
     echo "Weakening ${label} failed without a TLC counterexample trace." >&2

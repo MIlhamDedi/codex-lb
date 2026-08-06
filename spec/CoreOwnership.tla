@@ -5,8 +5,44 @@ CONSTANTS Replicas, Accounts, Turns, Weakening
 
 NoReplica == "no_replica"
 NoAccount == "no_account"
+ForeignAccount == "foreign_account"
 NoEpoch == 0
 MaxClock == 3
+
+(***************************************************************************)
+(* Named timeout budgets, expressed in model ticks.  These mirror the live  *)
+(* codex-lb settings pinned by the 2026-08-06 misclassification audit:      *)
+(*                                                                         *)
+(*   sse_keepalive_interval_seconds               -> KeepaliveInterval      *)
+(*   _STREAM_KEEPALIVE_MAX_COUNT                  -> MaxKeepaliveCount      *)
+(*   ..._bridge_stuck_gate_retire_after_seconds   -> GateRetireBudget       *)
+(*   stream_idle_timeout_seconds                  -> StreamIdleBudget       *)
+(*                                                                         *)
+(* The pre-response eventless bound is derived, not free.  Live it was an   *)
+(* implicit 6 * 10s = 60s that had no relation to any other budget and was  *)
+(* still reported under the 7200s stream-idle name.  The derivation modeled *)
+(* here is the shipped one: the pre-response bound is the minimum of the    *)
+(* named owner-side gate-retire and stream-idle budgets, floored by the     *)
+(* keepalive cadence, so it can never outlive the owner-side gate and can   *)
+(* never be confused with the post-start stream-idle budget.                *)
+(***************************************************************************)
+Min2(x, y) == IF x <= y THEN x ELSE y
+
+KeepaliveInterval == 1
+MaxKeepaliveCount == 2
+KeepaliveCadenceFloor == KeepaliveInterval * MaxKeepaliveCount
+GateRetireBudget == 2
+StreamIdleBudget == 3
+PreResponseBudget == Min2(GateRetireBudget, StreamIdleBudget)
+
+(***************************************************************************)
+(* Client retry backoff after a recoverable tear.  The full model assumes   *)
+(* bounded delay: the backoff never grows past MaxRetryBackoff, so a retry  *)
+(* is always eventually due.  RetryBackoffCap only keeps the weakened state *)
+(* space finite.                                                            *)
+(***************************************************************************)
+MaxRetryBackoff == 1
+RetryBackoffCap == 2
 
 WeakIgnoreOwnerEpoch == Weakening = "ignore_owner_epoch"
 WeakSingleTimeout == Weakening = "single_shared_timeout"
@@ -18,6 +54,9 @@ WeakShutdownAdmit == Weakening = "shutdown_admit"
 WeakDoubleSettle == Weakening = "double_settle"
 WeakLeakOwnerOnTerminal == Weakening = "leak_owner_on_terminal"
 WeakPoppedNotFinalized == Weakening = "popped_not_finalized"
+WeakCrossAccountAnchor == Weakening = "cross_account_anchor"
+WeakConflatedTimers == Weakening = "conflated_timers"
+WeakUnboundedBackoff == Weakening = "unbounded_backoff"
 
 TerminalStates == {"completed", "cancelled", "failed", "retryable_owner_loss"}
 NonTerminalStates == {"new", "queued", "active", "streaming", "completed_delivery_claimed"}
@@ -26,6 +65,9 @@ GateStates == {"none", "queued", "holding", "terminal"}
 AnchorKinds == {"none", "client_anchor", "proxy_full_resend_anchor", "proxy_delta_anchor"}
 SafeRecoveryKinds == {"client_anchor", "proxy_full_resend_anchor"}
 Reasons == {"none", "completed", "cancelled", "timeout", "owner_loss"}
+AnchorOwners == Accounts \cup {NoAccount, ForeignAccount}
+InjectionChoices == {NoAccount, ForeignAccount}
+RetryStates == {"attached", "torn", "recovered"}
 
 VARIABLES
   clock,
@@ -43,9 +85,13 @@ VARIABLES
   requestDeadline,
   connectDeadline,
   firstByteDeadline,
+  preResponseDeadline,
+  gateRetireDeadline,
+  mislabeledKill,
   anchor,
   anchorUsed,
   badAnchorUse,
+  crossAccountDispatch,
   durableVersion,
   snapshotVersion,
   routedWithStaleSnapshot,
@@ -59,14 +105,18 @@ VARIABLES
   completedDeliveryClaimed,
   finalizerOwner,
   finalizerAborted,
-  admittedDuringDrain
+  admittedDuringDrain,
+  clientRetry,
+  retryBackoff
 
 vars == << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount, turnEpoch,
   acquisitionCount, settlementCount, reservation, gate, gateDeadline, requestDeadline,
-  connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse, durableVersion,
+  connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+  mislabeledKill, anchor, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
   snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
   terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-  completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+  completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain,
+  clientRetry, retryBackoff >>
 
 Inc(n) == IF n < 2 THEN n + 1 ELSE n
 
@@ -92,10 +142,14 @@ Init ==
   /\ requestDeadline = [t \in Turns |-> 0]
   /\ connectDeadline = [t \in Turns |-> 0]
   /\ firstByteDeadline = [t \in Turns |-> 0]
+  /\ preResponseDeadline = [t \in Turns |-> 0]
+  /\ gateRetireDeadline = [t \in Turns |-> 0]
+  /\ mislabeledKill = FALSE
   /\ anchor = [t \in Turns |->
       [kind |-> "none", account |-> NoAccount, epoch |-> NoEpoch, lineageOk |-> TRUE]]
   /\ anchorUsed = [t \in Turns |-> FALSE]
   /\ badAnchorUse = FALSE
+  /\ crossAccountDispatch = FALSE
   /\ durableVersion = [a \in Accounts |-> 0]
   /\ snapshotVersion = [r \in Replicas |-> [a \in Accounts |-> 0]]
   /\ routedWithStaleSnapshot = [t \in Turns |-> FALSE]
@@ -110,6 +164,8 @@ Init ==
   /\ finalizerOwner = [t \in Turns |-> NoReplica]
   /\ finalizerAborted = [t \in Turns |-> FALSE]
   /\ admittedDuringDrain = FALSE
+  /\ clientRetry = "attached"
+  /\ retryBackoff = 0
 
 LiveOnAccount(a) ==
   {t \in Turns : turnState[t] \in {"active", "streaming", "completed_delivery_claimed"} /\ turnAccount[t] = a}
@@ -117,15 +173,60 @@ LiveOnAccount(a) ==
 CanAdmit ==
   (shutdownPhase = "running" \/ WeakShutdownAdmit)
 
+(***************************************************************************)
+(* Anchor account ownership.  A continuity anchor carries the account that  *)
+(* owns it.  Upstream accepts a request that injects a previous_response_id *)
+(* owned by another account, but it then never emits response.created, so   *)
+(* the turn sits in the pre-response eventless phase until a timer kills    *)
+(* it.  UpstreamRespondsTo is exactly that: upstream only produces the      *)
+(* created/streaming/completed events for a same-account anchor.            *)
+(***************************************************************************)
+UpstreamRespondsTo(t) ==
+  \/ anchor[t].kind = "none"
+  \/ anchor[t].account = turnAccount[t]
+
+(***************************************************************************)
+(* A dispatch may inject a durable continuity anchor owned by another       *)
+(* account.  Like MisrouteProducer, the injection itself is only reachable  *)
+(* under its weakening: the full model refuses it at AcquireTurn.  Anchors  *)
+(* owned by the serving account are produced by StartStream and shown       *)
+(* usable by UseAnchor, so the guard is not vacuous.                        *)
+(***************************************************************************)
+ForeignAnchor ==
+  [kind |-> "client_anchor",
+   account |-> ForeignAccount,
+   epoch |-> NoEpoch,
+   lineageOk |-> TRUE]
+
+(***************************************************************************)
+(* Two distinct eventless timers.  The pre-response phase (turnState        *)
+(* "active": request dispatched upstream, no response.created yet) is       *)
+(* bounded by preResponseDeadline.  The post-start phase (turnState         *)
+(* "streaming") is bounded by the request/stream-idle budget.  Conflating   *)
+(* them means a pre-start kill is reported under the post-start budget.     *)
+(***************************************************************************)
+ExpireBoundFor(t) ==
+  CASE turnState[t] = "queued" -> gateDeadline[t]
+    [] turnState[t] = "active" -> preResponseDeadline[t]
+    [] OTHER -> requestDeadline[t]
+
+KillBudgetFor(t) ==
+  CASE turnState[t] = "queued" -> "gate"
+    [] turnState[t] = "active" ->
+         IF WeakConflatedTimers THEN "stream_idle" ELSE "pre_response_eventless"
+    [] OTHER -> "stream_idle"
+
 Tick ==
   /\ clock < MaxClock
   /\ clock' = clock + 1
   /\ UNCHANGED << owner, ownerEpoch, turnState, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, settlementCount, reservation, gate, gateDeadline, requestDeadline,
-    connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse, durableVersion,
+    connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+    mislabeledKill, anchor, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
     terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain,
+    clientRetry, retryBackoff >>
 
 QueueTurn(t) ==
   /\ clock = 0
@@ -134,23 +235,30 @@ QueueTurn(t) ==
   /\ turnState' = [turnState EXCEPT ![t] = "queued"]
   /\ gate' = [gate EXCEPT ![t] = "queued"]
   /\ gateDeadline' = [gateDeadline EXCEPT ![t] = IF WeakSingleTimeout THEN 4 ELSE 3]
-  /\ requestDeadline' = [requestDeadline EXCEPT ![t] = 3]
+  /\ requestDeadline' = [requestDeadline EXCEPT ![t] = StreamIdleBudget]
   /\ connectDeadline' = [connectDeadline EXCEPT ![t] = IF WeakSingleTimeout THEN 3 ELSE 1]
   /\ firstByteDeadline' = [firstByteDeadline EXCEPT ![t] = 2]
+  /\ preResponseDeadline' = [preResponseDeadline EXCEPT ![t] = PreResponseBudget]
+  /\ gateRetireDeadline' = [gateRetireDeadline EXCEPT ![t] = GateRetireBudget]
   /\ registered' = [registered EXCEPT ![t] = TRUE]
   /\ admittedDuringDrain' = (admittedDuringDrain \/ shutdownPhase # "running")
   /\ UNCHANGED << clock, owner, ownerEpoch, turnReplica, turnAccount, turnEpoch,
-    acquisitionCount, settlementCount, reservation, anchor, anchorUsed, badAnchorUse,
-    durableVersion, snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted,
-    producerTarget, terminalReason, shutdownPhase, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted >>
+    acquisitionCount, settlementCount, reservation, mislabeledKill, anchor, anchorUsed,
+    badAnchorUse, crossAccountDispatch, durableVersion, snapshotVersion,
+    routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget, terminalReason,
+    shutdownPhase, ownerReleased, poppedFromPending, completedDeliveryClaimed,
+    finalizerOwner, finalizerAborted, clientRetry, retryBackoff >>
 
-AcquireTurn(t, r, a) ==
+AcquireTurn(t, r, a, inj) ==
   /\ turnState[t] = "queued"
   /\ r \in Replicas
   /\ a \in Accounts
+  /\ inj \in InjectionChoices
   /\ (owner[a] = NoReplica \/ WeakNonAtomicClaim)
   /\ (WeakNonAtomicClaim \/ LiveOnAccount(a) = {})
+  /\ (inj = NoAccount \/ WeakCrossAccountAnchor)
+  /\ crossAccountDispatch' = (crossAccountDispatch \/ inj # NoAccount)
+  /\ anchor' = [anchor EXCEPT ![t] = IF inj = NoAccount THEN @ ELSE ForeignAnchor]
   /\ owner' = [owner EXCEPT ![a] = r]
   /\ ownerEpoch' = [ownerEpoch EXCEPT ![a] = @ + 1]
   /\ turnState' = [turnState EXCEPT ![t] = "active"]
@@ -161,23 +269,27 @@ AcquireTurn(t, r, a) ==
   /\ reservation' = [reservation EXCEPT ![t] = "held"]
   /\ gate' = [gate EXCEPT ![t] = "holding"]
   /\ UNCHANGED << clock, settlementCount, gateDeadline, requestDeadline, connectDeadline,
-    firstByteDeadline, anchor, anchorUsed, badAnchorUse, durableVersion, snapshotVersion,
-    routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget, terminalReason,
-    shutdownPhase, registered, ownerReleased, poppedFromPending, completedDeliveryClaimed,
-    finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    firstByteDeadline, preResponseDeadline, gateRetireDeadline, mislabeledKill, anchorUsed,
+    badAnchorUse, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, producerTarget, terminalReason, shutdownPhase, registered,
+    ownerReleased, poppedFromPending, completedDeliveryClaimed, finalizerOwner,
+    finalizerAborted, admittedDuringDrain, clientRetry, retryBackoff >>
 
 StartStream(t, k) ==
   /\ turnState[t] = "active"
+  /\ UpstreamRespondsTo(t)
   /\ k \in AnchorKinds \ {"none"}
   /\ turnState' = [turnState EXCEPT ![t] = "streaming"]
   /\ anchor' = [anchor EXCEPT ![t] =
       [kind |-> k, account |-> turnAccount[t], epoch |-> turnEpoch[t], lineageOk |-> TRUE]]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, settlementCount, reservation, gate, gateDeadline, requestDeadline,
-    connectDeadline, firstByteDeadline, anchorUsed, badAnchorUse, durableVersion,
+    connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+    mislabeledKill, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
     terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain,
+    clientRetry, retryBackoff >>
 
 AnchorSafe(t) ==
   /\ anchor[t].kind \in SafeRecoveryKinds
@@ -194,10 +306,12 @@ UseAnchor(t) ==
   /\ badAnchorUse' = (badAnchorUse \/ ~AnchorSafe(t))
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, durableVersion,
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
     terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain,
+    clientRetry, retryBackoff >>
 
 OwnerLoss(t) ==
   /\ turnState[t] \in {"active", "streaming", "completed_delivery_claimed"}
@@ -218,13 +332,16 @@ OwnerLoss(t) ==
        /\ ownerReleased' = [ownerReleased EXCEPT ![t] = TRUE]
        /\ finalizerOwner' = [finalizerOwner EXCEPT ![t] = NoReplica]
   /\ UNCHANGED << clock, turnReplica, turnAccount, turnEpoch, acquisitionCount,
-    gateDeadline, requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed,
-    badAnchorUse, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    gateDeadline, requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
     snapshotRouteAttempted, producerTarget, shutdownPhase, poppedFromPending,
-    completedDeliveryClaimed, finalizerAborted, admittedDuringDrain >>
+    completedDeliveryClaimed, finalizerAborted, admittedDuringDrain, clientRetry,
+    retryBackoff >>
 
 CompleteTurn(t) ==
   /\ turnState[t] \in {"active", "streaming"}
+  /\ UpstreamRespondsTo(t)
   /\ turnState' = [turnState EXCEPT ![t] = "completed"]
   /\ settlementCount' = [settlementCount EXCEPT ![t] = Inc(@)]
   /\ reservation' = [reservation EXCEPT ![t] = "finalized"]
@@ -235,13 +352,15 @@ CompleteTurn(t) ==
   /\ owner' = IF WeakLeakOwnerOnTerminal THEN owner ELSE ReleaseOwnerFor(t)
   /\ UNCHANGED << clock, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, gateDeadline, requestDeadline, connectDeadline, firstByteDeadline,
-    anchor, anchorUsed, badAnchorUse, durableVersion, snapshotVersion,
+    preResponseDeadline, gateRetireDeadline, mislabeledKill, anchor, anchorUsed,
+    badAnchorUse, crossAccountDispatch, durableVersion, snapshotVersion,
     routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget, shutdownPhase,
     poppedFromPending, completedDeliveryClaimed, finalizerOwner, finalizerAborted,
-    admittedDuringDrain >>
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 ClaimCompletedDelivery(t) ==
   /\ turnState[t] \in {"active", "streaming"}
+  /\ UpstreamRespondsTo(t)
   /\ turnReplica[t] \in Replicas
   /\ turnState' = [turnState EXCEPT ![t] = "completed_delivery_claimed"]
   /\ poppedFromPending' = [poppedFromPending EXCEPT ![t] = TRUE]
@@ -249,10 +368,11 @@ ClaimCompletedDelivery(t) ==
   /\ finalizerOwner' = [finalizerOwner EXCEPT ![t] = turnReplica[t]]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, settlementCount, reservation, gate, gateDeadline, requestDeadline,
-    connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse, durableVersion,
+    connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+    mislabeledKill, anchor, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
     terminalReason, shutdownPhase, registered, ownerReleased, finalizerAborted,
-    admittedDuringDrain >>
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 FinalizeCompletedDelivery(t) ==
   /\ turnState[t] = "completed_delivery_claimed"
@@ -268,9 +388,11 @@ FinalizeCompletedDelivery(t) ==
   /\ finalizerOwner' = [finalizerOwner EXCEPT ![t] = NoReplica]
   /\ UNCHANGED << clock, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, gateDeadline, requestDeadline, connectDeadline, firstByteDeadline,
-    anchor, anchorUsed, badAnchorUse, durableVersion, snapshotVersion,
+    preResponseDeadline, gateRetireDeadline, mislabeledKill, anchor, anchorUsed,
+    badAnchorUse, crossAccountDispatch, durableVersion, snapshotVersion,
     routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget, shutdownPhase,
-    poppedFromPending, completedDeliveryClaimed, finalizerAborted, admittedDuringDrain >>
+    poppedFromPending, completedDeliveryClaimed, finalizerAborted, admittedDuringDrain,
+    clientRetry, retryBackoff >>
 
 AbortCompletedDelivery(t) ==
   /\ WeakPoppedNotFinalized
@@ -283,10 +405,11 @@ AbortCompletedDelivery(t) ==
   /\ finalizerAborted' = [finalizerAborted EXCEPT ![t] = TRUE]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, settlementCount, reservation, gateDeadline, requestDeadline,
-    connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse, durableVersion,
+    connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+    mislabeledKill, anchor, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
     shutdownPhase, ownerReleased, poppedFromPending, completedDeliveryClaimed,
-    admittedDuringDrain >>
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 CancelTurn(t) ==
   /\ turnState[t] \in {"queued", "active", "streaming", "completed_delivery_claimed"}
@@ -306,14 +429,20 @@ CancelTurn(t) ==
   /\ finalizerOwner' = [finalizerOwner EXCEPT ![t] = NoReplica]
   /\ UNCHANGED << clock, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, gateDeadline, requestDeadline, connectDeadline, firstByteDeadline,
-    anchor, anchorUsed, badAnchorUse, durableVersion, snapshotVersion,
+    preResponseDeadline, gateRetireDeadline, mislabeledKill, anchor, anchorUsed,
+    badAnchorUse, crossAccountDispatch, durableVersion, snapshotVersion,
     routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget, shutdownPhase,
-    poppedFromPending, completedDeliveryClaimed, finalizerAborted, admittedDuringDrain >>
+    poppedFromPending, completedDeliveryClaimed, finalizerAborted, admittedDuringDrain,
+    clientRetry, retryBackoff >>
 
 ExpireDeadline(t) ==
   /\ turnState[t] \in {"queued", "active", "streaming"}
-  /\ clock >= IF turnState[t] = "queued" THEN gateDeadline[t] ELSE requestDeadline[t]
+  /\ clock >= ExpireBoundFor(t)
   /\ turnState' = [turnState EXCEPT ![t] = "failed"]
+  /\ mislabeledKill' =
+      (mislabeledKill \/ (KillBudgetFor(t) = "stream_idle" /\ turnState[t] # "streaming"))
+  /\ clientRetry' =
+      IF turnState[t] = "active" /\ clientRetry = "attached" THEN "torn" ELSE clientRetry
   /\ settlementCount' = [settlementCount EXCEPT ![t] =
       IF reservation[t] = "held" THEN Inc(@) ELSE @]
   /\ reservation' = [reservation EXCEPT ![t] =
@@ -327,9 +456,45 @@ ExpireDeadline(t) ==
   /\ finalizerOwner' = [finalizerOwner EXCEPT ![t] = NoReplica]
   /\ UNCHANGED << clock, ownerEpoch, turnReplica, turnAccount, turnEpoch,
     acquisitionCount, gateDeadline, requestDeadline, connectDeadline, firstByteDeadline,
-    anchor, anchorUsed, badAnchorUse, durableVersion, snapshotVersion,
-    routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget, shutdownPhase,
-    poppedFromPending, completedDeliveryClaimed, finalizerAborted, admittedDuringDrain >>
+    preResponseDeadline, gateRetireDeadline, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, producerTarget, shutdownPhase, poppedFromPending,
+    completedDeliveryClaimed, finalizerAborted, admittedDuringDrain, retryBackoff >>
+
+(***************************************************************************)
+(* Client recovery after a recoverable tear.  GrowRetryBackoff is the       *)
+(* client sleeping longer between reconnects; ClientRetryAttempt is the     *)
+(* reconnect that repairs the session.  The bounded-delay assumption is the *)
+(* guard retryBackoff <= MaxRetryBackoff on ClientRetryAttempt: while the   *)
+(* backoff stays inside its bound the retry is always eventually due.       *)
+(***************************************************************************)
+GrowRetryBackoff ==
+  /\ clientRetry = "torn"
+  /\ retryBackoff < RetryBackoffCap
+  /\ (retryBackoff < MaxRetryBackoff \/ WeakUnboundedBackoff)
+  /\ retryBackoff' = retryBackoff + 1
+  /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
+    turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, producerTarget, terminalReason, shutdownPhase, registered,
+    ownerReleased, poppedFromPending, completedDeliveryClaimed, finalizerOwner,
+    finalizerAborted, admittedDuringDrain, clientRetry >>
+
+ClientRetryAttempt ==
+  /\ clientRetry = "torn"
+  /\ retryBackoff <= MaxRetryBackoff
+  /\ clientRetry' = "recovered"
+  /\ retryBackoff' = 0
+  /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
+    turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, producerTarget, terminalReason, shutdownPhase, registered,
+    ownerReleased, poppedFromPending, completedDeliveryClaimed, finalizerOwner,
+    finalizerAborted, admittedDuringDrain >>
 
 DuplicateSettlement(t) ==
   /\ WeakDoubleSettle
@@ -339,10 +504,12 @@ DuplicateSettlement(t) ==
   /\ settlementCount' = [settlementCount EXCEPT ![t] = Inc(@)]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, reservation, gate, gateDeadline, requestDeadline,
-    connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse, durableVersion,
+    connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+    mislabeledKill, anchor, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
     terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain,
+    clientRetry, retryBackoff >>
 
 InvalidateQuota(a) ==
   /\ a \in Accounts
@@ -350,10 +517,12 @@ InvalidateQuota(a) ==
   /\ durableVersion' = [durableVersion EXCEPT ![a] = @ + 1]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse,
-    snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
-    terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted,
+    producerTarget, terminalReason, shutdownPhase, registered, ownerReleased,
+    poppedFromPending, completedDeliveryClaimed, finalizerOwner, finalizerAborted,
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 RefreshSnapshot(r, a) ==
   /\ r \in Replicas
@@ -361,10 +530,12 @@ RefreshSnapshot(r, a) ==
   /\ snapshotVersion' = [snapshotVersion EXCEPT ![r][a] = durableVersion[a]]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse,
-    durableVersion, routedWithStaleSnapshot, snapshotRouteAttempted, producerTarget,
-    terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, routedWithStaleSnapshot, snapshotRouteAttempted,
+    producerTarget, terminalReason, shutdownPhase, registered, ownerReleased,
+    poppedFromPending, completedDeliveryClaimed, finalizerOwner, finalizerAborted,
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 RouteFromSnapshot(t, r, a) ==
   /\ turnState[t] = "queued"
@@ -376,10 +547,11 @@ RouteFromSnapshot(t, r, a) ==
       snapshotVersion[r][a] < durableVersion[a]]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse,
-    durableVersion, snapshotVersion, producerTarget, terminalReason, shutdownPhase,
-    registered, ownerReleased, poppedFromPending, completedDeliveryClaimed, finalizerOwner,
-    finalizerAborted, admittedDuringDrain >>
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, producerTarget, terminalReason,
+    shutdownPhase, registered, ownerReleased, poppedFromPending, completedDeliveryClaimed,
+    finalizerOwner, finalizerAborted, admittedDuringDrain, clientRetry, retryBackoff >>
 
 MisrouteProducer(t, u) ==
   /\ t \in Turns
@@ -391,20 +563,24 @@ MisrouteProducer(t, u) ==
   /\ producerTarget' = [producerTarget EXCEPT ![t] = u]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse,
-    durableVersion, snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted,
-    terminalReason, shutdownPhase, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, terminalReason, shutdownPhase, registered, ownerReleased,
+    poppedFromPending, completedDeliveryClaimed, finalizerOwner, finalizerAborted,
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 StartDrain ==
   /\ shutdownPhase = "running"
   /\ shutdownPhase' = "draining"
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse,
-    durableVersion, snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted,
-    producerTarget, terminalReason, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, producerTarget, terminalReason, registered, ownerReleased,
+    poppedFromPending, completedDeliveryClaimed, finalizerOwner, finalizerAborted,
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 CompleteShutdown ==
   /\ shutdownPhase = "draining"
@@ -412,10 +588,12 @@ CompleteShutdown ==
   /\ shutdownPhase' = "complete"
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, anchor, anchorUsed, badAnchorUse,
-    durableVersion, snapshotVersion, routedWithStaleSnapshot, snapshotRouteAttempted,
-    producerTarget, terminalReason, registered, ownerReleased, poppedFromPending,
-    completedDeliveryClaimed, finalizerOwner, finalizerAborted, admittedDuringDrain >>
+    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline,
+    gateRetireDeadline, mislabeledKill, anchor, anchorUsed, badAnchorUse,
+    crossAccountDispatch, durableVersion, snapshotVersion, routedWithStaleSnapshot,
+    snapshotRouteAttempted, producerTarget, terminalReason, registered, ownerReleased,
+    poppedFromPending, completedDeliveryClaimed, finalizerOwner, finalizerAborted,
+    admittedDuringDrain, clientRetry, retryBackoff >>
 
 Quiesce ==
   /\ shutdownPhase = "complete"
@@ -425,7 +603,8 @@ Quiesce ==
 Next ==
   \/ Tick
   \/ \E t \in Turns : QueueTurn(t)
-  \/ \E t \in Turns, r \in Replicas, a \in Accounts : AcquireTurn(t, r, a)
+  \/ \E t \in Turns, r \in Replicas, a \in Accounts, inj \in InjectionChoices :
+       AcquireTurn(t, r, a, inj)
   \/ \E t \in Turns, k \in AnchorKinds \ {"none"} : StartStream(t, k)
   \/ \E t \in Turns : UseAnchor(t)
   \/ \E t \in Turns : OwnerLoss(t)
@@ -440,6 +619,8 @@ Next ==
   \/ \E r \in Replicas, a \in Accounts : RefreshSnapshot(r, a)
   \/ \E t \in Turns, r \in Replicas, a \in Accounts : RouteFromSnapshot(t, r, a)
   \/ \E t \in Turns, u \in Turns : MisrouteProducer(t, u)
+  \/ GrowRetryBackoff
+  \/ ClientRetryAttempt
   \/ StartDrain
   \/ CompleteShutdown
   \/ Quiesce
@@ -450,6 +631,7 @@ Spec ==
   /\ WF_vars(Tick)
   /\ \A t \in Turns : WF_vars(ExpireDeadline(t))
   /\ \A t \in Turns : WF_vars(FinalizeCompletedDelivery(t))
+  /\ WF_vars(ClientRetryAttempt)
   /\ WF_vars(CompleteShutdown)
 
 TypeInvariant ==
@@ -468,12 +650,16 @@ TypeInvariant ==
   /\ requestDeadline \in [Turns -> Nat]
   /\ connectDeadline \in [Turns -> Nat]
   /\ firstByteDeadline \in [Turns -> Nat]
+  /\ preResponseDeadline \in [Turns -> Nat]
+  /\ gateRetireDeadline \in [Turns -> Nat]
+  /\ mislabeledKill \in BOOLEAN
   /\ anchor \in [Turns -> [kind : AnchorKinds,
-                           account : Accounts \cup {NoAccount},
+                           account : AnchorOwners,
                            epoch : Nat,
                            lineageOk : BOOLEAN]]
   /\ anchorUsed \in [Turns -> BOOLEAN]
   /\ badAnchorUse \in BOOLEAN
+  /\ crossAccountDispatch \in BOOLEAN
   /\ durableVersion \in [Accounts -> Nat]
   /\ snapshotVersion \in [Replicas -> [Accounts -> Nat]]
   /\ routedWithStaleSnapshot \in [Turns -> BOOLEAN]
@@ -488,6 +674,8 @@ TypeInvariant ==
   /\ finalizerOwner \in [Turns -> Replicas \cup {NoReplica}]
   /\ finalizerAborted \in [Turns -> BOOLEAN]
   /\ admittedDuringDrain \in BOOLEAN
+  /\ clientRetry \in RetryStates
+  /\ retryBackoff \in 0..RetryBackoffCap
 
 Inv1AnchorCurrent ==
   badAnchorUse = FALSE
@@ -544,10 +732,44 @@ Inv9TerminalOwnerReleased ==
       /\ ownerEpoch[turnAccount[t]] = turnEpoch[t] => owner[turnAccount[t]] = NoReplica
       /\ finalizerOwner[t] = NoReplica
 
+(***************************************************************************)
+(* Inv10: a request never dispatches with a foreign-owned continuity        *)
+(* anchor.  Upstream accepts such a request and then never emits            *)
+(* response.created, so the turn can only leave the pre-response phase      *)
+(* through a timer or a cancel: the wedge.                                  *)
+(***************************************************************************)
+Inv10AnchorAccountOwnership ==
+  /\ crossAccountDispatch = FALSE
+  /\ \A t \in Turns :
+       (turnState[t] # "new" /\ anchor[t].kind # "none") =>
+         anchor[t].account = turnAccount[t]
+
+(***************************************************************************)
+(* Inv11: the pre-response eventless phase has its own bound, derived from  *)
+(* the named keepalive budgets, ordered against the owner-side gate-retire  *)
+(* bound and strictly separate from the post-start stream-idle bound.  The  *)
+(* last conjunct is the behavioural half: no kill may be reported under the *)
+(* post-start stream-idle budget while the response had not started.        *)
+(***************************************************************************)
+Inv11PreResponseBudget ==
+  /\ \A t \in Turns :
+       turnState[t] # "new" =>
+         /\ preResponseDeadline[t] = Min2(gateRetireDeadline[t], requestDeadline[t])
+         /\ preResponseDeadline[t] >= KeepaliveCadenceFloor
+         /\ preResponseDeadline[t] < requestDeadline[t]
+  /\ mislabeledKill = FALSE
+
 TurnTermination ==
   \A t \in Turns : (turnState[t] # "new") ~> (turnState[t] \in TerminalStates)
 
 ShutdownEventuallyComplete ==
   shutdownPhase = "draining" ~> shutdownPhase = "complete"
+
+(***************************************************************************)
+(* A recoverable tear must eventually be recovered by the client.  This     *)
+(* holds only under the bounded-delay assumption on the retry backoff.      *)
+(***************************************************************************)
+TearEventuallyRecovers ==
+  (clientRetry = "torn") ~> (clientRetry = "recovered")
 
 =============================================================================
