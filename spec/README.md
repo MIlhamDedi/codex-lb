@@ -24,7 +24,8 @@ kills them under three different budgets:
 
 - `queued` - waiting at the admission gate (`gateDeadline`).
 - `active` - request dispatched upstream, `response.created` not seen yet.
-  This is the **pre-response eventless phase** (`preResponseDeadline`).
+  This is the **pre-response eventless phase** (`preResponseDeadline`), and its
+  phase resets still consume the same request budget.
 - `streaming` - response started, incremental events flowing
   (`requestDeadline`, i.e. the stream-idle/request budget).
 
@@ -39,10 +40,10 @@ kills them under three different budgets:
   the `-deadlock` opt-out, so TLC deadlock checking stays enabled.
 - `weak-*.cfg` - negative controls that set one weakening flag at a time.
 - `check.sh` - verifies the pinned `tla2tools.jar` sha256, downloads through a
-  temporary file before replacing the cache, runs the full model, then runs all
-  weakenings and requires each one to fail with its mapped invariant name (or,
-  for a liveness control, with its mapped temporal property and no invariant
-  violation at all).
+  temporary file before replacing the cache, runs the full model under a
+  wall-clock budget, then runs all weakenings and requires each one to fail
+  with its mapped invariant name (or, for a liveness control, with its mapped
+  temporal property and no invariant violation at all).
 - `evidence/TAXONOMY.md` and `evidence/taxonomy.csv` - taxonomy inputs used to
   classify the historical bug exemplars.
 
@@ -50,17 +51,17 @@ kills them under three different budgets:
 
 | Invariant | Requirement | Demonstrating action / weakening |
 | --- | --- | --- |
-| `Inv1AnchorCurrent` | Anchor use requires current owner epoch, compatible lineage, and safe provenance. | `UseAnchor` records `badAnchorUse`; `weak-ignore-owner-epoch.cfg` demonstrates stale anchor reuse can violate it. |
-| `Inv2DeadlineOrdering` | Connect, first-byte, gate, and request deadlines remain ordered under the original request deadline. | `QueueTurn` assigns phase deadlines; `weak-single-shared-timeout.cfg` demonstrates a shared timeout can violate ordering. |
+| `Inv1AnchorCurrent` | Anchor use requires current owner epoch, compatible lineage, and safe provenance. | `UseAnchor` records `badAnchorUse` and fires at most once per anchor value; `AcquireTurn` can inject a mismatched-lineage anchor that is current and same-account in every other respect, so the lineage conjunct has a distinguishing input. `weak-ignore-owner-epoch.cfg` demonstrates stale anchor reuse and `weak-ignore-anchor-lineage.cfg` demonstrates incompatible-lineage reuse. |
+| `Inv2DeadlineOrdering` | Connect, first-byte, gate, and request deadlines remain ordered under the original request deadline, with later active-phase deadlines clamped to the remaining request budget before each phase reset. | `QueueTurn` assigns phase deadlines and the active-phase transitions clamp them after elapsed wait; `weak-single-shared-timeout.cfg` demonstrates a shared timeout can violate ordering. |
 | `Inv3ReservationSettledExactlyOnce` | Every acquired terminal turn has exactly one settlement event and a settled reservation state. | `CompleteTurn`, `CancelTurn`, `ExpireDeadline`, and `FinalizeCompletedDelivery` increment `settlementCount`; `weak-skip-release-on-cancel.cfg`, `weak-double-settle.cfg`, and `weak-popped-not-finalized.cfg` demonstrate zero, double, and lost-finalizer failures. |
-| `Inv4FreshSnapshots` | Routing cannot use a local snapshot behind durable freshness evidence. | Normal `RouteFromSnapshot` consumes a fresh snapshot; `weak-stale-cache.cfg` removes the freshness guard. |
-| `Inv5SingleOwnerCAS` | Singleton/account work mutates under a single durable owner epoch. | `AcquireTurn` enforces empty durable ownership and no live turn on the same account; `weak-non-atomic-claim.cfg` demonstrates duplicate live owners. |
+| `Inv4FreshSnapshots` | Routing cannot use a local snapshot behind durable freshness evidence. | Normal `RouteFromSnapshot` consumes a fresh snapshot and records the routed replica/account; `AcquireTurn` is only enabled for that recorded pair, so every dispatch is freshness-gated rather than optionally so. `weak-stale-cache.cfg` removes the freshness guard. |
+| `Inv5SingleOwnerCAS` | Singleton/account work mutates under a single durable owner epoch, and the live turn is the replica/epoch that durable row names. | `AcquireTurn` enforces empty durable ownership and no live turn on the same account; the invariant also pins each live turn's replica and epoch to `owner`/`ownerEpoch`, so reassigning the durable owner under a live turn is a violation rather than an unchecked state. `weak-non-atomic-claim.cfg` demonstrates duplicate live owners. |
 | `Inv6TerminalIsolation` | Terminal or cancelled producers cannot enqueue into later turns, and terminal reason is present. | `MisrouteProducer` is disabled in the full model; `weak-lost-waiter.cfg` demonstrates terminal producer contamination. |
 | `Inv7GateAccounting` | Every gate waiter is exactly queued, holding, or terminal and keeps the inherited deadline. | `QueueTurn`, `AcquireTurn`, and terminal actions preserve the gate lattice; `weak-lost-waiter.cfg` demonstrates a dropped queued waiter. |
 | `Inv8ShutdownDrain` | Draining forbids admission of new externally visible work and shutdown completion requires no registered work. | `QueueTurn` is gated by `CanAdmit`; `weak-shutdown-admit.cfg` demonstrates post-drain admission. |
 | `Inv9TerminalOwnerReleased` | Every acquired terminal turn releases the durable owner slot and finalizer owner. | Terminal actions call epoch-fenced release; `weak-leak-owner-on-terminal.cfg` demonstrates a leaked owner lease. |
 | `Inv10AnchorAccountOwnership` | A request never dispatches with a continuity anchor owned by a different account, and no turn past admission carries a foreign-owned anchor. | `AcquireTurn` refuses a foreign-owned injected anchor (the injection is weakening-only, like `MisrouteProducer`) and records `crossAccountDispatch`; same-account anchors still come from `StartStream` and are shown usable by `UseAnchor`, so the guard is not vacuous. `UpstreamRespondsTo` makes `response.created`/`response.completed` unreachable for a foreign anchor, so the weakened turn wedges in the pre-response phase. `weak-cross-account-anchor.cfg` demonstrates it. |
-| `Inv11PreResponseBudget` | The pre-response eventless bound is derived from the named budgets - it is the minimum of the owner-side gate-retire and stream-idle budgets, at or above the keepalive cadence floor, and strictly below the post-start stream-idle budget - and no kill is ever reported under the post-start stream-idle budget while the response had not started. | `QueueTurn` assigns `preResponseDeadline`/`gateRetireDeadline` from named budgets; `ExpireDeadline` picks its bound and its budget label per phase and records `mislabeledKill`; `weak-conflated-timers.cfg` demonstrates a single shared timer name killing a healthy pre-start wait under the wrong budget. |
+| `Inv11PreResponseBudget` | The pre-response eventless bound is derived from the named budgets - it is the minimum of the owner-side gate-retire and stream-idle budgets, stays at or above the keepalive cadence floor until earlier active waits have consumed part of the request budget, and no kill is ever reported under the post-start stream-idle budget while the response had not started. | `QueueTurn` assigns `preResponseDeadline`/`gateRetireDeadline` from named budgets; the active-phase transitions clamp carried budget after every elapsed wait before resetting phase time; `ExpireDeadline` picks its bound and its budget label per phase and records `mislabeledKill`; `weak-conflated-timers.cfg` demonstrates a single shared timer name killing a healthy pre-start wait under the wrong budget. |
 
 The full configuration also checks natural liveness properties:
 
@@ -85,7 +86,8 @@ or if its config does not declare exactly the mapped temporal property.
 
 | Config | Disabled guard | Expected violation | Taxonomy class | Exemplar SHAs / live evidence |
 | --- | --- | --- | --- | --- |
-| `weak-ignore-owner-epoch.cfg` | Allows continuity anchor reuse without current owner epoch/provenance fencing. | `Inv1AnchorCurrent` | Stale continuity anchor and owner mapping | `85802e64`, `48f083ef`, `4c04e538`, `b1d27bc6` |
+| `weak-ignore-owner-epoch.cfg` | Allows continuity anchor reuse without current owner epoch/provenance fencing, and lets `OwnerLoss` clear the durable owner while leaving the turn live. | `Inv1AnchorCurrent\|Inv5SingleOwnerCAS` | Stale continuity anchor and owner mapping | `85802e64`, `48f083ef`, `4c04e538`, `b1d27bc6` |
+| `weak-ignore-anchor-lineage.cfg` | Accepts a continuity anchor whose conversation lineage does not match the turn, while every other fence still holds. | `Inv1AnchorCurrent` | Stale continuity anchor and owner mapping | `85802e64`, `48f083ef` |
 | `weak-single-shared-timeout.cfg` | Collapses phase-specific deadlines into a single mismatched timeout. | `Inv2DeadlineOrdering` | Timeout budget mismatch and stuck streams | `aa65e97d`, `de2c5fc0`, `af5051f8` |
 | `weak-skip-release-on-cancel.cfg` | Lets cancellation bypass reservation release/finalization. | `Inv3ReservationSettledExactlyOnce` | Lease and reservation leaks | `592d47b3`, `015f669e`, `783665b9` |
 | `weak-double-settle.cfg` | Allows a terminal acquired turn to settle twice. | `Inv3ReservationSettledExactlyOnce` | Duplicate finalization and replayed settlement | `592d47b3`, `015f669e`, `783665b9` |
@@ -178,11 +180,46 @@ conformance review confirmed from the implementation and proves it violates
 bash spec/check.sh
 ```
 
-Expected result: the full model completes with zero violations and deadlock
-checking enabled; all weakening runs fail with their mapped invariant names,
-and the liveness control fails with its mapped temporal property while keeping
-every invariant. The script prints the distinct-state count for the full model
-and every weakening so the checked state-space size is visible.
+Expected result: the full model reports no violation with deadlock checking
+enabled; all weakening runs fail with their mapped invariant names, and the
+liveness control fails with its mapped temporal property while keeping every
+invariant. The script prints the distinct-state count for the full model and
+every weakening so the checked state-space size is visible.
+
+### The full model is budgeted, not exhausted
+
+The weakenings all finish in seconds because TLC stops at the first
+counterexample. The full model has no counterexample to stop at, and its state
+space is much larger than a reviewer will sit through: a 12-worker run with a
+24 GB heap was still expanding at 46.2M distinct states and depth 24 after 40
+minutes, with 7.5M states left on the queue.
+
+So `check.sh` runs the full model under
+`CODEX_LB_TLC_FULL_TIMEOUT_SECONDS` (default 1800) and labels the outcome
+honestly:
+
+- `PASS full: ...` - the state space really was exhausted within the budget.
+- `PARTIAL full: no violation through depth N after Ts ...` - bounded search
+  found no violation and the state space was **not** exhausted.
+
+Set `CODEX_LB_TLC_FULL_TIMEOUT_SECONDS=0` to remove the budget and run to
+exhaustion. A counterexample fails the run either way: the budget only bounds
+how long TLC looks, never whether a violation it did find is reported.
+
+Read a `PARTIAL` line as bounded model checking, not proof. The reproducible
+evidence in this directory is the negative-control matrix: every weakening
+terminates quickly with a mapped counterexample, which is what shows the
+invariants have teeth.
+
+### Why `weak-ignore-owner-epoch` maps to two invariants
+
+That weakening changes two things at once: `UseAnchor` accepts a stale-epoch
+anchor, and `OwnerLoss` leaves the turn live after clearing `owner[a]` and
+advancing `ownerEpoch[a]`. The second is exactly the state the strengthened
+`Inv5SingleOwnerCAS` now rejects -- a live turn still mutating under a lease it
+no longer holds -- and TLC reaches it at a shallower depth than the bad anchor
+use, so it is the violation reported first. `Inv1AnchorCurrent` keeps a
+dedicated single-defect control in `weak-ignore-anchor-lineage.cfg`.
 
 ## Future Work
 

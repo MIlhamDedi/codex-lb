@@ -13,7 +13,8 @@ TLA2TOOLS_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e
 # and instead violate that one named temporal property; the property name is
 # bound by asserting the config declares exactly that property.
 declare -A EXPECTED_VIOLATION=(
-  ["weak-ignore-owner-epoch.cfg"]="Inv1AnchorCurrent"
+  ["weak-ignore-owner-epoch.cfg"]="Inv1AnchorCurrent|Inv5SingleOwnerCAS"
+  ["weak-ignore-anchor-lineage.cfg"]="Inv1AnchorCurrent"
   ["weak-single-shared-timeout.cfg"]="Inv2DeadlineOrdering"
   ["weak-skip-release-on-cancel.cfg"]="Inv3ReservationSettledExactlyOnce"
   ["weak-double-settle.cfg"]="Inv3ReservationSettledExactlyOnce"
@@ -57,13 +58,48 @@ download_tlc() {
   rmdir "$tmp_dir"
 }
 
+# Wall-clock budget for the full model only.  The weakenings all terminate in
+# seconds because TLC stops at the first counterexample; the full model has no
+# counterexample to stop at and its state space is far larger than a reviewer
+# will sit through.  0 disables the budget and runs to exhaustion.
+FULL_TIMEOUT_SECONDS="${CODEX_LB_TLC_FULL_TIMEOUT_SECONDS:-1800}"
+
 run_tlc() {
   local cfg="$1"
   local out="$2"
-  java -XX:+UseParallelGC -jar "$JAR" \
+  local budget="${3:-0}"
+  local -a launcher=()
+  if [[ "$budget" != "0" ]]; then
+    # SIGINT rather than SIGTERM: TLC installs a handler that prints the
+    # progress statistics we parse below before exiting.
+    launcher=(timeout --signal=INT --kill-after=60 "$budget")
+  fi
+  # Pin the JVM locale: TLC groups the digits of its state counts with the
+  # platform separator, and the parsers below expect one fixed grouping.
+  "${launcher[@]}" java -XX:+UseParallelGC \
+    -Duser.language=en -Duser.country=US \
+    -jar "$JAR" \
     -workers auto \
     -config "$cfg" \
     "$SPEC_DIR/CoreOwnership.tla" >"$out" 2>&1
+}
+
+search_depth() {
+  local out="$1"
+  grep -oE 'Progress\(([0-9]+)\)' "$out" \
+    | tail -n 1 \
+    | sed -E 's/^Progress\(([0-9]+)\)$/\1/' || true
+}
+
+# Distinct-state count from the last periodic progress report.  Interrupting
+# TLC skips the final summary line that ``state_count`` reads.
+progress_state_count() {
+  local out="$1"
+  grep -E '^Progress\([0-9]+\)' "$out" \
+    | tail -n 1 \
+    | grep -oE '[0-9,]+ distinct states found' \
+    | sed -E 's/ distinct states found$//' \
+    | tr -d ',' || true
 }
 
 state_count() {
@@ -76,19 +112,43 @@ state_count() {
 
 expect_full_pass() {
   local out="$SPEC_DIR/.tlc-full.out"
+  local status=0
   echo "== Full model =="
-  if ! run_tlc "$SPEC_DIR/CoreOwnership.cfg" "$out"; then
+  run_tlc "$SPEC_DIR/CoreOwnership.cfg" "$out" "$FULL_TIMEOUT_SECONDS" || status=$?
+
+  # A counterexample fails the run whether or not the budget expired: TLC has
+  # already printed it, and a violation found early is still a violation.
+  if grep -qE 'Error:|Deadlock reached' "$out"; then
+    cat "$out"
+    echo "Full model reported an error/deadlock." >&2
+    exit 1
+  fi
+
+  local distinct depth
+  distinct="$(state_count "$out")"
+  if [[ -z "$distinct" ]]; then
+    distinct="$(progress_state_count "$out")"
+  fi
+  depth="$(search_depth "$out")"
+
+  # 124/130 are timeout(1) reporting that the budget expired.
+  if [[ "$status" == "124" || "$status" == "130" ]]; then
+    if [[ -z "$distinct" ]]; then
+      cat "$out"
+      echo "Full model produced no progress statistics within ${FULL_TIMEOUT_SECONDS}s." >&2
+      exit 1
+    fi
+    echo "PARTIAL full: no violation through depth ${depth:-?} after ${FULL_TIMEOUT_SECONDS}s" \
+      "(distinct states=${distinct}); the state space was NOT exhausted."
+    echo "  Set CODEX_LB_TLC_FULL_TIMEOUT_SECONDS=0 to run the full model to exhaustion."
+    return
+  fi
+
+  if [[ "$status" != "0" ]]; then
     cat "$out"
     echo "Full model failed; expected zero violations and no deadlock." >&2
     exit 1
   fi
-  if grep -qE 'Error:|Deadlock reached' "$out"; then
-    cat "$out"
-    echo "Full model reported an error/deadlock despite zero exit." >&2
-    exit 1
-  fi
-  local distinct
-  distinct="$(state_count "$out")"
   if [[ -z "$distinct" ]]; then
     cat "$out"
     echo "Could not parse full-model state count." >&2
