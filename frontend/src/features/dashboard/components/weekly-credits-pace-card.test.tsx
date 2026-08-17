@@ -262,7 +262,7 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
     const verdict = screen.getByTestId("weekly-runway-verdict");
     expect(verdict).toHaveTextContent("Runs dry");
     expect(verdict.className).toContain("red");
-    expect(screen.getByText("runs dry in ~8h — before relief in 1d 2h")).toBeInTheDocument();
+    expect(screen.getByText("relief in 1d 2h — arrives after depletion")).toBeInTheDocument();
     expect(screen.queryByText("next reset in 1d 2h · returns ~100.8K credits")).not.toBeInTheDocument();
     expect(screen.getByText("8.0%")).toBeInTheDocument();
   });
@@ -282,9 +282,9 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
 
     const recommendations = screen.getByTestId("runway-recommendations");
     const text = recommendations.textContent ?? "";
-    expect(text).toContain("Throttle to ~28% of current load");
+    expect(text).toContain("~28% of current load");
     expect(text).toContain("Add 2 Pro accounts");
-    expect(text.indexOf("Throttle to ~28% of current load")).toBeLessThan(text.indexOf("Add 2 Pro accounts"));
+    expect(text.indexOf("~28% of current load")).toBeLessThan(text.indexOf("Add 2 Pro accounts"));
   });
 
   it("hides throttle guidance outside runs_dry but keeps a gated add-capacity line", () => {

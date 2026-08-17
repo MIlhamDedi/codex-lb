@@ -360,17 +360,17 @@ function RunwayWeeklyCreditsPaceCard({
                   // Key names are not unique on the wire (no id field), so the
                   // index disambiguates colliding names.
                   key={`${apiKey.name}-${index}`}
-                  className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground"
+                  className="grid grid-cols-[minmax(0,1fr)_5.5rem_5rem_6.5rem] items-baseline gap-3 text-xs text-muted-foreground"
                 >
                   <span className="min-w-0 truncate">{apiKey.name}</span>
-                  <span className="flex shrink-0 items-baseline gap-2 tabular-nums">
-                    <span>
-                      {t("dashboard.weeklyPace.attributionRequests", { value: formatCompactNumber(apiKey.requests) })}
-                    </span>
-                    <span>
-                      {t("dashboard.weeklyPace.attributionTokens", { value: formatCompactNumber(apiKey.billableTokens) })}
-                    </span>
-                    <span className="text-foreground/70">{formatModelLabel(apiKey.dominantModel, null)}</span>
+                  <span className="text-right tabular-nums">
+                    {t("dashboard.weeklyPace.attributionRequests", { value: formatCompactNumber(apiKey.requests) })}
+                  </span>
+                  <span className="text-right tabular-nums">
+                    {t("dashboard.weeklyPace.attributionTokens", { value: formatCompactNumber(apiKey.billableTokens) })}
+                  </span>
+                  <span className="truncate text-right text-foreground/70">
+                    {formatModelLabel(apiKey.dominantModel, null)}
                   </span>
                 </li>
               ))}
