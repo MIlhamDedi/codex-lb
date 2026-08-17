@@ -59,6 +59,21 @@ export interface SafeLineView {
 
 export type WeeklyCreditPaceStatus = "behind" | "on_track" | "ahead" | "danger";
 
+export type WeeklyCreditRunwayStatus = "safe" | "tight" | "runs_dry";
+
+export type WeeklyCreditResetEvent = {
+  at: string;
+  creditsReturned: number;
+};
+
+export type WeeklyCreditApiKeyAttribution = {
+  name: string;
+  requests: number;
+  billableTokens: number;
+  cachedTokens: number;
+  dominantModel: string;
+};
+
 export type WeeklyCreditPace = {
   totalFullCredits: number;
   totalActualRemainingCredits: number;
@@ -83,6 +98,18 @@ export type WeeklyCreditPace = {
   projectedMinimumRemainingCredits: number | null;
   forecastBurnRateCreditsPerHour: number | null;
   scheduledBurnRateCreditsPerHour: number;
+  /** Runway fields — absent when the backend predates the runway model. */
+  headroomPercent?: number;
+  headroomCredits?: number;
+  burnRateRecentCreditsPerHour?: number | null;
+  depletionEtaHours?: number | null;
+  nextReliefInHours?: number | null;
+  nextReliefCredits?: number | null;
+  resetEvents?: WeeklyCreditResetEvent[];
+  runwayStatus?: WeeklyCreditRunwayStatus;
+  saturatedAccountCount?: number;
+  topApiKeys?: WeeklyCreditApiKeyAttribution[];
+  addProAccounts?: number | null;
   status: WeeklyCreditPaceStatus;
   accountCount: number;
   staleAccountCount: number;
@@ -881,11 +908,12 @@ export function buildDashboardView(
     requestLogs,
     safeLinePrimary: buildDepletionView(projections?.depletionPrimary ?? overview.depletionPrimary),
     safeLineSecondary: buildDepletionView(projections?.depletionSecondary ?? overview.depletionSecondary),
+    // The overview payload paints the card; projections may refine it but must
+    // not gate or clear it (a null refinement keeps the overview value).
     weeklyCreditPace:
-      projections?.weeklyCreditPace !== undefined
-        ? projections.weeklyCreditPace
-        : overview.weeklyCreditPace !== undefined
-          ? overview.weeklyCreditPace
-          : buildWeeklyCreditPace(overview.accounts),
+      projections?.weeklyCreditPace ??
+      (overview.weeklyCreditPace !== undefined
+        ? overview.weeklyCreditPace
+        : buildWeeklyCreditPace(overview.accounts)),
   };
 }

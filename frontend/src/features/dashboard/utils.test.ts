@@ -679,6 +679,96 @@ describe("buildWeeklyCreditPace", () => {
 });
 
 describe("buildDashboardView", () => {
+  function serverWeeklyPace(overrides: Partial<WeeklyCreditPace> = {}): WeeklyCreditPace {
+    return {
+      totalFullCredits: 100_800,
+      totalActualRemainingCredits: 42_336,
+      totalExpectedRemainingCredits: 60_480,
+      actualUsedPercent: 58,
+      scheduledUsedPercent: 40,
+      deltaPercent: 18,
+      scheduleGapCredits: 18_144,
+      smoothedDeltaPercent: 18,
+      smoothedScheduleGapCredits: 18_144,
+      paceGapSmoothingMinutes: 30,
+      overPlanCredits: 18_144,
+      projectedShortfallCredits: 0,
+      pauseForBreakEvenHours: null,
+      paceMultiplier: null,
+      throttleToPercent: null,
+      reduceByPercent: null,
+      proAccountEquivalentToCoverOverPlan: null,
+      proAccountsToCoverOverPlan: null,
+      projectedDepletionHours: null,
+      projectedMinimumRemainingCredits: 12_000,
+      forecastBurnRateCreditsPerHour: 6_000,
+      scheduledBurnRateCreditsPerHour: 600,
+      status: "on_track",
+      accountCount: 2,
+      staleAccountCount: 0,
+      inactiveAccountCount: 0,
+      confidence: "high",
+      ...overrides,
+    };
+  }
+
+  it("flows runway fields through the view from the overview payload without projections", () => {
+    const runwayPace = serverWeeklyPace({
+      runwayStatus: "runs_dry",
+      headroomPercent: 8,
+      headroomCredits: 8_064,
+      burnRateRecentCreditsPerHour: 1_200,
+      depletionEtaHours: 6.7,
+      nextReliefInHours: 26,
+      nextReliefCredits: 50_400,
+      resetEvents: [{ at: "2026-01-08T14:00:00+00:00", creditsReturned: 50_400 }],
+      saturatedAccountCount: 1,
+      topApiKeys: [
+        {
+          name: "hermes-prod",
+          requests: 12_400,
+          billableTokens: 9_800_000,
+          cachedTokens: 4_000_000,
+          dominantModel: "gpt-5.2-codex",
+        },
+      ],
+      addProAccounts: 2,
+    });
+    const overview = { ...createDashboardOverview(), weeklyCreditPace: runwayPace };
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
+
+    expect(view.weeklyCreditPace).toBe(runwayPace);
+    expect(view.weeklyCreditPace?.runwayStatus).toBe("runs_dry");
+    expect(view.weeklyCreditPace?.resetEvents).toHaveLength(1);
+    expect(view.weeklyCreditPace?.topApiKeys?.[0]?.name).toBe("hermes-prod");
+    expect(view.weeklyCreditPace?.status).toBe("on_track");
+    expect(view.weeklyCreditPace?.scheduleGapCredits).toBe(18_144);
+  });
+
+  it("keeps the overview weekly pace when the projections refinement is null", () => {
+    const overviewPace = serverWeeklyPace({ runwayStatus: "safe" });
+    const overview = { ...createDashboardOverview(), weeklyCreditPace: overviewPace };
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false, {
+      weeklyCreditPace: null,
+    });
+
+    expect(view.weeklyCreditPace).toBe(overviewPace);
+  });
+
+  it("prefers a non-null projections weekly pace refinement over the overview value", () => {
+    const overviewPace = serverWeeklyPace({ runwayStatus: "tight" });
+    const refinedPace = serverWeeklyPace({ runwayStatus: "safe", headroomPercent: 40 });
+    const overview = { ...createDashboardOverview(), weeklyCreditPace: overviewPace };
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false, {
+      weeklyCreditPace: refinedPace,
+    });
+
+    expect(view.weeklyCreditPace).toBe(refinedPace);
+  });
+
   it("prefers backend weekly credit pace when the overview provides it", () => {
     const serverPace: WeeklyCreditPace = {
       totalFullCredits: 50_400,
