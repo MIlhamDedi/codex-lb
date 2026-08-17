@@ -109,12 +109,17 @@ const WeeklyCreditResetEventSchema = z.object({
 });
 
 const WeeklyCreditApiKeyAttributionSchema = z.object({
+  // Stable key id; absent on backends that predate per-key attribution ids.
+  apiKeyId: z.string().nullable().optional(),
   name: z.string(),
   requests: z.number().int().nonnegative(),
   billableTokens: z.number().int().nonnegative(),
   cachedTokens: z.number().int().nonnegative(),
   dominantModel: z.string(),
 });
+
+const WeeklyCreditPaceStatusSchema = z.enum(["behind", "on_track", "ahead", "danger"]);
+const WeeklyCreditRunwayStatusSchema = z.enum(["safe", "tight", "runs_dry"]);
 
 const WeeklyCreditPaceSchema = z.object({
   totalFullCredits: z.number(),
@@ -147,11 +152,11 @@ const WeeklyCreditPaceSchema = z.object({
   nextReliefInHours: z.number().nullable().optional(),
   nextReliefCredits: z.number().nullable().optional(),
   resetEvents: z.array(WeeklyCreditResetEventSchema).optional(),
-  runwayStatus: z.enum(["safe", "tight", "runs_dry"]).optional(),
+  runwayStatus: WeeklyCreditRunwayStatusSchema.optional(),
   saturatedAccountCount: z.number().int().nonnegative().optional(),
   topApiKeys: z.array(WeeklyCreditApiKeyAttributionSchema).optional(),
   addProAccounts: z.number().int().nullable().optional(),
-  status: z.enum(["behind", "on_track", "ahead", "danger"]),
+  status: WeeklyCreditPaceStatusSchema,
   accountCount: z.number().int().nonnegative(),
   staleAccountCount: z.number().int().nonnegative(),
   inactiveAccountCount: z.number().int().nonnegative(),
@@ -300,6 +305,8 @@ export type Depletion = z.infer<typeof DepletionSchema>;
 export type ServerWeeklyCreditPace = z.infer<typeof WeeklyCreditPaceSchema>;
 export type WeeklyCreditResetEvent = z.infer<typeof WeeklyCreditResetEventSchema>;
 export type WeeklyCreditApiKeyAttribution = z.infer<typeof WeeklyCreditApiKeyAttributionSchema>;
+export type WeeklyCreditPaceStatus = z.infer<typeof WeeklyCreditPaceStatusSchema>;
+export type WeeklyCreditRunwayStatus = z.infer<typeof WeeklyCreditRunwayStatusSchema>;
 
 export const DashboardViewSchema = z.enum(["request-logs", "conversations"]);
 export type DashboardView = z.infer<typeof DashboardViewSchema>;

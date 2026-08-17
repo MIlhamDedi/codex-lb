@@ -792,6 +792,7 @@
   "dashboard.weeklyPace.attributionRequests": "{{value}} req",
   "dashboard.weeklyPace.attributionTitle": "Top consumers · last 2h",
   "dashboard.weeklyPace.attributionTokens": "{{value}} tok",
+  "dashboard.weeklyPace.burnNotMeasured": "not enough recent samples to measure burn",
   "dashboard.weeklyPace.lines.belowPlannedNow": "{{percent}} below planned usage",
   "dashboard.weeklyPace.lines.belowPlannedWindow": "{{percent}} below planned usage over {{window}}",
   "dashboard.weeklyPace.lines.lowWaterMark": "{{credits}} credits projected low-water mark",

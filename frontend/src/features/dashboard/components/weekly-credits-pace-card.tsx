@@ -215,14 +215,16 @@ function buildRunwayTimeline(
 function RunwayWeeklyCreditsPaceCard({
   pace,
   runwayStatus,
+  headroomPercent,
+  headroomCredits,
 }: {
   pace: WeeklyCreditPace;
   runwayStatus: WeeklyCreditRunwayStatus;
+  headroomPercent: number;
+  headroomCredits: number;
 }) {
   const { t, i18n } = useTranslation();
 
-  const headroomPercent = pace.headroomPercent ?? Math.max(0, 100 - pace.actualUsedPercent);
-  const headroomCredits = pace.headroomCredits ?? pace.totalActualRemainingCredits;
   const burnRate = pace.burnRateRecentCreditsPerHour ?? null;
   const etaHours = pace.depletionEtaHours != null && Number.isFinite(pace.depletionEtaHours) ? pace.depletionEtaHours : null;
   const reliefHours = pace.nextReliefInHours != null && Number.isFinite(pace.nextReliefInHours) ? pace.nextReliefInHours : null;
@@ -283,6 +285,10 @@ function RunwayWeeklyCreditsPaceCard({
               >
                 {t("dashboard.weeklyPace.runsOutIn", { duration: formatDurationHours(etaHours) })}
               </span>
+            ) : burnRate == null ? (
+              // null burn rate means "too few recent samples to measure",
+              // which must read differently from a measured zero burn.
+              <span>{t("dashboard.weeklyPace.burnNotMeasured")}</span>
             ) : (
               <span>{t("dashboard.weeklyPace.steadyState")}</span>
             )}
@@ -357,9 +363,9 @@ function RunwayWeeklyCreditsPaceCard({
             <ul className="mt-1.5 space-y-1">
               {topApiKeys.map((apiKey, index) => (
                 <li
-                  // Key names are not unique on the wire (no id field), so the
-                  // index disambiguates colliding names.
-                  key={`${apiKey.name}-${index}`}
+                  // Prefer the stable wire id; older backends omit it, and key
+                  // names are not unique, so name+index disambiguates then.
+                  key={apiKey.apiKeyId ?? `${apiKey.name}-${index}`}
                   className="grid grid-cols-[minmax(0,1fr)_5.5rem_5rem_6.5rem] items-baseline gap-3 text-xs text-muted-foreground"
                 >
                   <span className="min-w-0 truncate">{apiKey.name}</span>
@@ -521,8 +527,18 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
   if (!pace) {
     return null;
   }
-  if (pace.runwayStatus != null) {
-    return <RunwayWeeklyCreditsPaceCard pace={pace} runwayStatus={pace.runwayStatus} />;
+  // The runway layout renders only when the backend sent the full companion
+  // set; a partial payload falls back to the legacy layout instead of
+  // masking gaps with synthesized stand-in numbers.
+  if (pace.runwayStatus != null && pace.headroomPercent != null && pace.headroomCredits != null) {
+    return (
+      <RunwayWeeklyCreditsPaceCard
+        pace={pace}
+        runwayStatus={pace.runwayStatus}
+        headroomPercent={pace.headroomPercent}
+        headroomCredits={pace.headroomCredits}
+      />
+    );
   }
   return <LegacyWeeklyCreditsPaceCard pace={pace} />;
 }

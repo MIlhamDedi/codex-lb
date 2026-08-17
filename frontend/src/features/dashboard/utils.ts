@@ -7,8 +7,10 @@ import type {
   DashboardProjections,
   Depletion,
   RequestLog,
+  ServerWeeklyCreditPace,
   TrendPoint,
   UsageWindow,
+  WeeklyCreditPaceStatus,
 } from "@/features/dashboard/schemas";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
 import { buildDonutPalette } from "@/utils/colors";
@@ -57,65 +59,18 @@ export interface SafeLineView {
   riskLevel: "safe" | "warning" | "danger" | "critical";
 }
 
-export type WeeklyCreditPaceStatus = "behind" | "on_track" | "ahead" | "danger";
-
-export type WeeklyCreditRunwayStatus = "safe" | "tight" | "runs_dry";
-
-export type WeeklyCreditResetEvent = {
-  at: string;
-  creditsReturned: number;
-};
-
-export type WeeklyCreditApiKeyAttribution = {
-  name: string;
-  requests: number;
-  billableTokens: number;
-  cachedTokens: number;
-  dominantModel: string;
-};
-
-export type WeeklyCreditPace = {
-  totalFullCredits: number;
-  totalActualRemainingCredits: number;
-  totalExpectedRemainingCredits: number;
-  actualUsedPercent: number;
-  scheduledUsedPercent: number;
-  deltaPercent: number;
-  scheduleGapCredits: number;
-  smoothedDeltaPercent?: number;
-  smoothedScheduleGapCredits?: number;
-  paceGapSmoothingMinutes?: number;
-  /** Legacy alias for scheduleGapCredits while older components migrate. */
-  overPlanCredits: number;
-  projectedShortfallCredits: number;
-  pauseForBreakEvenHours: number | null;
-  paceMultiplier: number | null;
-  throttleToPercent: number | null;
-  reduceByPercent: number | null;
-  proAccountEquivalentToCoverOverPlan: number | null;
-  proAccountsToCoverOverPlan: number | null;
-  projectedDepletionHours: number | null;
-  projectedMinimumRemainingCredits: number | null;
-  forecastBurnRateCreditsPerHour: number | null;
-  scheduledBurnRateCreditsPerHour: number;
-  /** Runway fields — absent when the backend predates the runway model. */
-  headroomPercent?: number;
-  headroomCredits?: number;
-  burnRateRecentCreditsPerHour?: number | null;
-  depletionEtaHours?: number | null;
-  nextReliefInHours?: number | null;
-  nextReliefCredits?: number | null;
-  resetEvents?: WeeklyCreditResetEvent[];
-  runwayStatus?: WeeklyCreditRunwayStatus;
-  saturatedAccountCount?: number;
-  topApiKeys?: WeeklyCreditApiKeyAttribution[];
-  addProAccounts?: number | null;
-  status: WeeklyCreditPaceStatus;
-  accountCount: number;
-  staleAccountCount: number;
-  inactiveAccountCount: number;
-  confidence: "high" | "medium" | "low";
-};
+/**
+ * View-model weekly pace, derived from the Zod wire contract in schemas.ts so
+ * the shapes cannot drift apart. Runway fields are absent when the backend
+ * predates the runway model.
+ */
+export type WeeklyCreditPace = ServerWeeklyCreditPace;
+export type {
+  WeeklyCreditApiKeyAttribution,
+  WeeklyCreditPaceStatus,
+  WeeklyCreditResetEvent,
+  WeeklyCreditRunwayStatus,
+} from "@/features/dashboard/schemas";
 
 export type DashboardView = {
   stats: DashboardStat[];
@@ -908,12 +863,14 @@ export function buildDashboardView(
     requestLogs,
     safeLinePrimary: buildDepletionView(projections?.depletionPrimary ?? overview.depletionPrimary),
     safeLineSecondary: buildDepletionView(projections?.depletionSecondary ?? overview.depletionSecondary),
-    // The overview payload paints the card; projections may refine it but must
-    // not gate or clear it (a null refinement keeps the overview value).
+    // The overview payload is the freshest verdict and always wins. TanStack
+    // Query retains the last successful projections payload across later
+    // failures, so a stale projections copy must never override a fresh
+    // overview; it only backfills older backends whose overview omits the
+    // field entirely.
     weeklyCreditPace:
-      projections?.weeklyCreditPace ??
-      (overview.weeklyCreditPace !== undefined
+      overview.weeklyCreditPace !== undefined
         ? overview.weeklyCreditPace
-        : buildWeeklyCreditPace(overview.accounts)),
+        : projections?.weeklyCreditPace ?? buildWeeklyCreditPace(overview.accounts),
   };
 }

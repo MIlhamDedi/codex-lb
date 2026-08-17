@@ -311,6 +311,7 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
           ...RUNWAY_PACE,
           topApiKeys: [
             {
+              apiKeyId: "key_hermes_prod",
               name: "hermes-prod",
               requests: 12_400,
               billableTokens: 9_800_000,
@@ -318,6 +319,7 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
               dominantModel: "gpt-5.2-codex",
             },
             {
+              apiKeyId: "key_batch_eval",
               name: "batch-eval",
               requests: 800,
               billableTokens: 14_200_000,
@@ -369,7 +371,7 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
     expect(screen.getByText(/runs out in/)).toBeInTheDocument();
   });
 
-  it("shows steady-state copy instead of an ETA when there is no burn", () => {
+  it("shows steady-state copy instead of an ETA when a measured burn is zero", () => {
     render(
       <WeeklyCreditsPaceCard
         pace={{
@@ -381,8 +383,42 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
     );
 
     expect(screen.getByText("no recent burn — holding steady")).toBeInTheDocument();
+    expect(screen.queryByText("not enough recent samples to measure burn")).not.toBeInTheDocument();
     expect(screen.queryByText(/runs out in/)).not.toBeInTheDocument();
     expect(screen.queryByTestId("runway-eta-marker")).not.toBeInTheDocument();
+  });
+
+  it("explains an unmeasured burn instead of claiming the pool is holding steady", () => {
+    render(
+      <WeeklyCreditsPaceCard
+        pace={{
+          ...RUNWAY_PACE,
+          burnRateRecentCreditsPerHour: null,
+          depletionEtaHours: null,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("not enough recent samples to measure burn")).toBeInTheDocument();
+    expect(screen.queryByText("no recent burn — holding steady")).not.toBeInTheDocument();
+    expect(screen.queryByText(/runs out in/)).not.toBeInTheDocument();
+  });
+
+  it("falls back to the legacy layout when a headroom companion is missing", () => {
+    const { unmount } = render(
+      <WeeklyCreditsPaceCard pace={{ ...RUNWAY_PACE, headroomPercent: undefined }} />,
+    );
+
+    expect(screen.queryByTestId("weekly-runway-verdict")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("runway-timeline")).not.toBeInTheDocument();
+    expect(screen.getByText("Used now")).toBeInTheDocument();
+    unmount();
+
+    render(<WeeklyCreditsPaceCard pace={{ ...RUNWAY_PACE, headroomCredits: undefined }} />);
+
+    expect(screen.queryByTestId("weekly-runway-verdict")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("runway-timeline")).not.toBeInTheDocument();
+    expect(screen.getByText("Used now")).toBeInTheDocument();
   });
 
   it("labels demand figures as floors when every account is saturated", () => {

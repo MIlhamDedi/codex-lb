@@ -792,6 +792,7 @@
   "dashboard.weeklyPace.attributionRequests": "{{value}} 次请求",
   "dashboard.weeklyPace.attributionTitle": "主要消耗方 · 近 2 小时",
   "dashboard.weeklyPace.attributionTokens": "{{value}} 令牌",
+  "dashboard.weeklyPace.burnNotMeasured": "近期样本不足 — 无法测算消耗速率",
   "dashboard.weeklyPace.lines.belowPlannedNow": "低于计划用量 {{percent}}",
   "dashboard.weeklyPace.lines.belowPlannedWindow": "{{window}} 内低于计划用量 {{percent}}",
   "dashboard.weeklyPace.lines.lowWaterMark": "预计低水位 {{credits}} credits",
