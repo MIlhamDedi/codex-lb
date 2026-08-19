@@ -76,6 +76,7 @@ from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.errors import (
+    HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     OpenAIErrorEnvelope,
     is_previous_response_not_found_error,
@@ -420,6 +421,7 @@ internal_router = APIRouter(
 )
 
 _TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+_HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS = 6
 _OPENAPI_VALIDATION_ERROR_RESPONSE: Final[dict[str, Any]] = {
     "description": "Validation Error",
     "content": {
@@ -7670,9 +7672,9 @@ async def _stream_response_error_events(
             yield line
     except ProxyResponseError as exc:
         error_code = exc.payload.get("error", {}).get("code") if isinstance(exc.payload, dict) else None
+        settings = get_settings()
         indefinite_recovery = (
-            get_settings().http_responses_session_bridge_ambiguous_continuation_recovery_mode
-            == "server_indefinite_recovery"
+            settings.http_responses_session_bridge_ambiguous_continuation_recovery_mode == "server_indefinite_recovery"
         )
         if (
             recovery_stream_factory is not None
@@ -7686,9 +7688,11 @@ async def _stream_response_error_events(
             # The operation remains serialized by the durable operation
             # fingerprint; each new upstream attempt is still at-least-once.
             retry_delay = max(1.0, min(30.0, float(exc.retry_after_seconds or 5.0)))
-            while True:
+            recovery_attempts = 0
+            while recovery_attempts < _HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS:
                 yield ": codex-lb recovery in progress\n\n"
                 await asyncio.sleep(retry_delay)
+                recovery_attempts += 1
                 try:
                     retry_stream = recovery_stream_factory()
                     retry_saw_downstream_event = False
@@ -7699,6 +7703,7 @@ async def _stream_response_error_events(
                         yield line
                     return
                 except ProxyResponseError as retry_exc:
+                    exc = retry_exc
                     retry_code = (
                         retry_exc.payload.get("error", {}).get("code") if isinstance(retry_exc.payload, dict) else None
                     )
@@ -7716,7 +7721,6 @@ async def _stream_response_error_events(
                             and not getattr(retry_exc, "http_bridge_durable_recovery_eligible", False)
                         )
                     ):
-                        exc = retry_exc
                         break
                     retry_delay = max(1.0, min(30.0, float(retry_exc.retry_after_seconds or retry_delay)))
                 except (ProxyRateLimitError, ProxyAuthError) as retry_limit_exc:
@@ -7751,7 +7755,17 @@ async def _stream_response_error_events(
                         retry_after_seconds=5,
                     )
                     break
+            else:
+                logger.warning(
+                    "HTTP bridge server recovery exhausted before downstream event after %s attempts",
+                    _HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS,
+                )
         await release_owned_reservation()
+        response_id = None
+        if isinstance(exc.payload, dict):
+            response_id = _response_id_from_event_payload(cast(dict[str, JsonValue], exc.payload))
+        if response_id is None:
+            response_id = f"resp_{uuid4().hex}"
         envelope = _parse_error_envelope(exc.payload)
         _, envelope = _mask_previous_response_not_found_error(
             envelope,
@@ -7774,6 +7788,7 @@ async def _stream_response_error_events(
                 error.code if error and error.code else "upstream_error",
                 error.message if error and error.message else "Upstream error",
                 error.type if error and error.type else "server_error",
+                response_id=response_id,
                 error_param=error.param if error else None,
             )
         )
@@ -9604,6 +9619,11 @@ def _mask_previous_response_not_found_error(
 def _status_for_error(error_value: OpenAIError | None) -> int:
     if error_value and error_value.code == "previous_response_not_found":
         return 502
+    if error_value and error_value.code == HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE:
+        # The bridge never got a response created upstream, so this is our
+        # availability problem and the request is safe to repeat: 503, not a
+        # 502 that claims the upstream returned a bad response.
+        return 503
     if error_value and error_value.code in _UNAVAILABLE_SELECTION_ERROR_CODES:
         return 503
     if error_value and error_value.code in {"rate_limit_exceeded", "usage_limit_reached", "insufficient_quota"}:
