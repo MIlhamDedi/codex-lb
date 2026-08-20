@@ -1126,8 +1126,8 @@ async def responses(
         error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
     try:
-        source_selection = (
-            None
+        source_selection, continuity_suppressed = (
+            (None, False)
             if source_route_excluded
             else await _select_responses_model_source_with_continuity(
                 request,
@@ -1143,6 +1143,20 @@ async def responses(
     source = source_selection[0] if source_selection is not None else None
     if source_selection is not None:
         responses_payload.model = source_selection[1]
+    elif not source_route_excluded and not continuity_suppressed:
+        # The ordinary lookup itself missed (continuity suppression means an
+        # enabled source claimed the model, so the disabled probe must not
+        # override the recorded subscription anchor).
+        disabled_denial = await _disabled_model_source_denial(
+            request,
+            responses_payload.model,
+            api_key,
+            route="responses",
+            raw_model=raw_source_model,
+            require_streaming=True,
+        )
+        if disabled_denial is not None:
+            return disabled_denial
     if source is not None:
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
@@ -1305,8 +1319,8 @@ async def v1_responses(
         error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
     try:
-        source_selection = (
-            None
+        source_selection, continuity_suppressed = (
+            (None, False)
             if source_route_excluded
             else await _select_responses_model_source_with_continuity(
                 request,
@@ -1322,6 +1336,20 @@ async def v1_responses(
     source = source_selection[0] if source_selection is not None else None
     if source_selection is not None:
         responses_payload.model = source_selection[1]
+    elif not source_route_excluded and not continuity_suppressed:
+        # The ordinary lookup itself missed (continuity suppression means an
+        # enabled source claimed the model, so the disabled probe must not
+        # override the recorded subscription anchor).
+        disabled_denial = await _disabled_model_source_denial(
+            request,
+            responses_payload.model,
+            api_key,
+            route="responses",
+            raw_model=raw_source_model,
+            require_streaming=responses_payload.stream is True,
+        )
+        if disabled_denial is not None:
+            return disabled_denial
     if source is not None:
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
@@ -4261,6 +4289,7 @@ async def v1_chat_completions(
     if prohibit_fast_mode and _is_fast_mode_model_alias(effective_model):
         effective_model = responses_payload.model
     validate_model_access(api_key, responses_payload.model)
+    source_route_attempted = not responses_shaped_payload and payload.messages is not None
     source_selection = (
         await _select_chat_model_source(
             responses_payload.model,
@@ -4268,11 +4297,24 @@ async def v1_chat_completions(
             raw_model=effective_model,
             require_streaming=payload.stream is True,
         )
-        if not responses_shaped_payload and payload.messages is not None
+        if source_route_attempted
         else None
     )
     source = source_selection[0] if source_selection is not None else None
     request_model = source_selection[1] if source_selection is not None else responses_payload.model
+    if source is None and source_route_attempted:
+        # Before any reservation is taken, so a refusal strands nothing.
+        disabled_denial = await _disabled_model_source_denial(
+            request,
+            responses_payload.model,
+            api_key,
+            route="chat",
+            raw_model=effective_model,
+            require_streaming=payload.stream is True,
+            headers=rate_limit_headers,
+        )
+        if disabled_denial is not None:
+            return disabled_denial
     if source is None:
         apply_enforced_service_tier_model_fallback(
             responses_payload,
@@ -4409,7 +4451,15 @@ async def _select_chat_model_source(
     *,
     raw_model: str | None = None,
     require_streaming: bool = False,
+    only_disabled: bool = False,
 ) -> tuple[ModelSource, str] | None:
+    """Resolve ``model`` to a Chat Completions-capable model source, if any.
+
+    ``only_disabled`` mirrors :func:`select_responses_model_source`: every rule
+    stays the same except the enabled-state filter, which is inverted, so the
+    result names the source the request would have used had it not been
+    switched off.
+    """
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
     candidates = [candidate for candidate in (raw_model, model) if candidate]
@@ -4429,6 +4479,7 @@ async def _select_chat_model_source(
                 candidate,
                 allowed_source_ids=assigned_source_ids,
                 require_streaming=require_streaming,
+                only_disabled=only_disabled,
             )
             if source is not None:
                 break
@@ -4447,6 +4498,7 @@ async def _select_responses_model_source(
     *,
     raw_model: str | None = None,
     require_streaming: bool = False,
+    only_disabled: bool = False,
 ) -> tuple[ModelSource, str] | None:
     # Shared with the WebSocket path so both transports agree on which models
     # belong to a model source.
@@ -4455,6 +4507,7 @@ async def _select_responses_model_source(
         api_key,
         raw_model=raw_model,
         require_streaming=require_streaming,
+        only_disabled=only_disabled,
     )
 
 
@@ -4466,8 +4519,17 @@ async def _select_responses_model_source_with_continuity(
     *,
     raw_model: str | None = None,
     require_streaming: bool = False,
-) -> tuple[ModelSource, str] | None:
-    """Select a source unless recorded subscription continuity owns the anchor."""
+) -> tuple[tuple[ModelSource, str] | None, bool]:
+    """Select a source unless recorded subscription continuity owns the anchor.
+
+    Returns ``(selection, continuity_suppressed)``. ``continuity_suppressed``
+    is ``True`` only when an enabled source claimed the model but a recorded
+    subscription owner for ``previous_response_id`` pinned the turn to a
+    subscription account instead. Callers use it to tell that case apart from
+    a genuine lookup miss: only a genuine miss may consult the disabled-source
+    denial, because a continuity-suppressed turn already has a subscription
+    anchor that must keep being served.
+    """
     source_selection = await _select_responses_model_source(
         payload.model,
         api_key,
@@ -4475,14 +4537,72 @@ async def _select_responses_model_source_with_continuity(
         require_streaming=require_streaming,
     )
     if source_selection is None or payload.previous_response_id is None:
-        return source_selection
+        return source_selection, False
     owner_account_id = await context.service._resolve_websocket_previous_response_owner(
         previous_response_id=payload.previous_response_id,
         api_key=api_key,
         session_id=proxy_affinity_module._owner_lookup_session_id_from_headers(request.headers),
         surface="http_source_route",
     )
-    return None if owner_account_id is not None else source_selection
+    if owner_account_id is not None:
+        return None, True
+    return source_selection, False
+
+
+async def _disabled_model_source_denial(
+    request: Request,
+    model: str,
+    api_key: ApiKeyData | None,
+    *,
+    route: Literal["chat", "responses"],
+    raw_model: str | None = None,
+    require_streaming: bool = False,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse | None:
+    """Refuse a request whose model source exists but is switched off.
+
+    Called only after the ordinary lookup missed. A miss has two very different
+    causes that the routing code cannot otherwise tell apart: the model belongs
+    to nobody, or it belongs to a model source (or a source model) an operator
+    disabled. Only the first may fall through to subscription selection --
+    handing a source-owned slug to a ChatGPT account produces
+    ``The '<model>' model is not supported when using Codex with a ChatGPT
+    account.``, which burns the account's health signal and tells the operator
+    nothing about the source they switched off.
+
+    Returns ``None`` when no disabled source claims the model, leaving every
+    other request on its existing path.
+    """
+    selection = (
+        await _select_responses_model_source(
+            model,
+            api_key,
+            raw_model=raw_model,
+            require_streaming=require_streaming,
+            only_disabled=True,
+        )
+        if route == "responses"
+        else await _select_chat_model_source(
+            model,
+            api_key,
+            raw_model=raw_model,
+            require_streaming=require_streaming,
+            only_disabled=True,
+        )
+    )
+    if selection is None:
+        return None
+    source, matched_model = selection
+    # The source name is operator-facing configuration, not a client-visible
+    # identifier, so the envelope names the model and the condition only.
+    reason = "is disabled" if not source.is_enabled else "has that model disabled"
+    error = openai_error(
+        "model_source_disabled",
+        f"The model '{matched_model}' is served by an OpenAI-compatible model source that {reason}. "
+        "Enable the source and its model in codex-lb, or request a different model.",
+        error_type="upstream_error",
+    )
+    return _logged_error_json_response(request, 503, error, headers=headers)
 
 
 async def _select_embeddings_model_source(model: str, api_key: ApiKeyData | None) -> ModelSource | None:
