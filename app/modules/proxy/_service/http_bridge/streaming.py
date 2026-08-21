@@ -3783,12 +3783,13 @@ class _HTTPBridgeStreamingMixin:
                 return None
             await self._release_websocket_request_state_reservation(request_state)
             request_state.api_key_reservation = None
+            mark_bridge_eventless_failure()
             if propagate_http_errors:
                 raise ProxyResponseError(
                     503,
                     openai_error(
-                        "upstream_request_timeout",
-                        "HTTP responses session bridge recovery exceeded the request budget.",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
                         error_type="server_error",
                     ),
                 )
@@ -3796,8 +3797,8 @@ class _HTTPBridgeStreamingMixin:
                 cast(
                     Mapping[str, JsonValue],
                     response_failed_event(
-                        "stream_idle_timeout",
-                        "HTTP responses session bridge recovery exceeded the request budget",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
                         response_id=_websocket_downstream_response_id(request_state),
                     ),
                 )

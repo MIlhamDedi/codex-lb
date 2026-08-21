@@ -5715,7 +5715,13 @@ async def _stream_responses(
             == "server_indefinite_recovery"
             and getattr(startup_error, "http_bridge_durable_recovery_eligible", False)
             and startup_error_code
-            in {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}
+            in {
+                HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
+                "stream_incomplete",
+                "stream_idle_timeout",
+                "upstream_request_timeout",
+                "upstream_unavailable",
+            }
             and _responses_origin_may_release_reservation(
                 service_cleanup_ready_event=responses_service_cleanup_ready_event,
                 owner_forward_dispatched_event=responses_owner_forward_dispatched_event,
@@ -7211,7 +7217,13 @@ async def _stream_response_error_events(
             and (not require_durable_recovery_fence or getattr(exc, "http_bridge_durable_recovery_eligible", False))
             and not saw_downstream_event
             and error_code
-            in {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}
+            in {
+                HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
+                "stream_incomplete",
+                "stream_idle_timeout",
+                "upstream_request_timeout",
+                "upstream_unavailable",
+            }
         ):
             # Keep the client stream alive while the server owns recovery.
             # The operation remains serialized by the durable operation
@@ -7239,6 +7251,7 @@ async def _stream_response_error_events(
                     if (
                         retry_code
                         not in {
+                            HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
                             "stream_incomplete",
                             "stream_idle_timeout",
                             "upstream_request_timeout",

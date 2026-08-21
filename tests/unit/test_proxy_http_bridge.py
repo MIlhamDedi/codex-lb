@@ -6518,7 +6518,73 @@ async def test_http_bridge_one_shot_hard_turn_does_not_submit_after_wait_budget(
             pass
 
     assert exc_info.value.status_code == 503
-    assert exc_info.value.payload["error"]["code"] == "upstream_request_timeout"
+    assert exc_info.value.payload["error"]["code"] == HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE
+    assert request_state.failure_phase_override == "bridge"
+    assert request_state.failure_detail_override == HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE
+    submit.assert_not_awaited()
+    release.assert_awaited_once_with(request_state)
+    assert request_state.api_key_reservation is None
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_one_shot_hard_turn_sse_budget_wait_uses_eventless_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="sid-hard-turn-wait-budget-sse")
+    session.durable_session_id = "durable-hard-turn-wait-budget-sse"
+    session.durable_owner_epoch = 9
+    reservation = cast(Any, object())
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-hard-turn-wait-budget-sse",
+        model="gpt-5.6",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=reservation,
+        started_at=time.monotonic(),
+        event_queue=asyncio.Queue(),
+        transport="http",
+        session_id="turn-state-wait-budget-sse",
+        hard_continuity_anchor=True,
+    )
+    clock = SimpleNamespace(now=100.0)
+    submit = AsyncMock()
+    release = AsyncMock()
+
+    async def sleep(delay: float) -> None:
+        clock.now += delay
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings",
+        lambda: _make_app_settings(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_anchored_replay_once",
+        ),
+    )
+    monkeypatch.setattr(http_bridge_streaming_module._service_time(), "monotonic", lambda: clock.now)
+    monkeypatch.setattr(service, "_http_bridge_precreated_retry_cooldown_seconds", AsyncMock(return_value=30.0))
+    monkeypatch.setattr(service, "_submit_http_bridge_request", submit)
+    monkeypatch.setattr(service, "_release_websocket_request_state_reservation", release)
+    monkeypatch.setattr(http_bridge_streaming_module.asyncio, "sleep", sleep)
+
+    events = [
+        event
+        async for event in service._stream_http_bridge_session_events(
+            session,
+            request_state=request_state,
+            text_data='{"type":"response.create"}',
+            queue_limit=8,
+            propagate_http_errors=False,
+            downstream_turn_state="turn-state-wait-budget-sse",
+            request_deadline=105.0,
+        )
+    ]
+
+    terminal = cast(dict[str, object], proxy_service.parse_sse_data_json(events[-1]))
+    error = cast(dict[str, object], cast(dict[str, object], terminal["response"])["error"])
+    assert error["code"] == HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE
+    assert request_state.failure_phase_override == "bridge"
+    assert request_state.failure_detail_override == HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE
     submit.assert_not_awaited()
     release.assert_awaited_once_with(request_state)
     assert request_state.api_key_reservation is None
