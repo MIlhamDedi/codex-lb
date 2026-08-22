@@ -186,9 +186,10 @@ async def test_http_bridge_pre_response_silence_is_bridge_eventless_timeout(
     assert terminal["type"] == "response.failed"
     error = cast(dict[str, Any], cast(dict[str, Any], terminal["response"])["error"])
     assert error["code"] == "bridge_eventless_timeout"
-    # Honest message: no upstream blame, and it says the retry is safe.
+    # Honest message: no upstream blame, and unmatched upstream liveness means
+    # the retry cannot be promised duplicate-safe.
     assert "Upstream" not in cast(str, error["message"])
-    assert "safe to retry" in cast(str, error["message"])
+    assert "retry may duplicate upstream work" in cast(str, error["message"])
 
     # Durable request-log detail.
     assert request_state.failure_detail_override == "bridge_eventless_timeout"

@@ -676,14 +676,18 @@ def _http_bridge_denied_anchor_fence_advanced(
 
 
 # Silence before ``response.created`` is a different failure class than a
-# stream that started and then went quiet. Nothing exists upstream yet, so the
-# request is safe to retry and the upstream is not proven at fault. Keep it out
-# of ``stream_idle_timeout``, whose budget is the post-start
-# ``stream_idle_timeout_seconds``.
+# stream that started and then went quiet. When no unmatched upstream liveness
+# was observed, nothing exists upstream yet, so the request is safe to retry and
+# the upstream is not proven at fault. Keep it out of ``stream_idle_timeout``,
+# whose budget is the post-start ``stream_idle_timeout_seconds``.
 _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL = HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE
 _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE = (
     "HTTP responses session bridge saw no response events before its pre-response budget expired; "
     "no response was created upstream, so the request is safe to retry"
+)
+_HTTP_BRIDGE_EVENTLESS_TIMEOUT_UNMATCHED_LIVENESS_MESSAGE = (
+    "HTTP responses session bridge saw upstream liveness before its pre-response budget expired, "
+    "but no response events were matched; retry may duplicate upstream work"
 )
 _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE = (
     "HTTP responses session bridge is cooling down after repeated upstream timeouts; retry shortly."
@@ -710,6 +714,12 @@ _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR = "http_bridge_prepared_continuity_anchor"
 _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR = "http_bridge_cooldown_suppression"
 _HTTP_BRIDGE_STALE_INFLIGHT_MIN_SECONDS = 120.0
 _HTTP_BRIDGE_STALE_INFLIGHT_TIMEOUT_MULTIPLIER = 6.0
+
+
+def _http_bridge_eventless_timeout_message(unmatched_upstream_liveness_count: int) -> str:
+    if unmatched_upstream_liveness_count > 0:
+        return _HTTP_BRIDGE_EVENTLESS_TIMEOUT_UNMATCHED_LIVENESS_MESSAGE
+    return _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE
 
 
 async def _await_task_deferring_cancellation(
