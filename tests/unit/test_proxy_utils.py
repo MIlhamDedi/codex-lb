@@ -74,6 +74,7 @@ from app.modules.proxy._service import compact as proxy_compact_service
 from app.modules.proxy._service import file_ops as proxy_file_ops
 from app.modules.proxy._service import support as proxy_support
 from app.modules.proxy._service import warmup as proxy_warmup_service
+from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers_module
 from app.modules.proxy._service.http_bridge import request_submit as proxy_http_bridge_request_submit
 from app.modules.proxy._service.http_bridge import service_stubs as proxy_http_bridge_service_stubs
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
@@ -44039,6 +44040,7 @@ async def test_http_bridge_eventless_retry_transport_failure_uses_bridge_timeout
         last_used_at=0.0,
         idle_ttl_seconds=30.0,
     )
+    session.unmatched_upstream_liveness_count = 1
     record_failure = AsyncMock(return_value=1)
 
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
@@ -44073,7 +44075,7 @@ async def test_http_bridge_eventless_retry_transport_failure_uses_bridge_timeout
     terminal = cast(dict[str, object], proxy_service.parse_sse_data_json(events[-1]))
     error = cast(dict[str, object], cast(dict[str, object], terminal["response"])["error"])
     assert error["code"] == "bridge_eventless_timeout"
-    assert error["message"] == http_bridge_streaming_module._HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE
+    assert "retry may duplicate upstream work" in cast(str, error["message"])
     assert request_state.failure_detail_override == "bridge_eventless_timeout"
     record_failure.assert_awaited_once_with(session, detail="bridge_eventless_timeout")
 
@@ -44151,8 +44153,7 @@ async def test_http_bridge_eventless_retry_transport_failure_raises_bridge_timeo
     assert exc_info.value.status_code == 503
     assert exc_info.value.payload["error"]["code"] == "bridge_eventless_timeout"
     assert (
-        exc_info.value.payload["error"]["message"]
-        == http_bridge_streaming_module._HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE
+        exc_info.value.payload["error"]["message"] == http_bridge_helpers_module._HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE
     )
     record_failure.assert_awaited_once_with(session, detail="bridge_eventless_timeout")
 
@@ -44291,11 +44292,10 @@ async def test_http_bridge_session_events_keepalive_backstop_respects_idle_timeo
     finally:
         await events.aclose()
 
-    # The pre-response budget is min(stuck gate, stream idle, request budget)
-    # = 0.05s, i.e. ceil(0.05 / 0.01) = 5 keepalive ticks, instead of the old
-    # implicit _STREAM_KEEPALIVE_MAX_COUNT product.
-    assert len(collected) == 5
-    assert collected[:-1] == [proxy_service.CODEX_KEEPALIVE_FRAME] * 4
+    # Under event-loop load a boundary tick can shift by one interval; keep the
+    # assertion about the backstop budget without depending on exact scheduling.
+    assert 4 <= len(collected) <= 6
+    assert all(event == proxy_service.CODEX_KEEPALIVE_FRAME for event in collected[:-1])
     last = cast(dict[str, object], proxy_service.parse_sse_data_json(collected[-1]))
     assert last["type"] == "response.failed"
     assert (

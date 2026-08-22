@@ -75,13 +75,13 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
     _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
-    _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
     _HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
     _effective_http_bridge_idle_ttl_seconds,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_durable_lookup_allows_turn_state_takeover,
     _http_bridge_eventless_budget_seconds,
     _http_bridge_eventless_max_keepalive_count,
+    _http_bridge_eventless_timeout_message,
     _http_bridge_is_context_overflow_error,
     _http_bridge_is_previous_response_owner_unavailable,
     _http_bridge_models_compatible,
@@ -3631,6 +3631,7 @@ class _HTTPBridgeStreamingMixin:
                 )
                 mark_bridge_eventless_failure()
                 await record_bridge_eventless_timeout_failure()
+                eventless_message = _http_bridge_eventless_timeout_message(session.unmatched_upstream_liveness_count)
                 if getattr(
                     _service_get_settings(),
                     "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
@@ -3640,7 +3641,7 @@ class _HTTPBridgeStreamingMixin:
                         503,
                         openai_error(
                             _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
-                            _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
+                            eventless_message,
                             error_type="server_error",
                         ),
                     ) from exc
@@ -3651,7 +3652,7 @@ class _HTTPBridgeStreamingMixin:
                             Mapping[str, JsonValue],
                             response_failed_event(
                                 _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
-                                _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
+                                eventless_message,
                                 response_id=downstream_response_id,
                             ),
                         )
@@ -3784,12 +3785,13 @@ class _HTTPBridgeStreamingMixin:
             await self._release_websocket_request_state_reservation(request_state)
             request_state.api_key_reservation = None
             mark_bridge_eventless_failure()
+            eventless_message = _http_bridge_eventless_timeout_message(session.unmatched_upstream_liveness_count)
             if propagate_http_errors:
                 raise ProxyResponseError(
                     503,
                     openai_error(
                         _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
-                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
+                        eventless_message,
                         error_type="server_error",
                     ),
                 )
@@ -3798,7 +3800,7 @@ class _HTTPBridgeStreamingMixin:
                     Mapping[str, JsonValue],
                     response_failed_event(
                         _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
-                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
+                        eventless_message,
                         response_id=_websocket_downstream_response_id(request_state),
                     ),
                 )
@@ -4464,12 +4466,15 @@ class _HTTPBridgeStreamingMixin:
                                             eventless_budget_seconds,
                                             session.unmatched_upstream_liveness_count,
                                         )
+                                        eventless_message = _http_bridge_eventless_timeout_message(
+                                            session.unmatched_upstream_liveness_count
+                                        )
                                         yield format_sse_event(
                                             cast(
                                                 Mapping[str, JsonValue],
                                                 response_failed_event(
                                                     _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
-                                                    _HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE,
+                                                    eventless_message,
                                                     response_id=downstream_response_id,
                                                 ),
                                             )

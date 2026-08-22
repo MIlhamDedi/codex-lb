@@ -58,8 +58,10 @@ STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES = frozenset(
 )
 # Pre-response-start bridge silence. Distinct from ``stream_idle_timeout``,
 # whose budget (``stream_idle_timeout_seconds``) only governs gaps *after*
-# ``response.created``. Nothing was created upstream, so a retry forks no
-# context and the client may safely repeat the request.
+# ``response.created``. When the bridge saw no unmatched upstream liveness,
+# nothing was created upstream and a retry forks no context. If liveness was
+# observed but not matched to a response, callers must treat retry as
+# at-least-once.
 HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE = "bridge_eventless_timeout"
 PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found"
 PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE = "Previous response was not found; retry without previous_response_id."

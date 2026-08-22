@@ -9095,9 +9095,10 @@ def _status_for_error(error_value: OpenAIError | None) -> int:
     if error_value and error_value.code == "previous_response_not_found":
         return 502
     if error_value and error_value.code == HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE:
-        # The bridge never got a response created upstream, so this is our
-        # availability problem and the request is safe to repeat: 503, not a
-        # 502 that claims the upstream returned a bad response.
+        # The bridge never matched a response.created event upstream, so this
+        # is our availability problem: 503, not a 502 that claims the upstream
+        # returned a bad response. Retry safety depends on whether the bridge
+        # observed unmatched upstream liveness before timing out.
         return 503
     if error_value and error_value.code in _UNAVAILABLE_SELECTION_ERROR_CODES:
         return 503
