@@ -25749,6 +25749,54 @@ def test_slim_response_create_preserves_only_namespaced_agent_control_custom_out
 
 
 @pytest.mark.parametrize(
+    "slimmer",
+    [
+        pytest.param(streaming_helpers_module._slim_response_create_payload_for_upstream, id="service-bridge"),
+        pytest.param(proxy_module._slim_response_create_payload_for_upstream, id="core-websocket"),
+    ],
+)
+def test_slim_response_create_keeps_agent_control_protocols_separate_for_reused_call_id(slimmer):
+    agent_custom_output = "agent-custom-result:" + ("c" * (33 * 1024))
+    unrelated_function_output = "unrelated-function-result:" + ("f" * (33 * 1024))
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "namespace": "collaboration",
+                "name": "wait_agent",
+                "call_id": "call_reused",
+                "input": '{"timeout_ms":120000}',
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_reused",
+                "output": agent_custom_output,
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_reused",
+                "output": unrelated_function_output,
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+    }
+
+    slimmed_payload, summary = slimmer(payload, max_bytes=256)
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+
+    assert summary is not None
+    assert summary["historical_tool_outputs_slimmed"] == 1
+    assert cast(dict[str, JsonValue], slimmed_input[1])["output"] == agent_custom_output
+    assert cast(dict[str, JsonValue], slimmed_input[2])["output"] == (
+        proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+            bytes=len(unrelated_function_output.encode("utf-8"))
+        )
+    )
+
+
+@pytest.mark.parametrize(
     "transport",
     [
         pytest.param(proxy_service._REQUEST_TRANSPORT_HTTP, id="http-bridge"),

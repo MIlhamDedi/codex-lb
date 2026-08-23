@@ -18,7 +18,7 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     ImageFetchSession,
     ProxyResponseError,
     UpstreamProxyRouteTrace,
-    _agent_control_function_call_ids,
+    _agent_control_tool_output_keys,
     _as_image_fetch_session,
     _inline_content_images,
     _inline_input_image_urls,
@@ -731,7 +731,7 @@ def _slim_response_create_payload_for_upstream(
     payload: dict[str, JsonValue],
     *,
     max_bytes: int,
-    protected_agent_control_call_ids: set[str] | None = None,
+    protected_agent_control_output_keys: set[tuple[str, str]] | None = None,
 ) -> tuple[dict[str, JsonValue], dict[str, int] | None]:
     input_value = payload.get("input")
     if not isinstance(input_value, list) or not input_value:
@@ -744,8 +744,8 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
-    if protected_agent_control_call_ids is None:
-        protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
+    if protected_agent_control_output_keys is None:
+        protected_agent_control_output_keys = _agent_control_tool_output_keys(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
@@ -755,7 +755,7 @@ def _slim_response_create_payload_for_upstream(
             item_images_slimmed,
         ) = _facade()._slim_historical_response_input_item(
             item,
-            protected_agent_control_call_ids=protected_agent_control_call_ids,
+            protected_agent_control_output_keys=protected_agent_control_output_keys,
         )
         tool_outputs_slimmed += item_tool_outputs_slimmed
         images_slimmed += item_images_slimmed
