@@ -167,6 +167,7 @@ _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE = "[codex-lb omitted historical inline im
 _SLIMMABLE_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(
     {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
 )
+_AGENT_CONTROL_TOOL_NAMESPACES = frozenset({"collaboration", "multi_agent_v1"})
 _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
     {
         "accept",
@@ -2767,10 +2768,14 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
+    protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
-        slimmed_item, item_tool_outputs_slimmed, item_images_slimmed = _slim_historical_response_input_item(item)
+        slimmed_item, item_tool_outputs_slimmed, item_images_slimmed = _slim_historical_response_input_item(
+            item,
+            protected_agent_control_call_ids=protected_agent_control_call_ids,
+        )
         tool_outputs_slimmed += item_tool_outputs_slimmed
         images_slimmed += item_images_slimmed
         slimmed_historical.append(slimmed_item)
@@ -2798,7 +2803,28 @@ def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
     return 0
 
 
-def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, int, int]:
+def _agent_control_function_call_ids(input_items: list[JsonValue]) -> set[str]:
+    call_ids: set[str] = set()
+    for item in input_items:
+        if not is_json_mapping(item) or item.get("type") != "function_call":
+            continue
+        namespace = item.get("namespace")
+        call_id = item.get("call_id")
+        if (
+            isinstance(namespace, str)
+            and namespace in _AGENT_CONTROL_TOOL_NAMESPACES
+            and isinstance(call_id, str)
+            and call_id
+        ):
+            call_ids.add(call_id)
+    return call_ids
+
+
+def _slim_historical_response_input_item(
+    item: JsonValue,
+    *,
+    protected_agent_control_call_ids: set[str],
+) -> tuple[JsonValue, int, int]:
     if not is_json_mapping(item):
         return item, 0, 0
 
@@ -2807,6 +2833,10 @@ def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, in
     images_slimmed = 0
 
     item_type = item_mapping.get("type")
+    if item_type == "function_call_output":
+        call_id = item_mapping.get("call_id")
+        if isinstance(call_id, str) and call_id in protected_agent_control_call_ids:
+            return item_mapping, tool_outputs_slimmed, images_slimmed
     if isinstance(item_type, str) and item_type in _SLIMMABLE_TOOL_CALL_OUTPUT_ITEM_TYPES:
         output = item_mapping.get("output")
         if isinstance(output, str):
