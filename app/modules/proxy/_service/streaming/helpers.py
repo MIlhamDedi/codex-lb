@@ -18,6 +18,7 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     ImageFetchSession,
     ProxyResponseError,
     UpstreamProxyRouteTrace,
+    _agent_control_function_call_ids,
     _as_image_fetch_session,
     _inline_content_images,
     _inline_input_image_urls,
@@ -742,6 +743,7 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
+    protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
@@ -749,7 +751,10 @@ def _slim_response_create_payload_for_upstream(
             slimmed_item,
             item_tool_outputs_slimmed,
             item_images_slimmed,
-        ) = _facade()._slim_historical_response_input_item(item)
+        ) = _facade()._slim_historical_response_input_item(
+            item,
+            protected_agent_control_call_ids=protected_agent_control_call_ids,
+        )
         tool_outputs_slimmed += item_tool_outputs_slimmed
         images_slimmed += item_images_slimmed
         slimmed_historical.append(slimmed_item)
