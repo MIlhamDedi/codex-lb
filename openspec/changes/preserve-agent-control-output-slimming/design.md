@@ -26,9 +26,10 @@ did not protect the direct core path and used a broad pending-call type set.
   `custom_tool_call` items whose namespace is exactly `collaboration` or
   `multi_agent_v1`; use call ID rather than tool name, because names are
   user-controlled.
-- Derive those IDs from the original `ResponsesRequest.input` before the
-  outbound payload normalization removes replay namespaces, then carry only
-  the IDs into slimming.
+- Derive those IDs only from the historical prefix of the original
+  `ResponsesRequest.input` before outbound payload normalization removes replay
+  namespaces, then carry only the IDs into slimming. Recent calls cannot
+  protect historical outputs that reuse the same call ID.
 - Skip slimming only for matching `function_call_output` and
   `custom_tool_call_output` items. Other output types keep their current
   treatment.

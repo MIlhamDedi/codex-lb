@@ -7,9 +7,11 @@ Every live upstream path MUST preserve a historical `function_call_output` or
 unchanged before forwarding an oversized Responses `response.create` when
 its non-empty `call_id` matches a historical `function_call` or
 `custom_tool_call` whose namespace is exactly `collaboration` or
-`multi_agent_v1`. The service MUST determine this from the original request
-input before outbound payload normalization removes replay namespaces, and use
-namespace and call ID rather than the tool name alone. Historical outputs
+`multi_agent_v1`. The service MUST determine this from the historical prefix of
+the original request input before outbound payload normalization removes replay
+namespaces, and use namespace and call ID rather than the tool name alone. A
+recent namespaced call MUST NOT protect a historical output that reuses its
+call ID. Historical outputs
 without such a matching call, including an unnamespaced user tool named
 `wait_agent` or `send_input`, MUST remain eligible for the normal omission
 policy.
@@ -38,3 +40,9 @@ policy.
   namespaces
 - **AND** the unrelated custom output remains eligible for the historical
   tool-output omission policy
+
+#### Scenario: Recent calls do not protect reused historical IDs
+- **WHEN** a historical unrelated output reuses the call ID of an
+  agent-control call that appears only after the latest user item
+- **THEN** every live slimming path leaves the historical output eligible for
+  the normal omission policy

@@ -10514,6 +10514,7 @@ async def test_stream_responses_websocket_preserves_agent_outputs_before_wire_na
 
     agent_custom_output = "agent-custom-result:" + ("c" * (33 * 1024))
     unrelated_custom_output = "unrelated-custom-result:" + ("u" * (33 * 1024))
+    reused_historical_output = "reused-historical-result:" + ("r" * (33 * 1024))
     payload = ResponsesRequest.model_validate(
         {
             "model": "gpt-5.4",
@@ -10543,7 +10544,19 @@ async def test_stream_responses_websocket_preserves_agent_outputs_before_wire_na
                     "call_id": "call_unrelated_custom",
                     "output": unrelated_custom_output,
                 },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_reused",
+                    "output": reused_historical_output,
+                },
                 {"role": "user", "content": "continue"},
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "collaboration",
+                    "name": "wait_agent",
+                    "call_id": "call_reused",
+                    "input": "{}",
+                },
             ],
         }
     )
@@ -10575,6 +10588,11 @@ async def test_stream_responses_websocket_preserves_agent_outputs_before_wire_na
     assert cast(dict[str, JsonValue], upstream_input[3])["output"] == (
         proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
             bytes=len(unrelated_custom_output.encode("utf-8"))
+        )
+    )
+    assert cast(dict[str, JsonValue], upstream_input[4])["output"] == (
+        proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+            bytes=len(reused_historical_output.encode("utf-8"))
         )
     )
 
@@ -25744,6 +25762,7 @@ def test_prepare_response_bridge_preserves_namespaced_custom_outputs_before_wire
     agent_function_output = "agent-function-result:" + ("f" * (33 * 1024))
     agent_custom_output = "agent-custom-result:" + ("c" * (33 * 1024))
     unrelated_custom_output = "unrelated-custom-result:" + ("u" * (33 * 1024))
+    reused_historical_output = "reused-historical-result:" + ("r" * (33 * 1024))
     payload = ResponsesRequest.model_validate(
         {
             "model": "gpt-5.1",
@@ -25785,7 +25804,19 @@ def test_prepare_response_bridge_preserves_namespaced_custom_outputs_before_wire
                     "call_id": "call_unrelated_custom",
                     "output": unrelated_custom_output,
                 },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_reused",
+                    "output": reused_historical_output,
+                },
                 {"role": "user", "content": "continue"},
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "collaboration",
+                    "name": "wait_agent",
+                    "call_id": "call_reused",
+                    "input": "{}",
+                },
             ],
         }
     )
@@ -25808,6 +25839,9 @@ def test_prepare_response_bridge_preserves_namespaced_custom_outputs_before_wire
     assert upstream_input[3]["output"] == agent_custom_output
     assert upstream_input[5]["output"] == proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
         bytes=len(unrelated_custom_output.encode("utf-8"))
+    )
+    assert upstream_input[6]["output"] == proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+        bytes=len(reused_historical_output.encode("utf-8"))
     )
 
 

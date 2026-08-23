@@ -2834,6 +2834,11 @@ def _agent_control_function_call_ids(input_items: list[JsonValue]) -> set[str]:
     return call_ids
 
 
+def _historical_agent_control_call_ids(input_items: list[JsonValue]) -> set[str]:
+    suffix_start = _response_create_recent_suffix_start(input_items)
+    return _agent_control_function_call_ids(input_items[:suffix_start])
+
+
 def _slim_historical_response_input_item(
     item: JsonValue,
     *,
@@ -3304,7 +3309,7 @@ async def _stream_responses_with_session(
     retryable_same_contract: bool | None = None
     client_session = session
     protected_agent_control_call_ids = (
-        _agent_control_function_call_ids(cast(list[JsonValue], payload.input))
+        _historical_agent_control_call_ids(cast(list[JsonValue], payload.input))
         if isinstance(payload.input, list)
         else set()
     )
