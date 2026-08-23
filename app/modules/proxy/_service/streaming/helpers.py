@@ -731,6 +731,7 @@ def _slim_response_create_payload_for_upstream(
     payload: dict[str, JsonValue],
     *,
     max_bytes: int,
+    protected_agent_control_call_ids: set[str] | None = None,
 ) -> tuple[dict[str, JsonValue], dict[str, int] | None]:
     input_value = payload.get("input")
     if not isinstance(input_value, list) or not input_value:
@@ -743,7 +744,8 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
-    protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
+    if protected_agent_control_call_ids is None:
+        protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:

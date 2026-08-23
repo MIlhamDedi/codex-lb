@@ -2450,6 +2450,7 @@ async def _close_unmanaged_websocket(websocket: Any | None) -> None:
 async def _stream_responses_via_websocket(
     *,
     payload_dict: JsonObject,
+    protected_agent_control_call_ids: set[str] | None = None,
     url: str,
     headers: Mapping[str, str],
     client_session: aiohttp.ClientSession,
@@ -2468,7 +2469,10 @@ async def _stream_responses_via_websocket(
     """Yield ``(sse_block, event_type)`` pairs from the upstream websocket."""
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
-    request_payload = _prepare_websocket_response_create_payload(payload_dict)
+    request_payload = _prepare_websocket_response_create_payload(
+        payload_dict,
+        protected_agent_control_call_ids=protected_agent_control_call_ids,
+    )
     websocket_cm: AsyncContextManager[aiohttp.ClientWebSocketResponse] | None = None
     websocket: aiohttp.ClientWebSocketResponse | None = None
     circuit_breaker = None
@@ -2690,7 +2694,11 @@ def _build_websocket_response_create_payload(payload_dict: JsonObject) -> JsonOb
     return request_payload
 
 
-def _prepare_websocket_response_create_payload(payload_dict: JsonObject) -> JsonObject:
+def _prepare_websocket_response_create_payload(
+    payload_dict: JsonObject,
+    *,
+    protected_agent_control_call_ids: set[str] | None = None,
+) -> JsonObject:
     request_payload = _build_websocket_response_create_payload(payload_dict)
     payload_text = json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))
     payload_size = len(payload_text.encode("utf-8"))
@@ -2698,6 +2706,7 @@ def _prepare_websocket_response_create_payload(payload_dict: JsonObject) -> Json
         slimmed_payload, slim_summary = _slim_response_create_payload_for_upstream(
             request_payload,
             max_bytes=_UPSTREAM_RESPONSE_CREATE_MAX_BYTES,
+            protected_agent_control_call_ids=protected_agent_control_call_ids,
         )
         if slim_summary is not None:
             request_payload = slimmed_payload
@@ -2755,6 +2764,7 @@ def _slim_response_create_payload_for_upstream(
     payload: JsonObject,
     *,
     max_bytes: int,
+    protected_agent_control_call_ids: set[str] | None = None,
 ) -> tuple[JsonObject, dict[str, int] | None]:
     del max_bytes
     input_value = payload.get("input")
@@ -2768,7 +2778,8 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
-    protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
+    if protected_agent_control_call_ids is None:
+        protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
@@ -2806,7 +2817,10 @@ def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
 def _agent_control_function_call_ids(input_items: list[JsonValue]) -> set[str]:
     call_ids: set[str] = set()
     for item in input_items:
-        if not is_json_mapping(item) or item.get("type") != "function_call":
+        if not is_json_mapping(item):
+            continue
+        item_type = item.get("type")
+        if not isinstance(item_type, str) or item_type not in {"function_call", "custom_tool_call"}:
             continue
         namespace = item.get("namespace")
         call_id = item.get("call_id")
@@ -2833,7 +2847,7 @@ def _slim_historical_response_input_item(
     images_slimmed = 0
 
     item_type = item_mapping.get("type")
-    if item_type == "function_call_output":
+    if isinstance(item_type, str) and item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = item_mapping.get("call_id")
         if isinstance(call_id, str) and call_id in protected_agent_control_call_ids:
             return item_mapping, tool_outputs_slimmed, images_slimmed
@@ -3289,6 +3303,11 @@ async def _stream_responses_with_session(
     failure_exception_type: str | None = None
     retryable_same_contract: bool | None = None
     client_session = session
+    protected_agent_control_call_ids = (
+        _agent_control_function_call_ids(cast(list[JsonValue], payload.input))
+        if isinstance(payload.input, list)
+        else set()
+    )
     payload_dict = dict(payload.to_payload())
     apply_codex_installation_metadata(payload_dict, codex_installation_id)
     if settings.image_inline_fetch_enabled:
@@ -3645,6 +3664,7 @@ async def _stream_responses_with_session(
             try:
                 async for event_block, event_type in _stream_responses_via_websocket(
                     payload_dict=payload_dict,
+                    protected_agent_control_call_ids=protected_agent_control_call_ids,
                     url=url,
                     headers=upstream_headers,
                     client_session=client_session,
