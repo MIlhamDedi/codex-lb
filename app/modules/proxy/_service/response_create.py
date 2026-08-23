@@ -17,9 +17,9 @@ from app.core.clients.proxy import (
     CODEX_INSTALLATION_ID_HEADER,
     ImageFetchSession,
     ProxyResponseError,
-    _agent_control_function_call_ids,
+    _agent_control_tool_output_keys,
     _finalize_responses_lite_reasoning_context,
-    _historical_agent_control_call_ids,
+    _historical_agent_control_output_keys,
     _inline_content_images,
     _normalize_responses_lite_websocket_client_metadata,
     _payload_has_responses_lite_websocket_marker,
@@ -214,8 +214,8 @@ def _response_create_text_with_size_guard(
     request_state: _WebSocketRequestState,
     transport: str,
 ) -> str | None:
-    protected_agent_control_call_ids = (
-        _historical_agent_control_call_ids(cast(list[JsonValue], payload.input))
+    protected_agent_control_output_keys = (
+        _historical_agent_control_output_keys(cast(list[JsonValue], payload.input))
         if isinstance(payload.input, list)
         else set()
     )
@@ -245,7 +245,7 @@ def _response_create_text_with_size_guard(
         slimmed_payload, slim_summary = slim_payload_for_upstream(
             upstream_payload,
             max_bytes=max_bytes,
-            protected_agent_control_call_ids=protected_agent_control_call_ids,
+            protected_agent_control_output_keys=protected_agent_control_output_keys,
         )
         if slim_summary is not None:
             upstream_payload = slimmed_payload
@@ -310,7 +310,7 @@ def _slim_response_create_payload_for_upstream(
     payload: dict[str, JsonValue],
     *,
     max_bytes: int,
-    protected_agent_control_call_ids: set[str] | None = None,
+    protected_agent_control_output_keys: set[tuple[str, str]] | None = None,
 ) -> tuple[dict[str, JsonValue], dict[str, int] | None]:
     input_value = payload.get("input")
     if not isinstance(input_value, list) or not input_value:
@@ -323,8 +323,8 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
-    if protected_agent_control_call_ids is None:
-        protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
+    if protected_agent_control_output_keys is None:
+        protected_agent_control_output_keys = _agent_control_tool_output_keys(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
@@ -334,7 +334,7 @@ def _slim_response_create_payload_for_upstream(
             item_images_slimmed,
         ) = _slim_historical_response_input_item(
             item,
-            protected_agent_control_call_ids=protected_agent_control_call_ids,
+            protected_agent_control_output_keys=protected_agent_control_output_keys,
         )
         tool_outputs_slimmed += item_tool_outputs_slimmed
         images_slimmed += item_images_slimmed
@@ -466,7 +466,7 @@ def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
 def _slim_historical_response_input_item(
     item: JsonValue,
     *,
-    protected_agent_control_call_ids: set[str],
+    protected_agent_control_output_keys: set[tuple[str, str]],
 ) -> tuple[JsonValue, int, int]:
     if not is_json_mapping(item):
         return item, 0, 0
@@ -478,7 +478,7 @@ def _slim_historical_response_input_item(
     item_type = item_mapping.get("type")
     if isinstance(item_type, str) and item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = item_mapping.get("call_id")
-        if isinstance(call_id, str) and call_id in protected_agent_control_call_ids:
+        if isinstance(call_id, str) and (item_type, call_id) in protected_agent_control_output_keys:
             return item_mapping, tool_outputs_slimmed, images_slimmed
     if isinstance(item_type, str) and item_type in _PENDING_TOOL_CALL_OUTPUT_ITEM_TYPES:
         output = item_mapping.get("output")

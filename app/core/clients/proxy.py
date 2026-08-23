@@ -168,6 +168,10 @@ _SLIMMABLE_TOOL_CALL_OUTPUT_ITEM_TYPES = frozenset(
     {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
 )
 _AGENT_CONTROL_TOOL_NAMESPACES = frozenset({"collaboration", "multi_agent_v1"})
+_AGENT_CONTROL_OUTPUT_TYPE_BY_CALL_TYPE = {
+    "function_call": "function_call_output",
+    "custom_tool_call": "custom_tool_call_output",
+}
 _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
     {
         "accept",
@@ -2392,7 +2396,7 @@ async def _close_unmanaged_websocket(websocket: Any | None) -> None:
 async def _stream_responses_via_websocket(
     *,
     payload_dict: JsonObject,
-    protected_agent_control_call_ids: set[str] | None = None,
+    protected_agent_control_output_keys: set[tuple[str, str]] | None = None,
     url: str,
     headers: Mapping[str, str],
     client_session: aiohttp.ClientSession,
@@ -2413,7 +2417,7 @@ async def _stream_responses_via_websocket(
     request_started_at = time.monotonic()
     request_payload = _prepare_websocket_response_create_payload(
         payload_dict,
-        protected_agent_control_call_ids=protected_agent_control_call_ids,
+        protected_agent_control_output_keys=protected_agent_control_output_keys,
     )
     websocket_cm: AsyncContextManager[aiohttp.ClientWebSocketResponse] | None = None
     websocket: aiohttp.ClientWebSocketResponse | None = None
@@ -2639,7 +2643,7 @@ def _build_websocket_response_create_payload(payload_dict: JsonObject) -> JsonOb
 def _prepare_websocket_response_create_payload(
     payload_dict: JsonObject,
     *,
-    protected_agent_control_call_ids: set[str] | None = None,
+    protected_agent_control_output_keys: set[tuple[str, str]] | None = None,
 ) -> JsonObject:
     request_payload = _build_websocket_response_create_payload(payload_dict)
     payload_text = json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))
@@ -2648,7 +2652,7 @@ def _prepare_websocket_response_create_payload(
         slimmed_payload, slim_summary = _slim_response_create_payload_for_upstream(
             request_payload,
             max_bytes=_UPSTREAM_RESPONSE_CREATE_MAX_BYTES,
-            protected_agent_control_call_ids=protected_agent_control_call_ids,
+            protected_agent_control_output_keys=protected_agent_control_output_keys,
         )
         if slim_summary is not None:
             request_payload = slimmed_payload
@@ -2706,7 +2710,7 @@ def _slim_response_create_payload_for_upstream(
     payload: JsonObject,
     *,
     max_bytes: int,
-    protected_agent_control_call_ids: set[str] | None = None,
+    protected_agent_control_output_keys: set[tuple[str, str]] | None = None,
 ) -> tuple[JsonObject, dict[str, int] | None]:
     del max_bytes
     input_value = payload.get("input")
@@ -2720,14 +2724,14 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
-    if protected_agent_control_call_ids is None:
-        protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
+    if protected_agent_control_output_keys is None:
+        protected_agent_control_output_keys = _agent_control_tool_output_keys(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
         slimmed_item, item_tool_outputs_slimmed, item_images_slimmed = _slim_historical_response_input_item(
             item,
-            protected_agent_control_call_ids=protected_agent_control_call_ids,
+            protected_agent_control_output_keys=protected_agent_control_output_keys,
         )
         tool_outputs_slimmed += item_tool_outputs_slimmed
         images_slimmed += item_images_slimmed
@@ -2756,13 +2760,16 @@ def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
     return 0
 
 
-def _agent_control_function_call_ids(input_items: list[JsonValue]) -> set[str]:
-    call_ids: set[str] = set()
+def _agent_control_tool_output_keys(input_items: list[JsonValue]) -> set[tuple[str, str]]:
+    output_keys: set[tuple[str, str]] = set()
     for item in input_items:
         if not is_json_mapping(item):
             continue
         item_type = item.get("type")
-        if not isinstance(item_type, str) or item_type not in {"function_call", "custom_tool_call"}:
+        if not isinstance(item_type, str):
+            continue
+        output_type = _AGENT_CONTROL_OUTPUT_TYPE_BY_CALL_TYPE.get(item_type)
+        if output_type is None:
             continue
         namespace = item.get("namespace")
         call_id = item.get("call_id")
@@ -2772,19 +2779,19 @@ def _agent_control_function_call_ids(input_items: list[JsonValue]) -> set[str]:
             and isinstance(call_id, str)
             and call_id
         ):
-            call_ids.add(call_id)
-    return call_ids
+            output_keys.add((output_type, call_id))
+    return output_keys
 
 
-def _historical_agent_control_call_ids(input_items: list[JsonValue]) -> set[str]:
+def _historical_agent_control_output_keys(input_items: list[JsonValue]) -> set[tuple[str, str]]:
     suffix_start = _response_create_recent_suffix_start(input_items)
-    return _agent_control_function_call_ids(input_items[:suffix_start])
+    return _agent_control_tool_output_keys(input_items[:suffix_start])
 
 
 def _slim_historical_response_input_item(
     item: JsonValue,
     *,
-    protected_agent_control_call_ids: set[str],
+    protected_agent_control_output_keys: set[tuple[str, str]],
 ) -> tuple[JsonValue, int, int]:
     if not is_json_mapping(item):
         return item, 0, 0
@@ -2796,7 +2803,7 @@ def _slim_historical_response_input_item(
     item_type = item_mapping.get("type")
     if isinstance(item_type, str) and item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = item_mapping.get("call_id")
-        if isinstance(call_id, str) and call_id in protected_agent_control_call_ids:
+        if isinstance(call_id, str) and (item_type, call_id) in protected_agent_control_output_keys:
             return item_mapping, tool_outputs_slimmed, images_slimmed
     if isinstance(item_type, str) and item_type in _SLIMMABLE_TOOL_CALL_OUTPUT_ITEM_TYPES:
         output = item_mapping.get("output")
@@ -3250,8 +3257,8 @@ async def _stream_responses_with_session(
     failure_exception_type: str | None = None
     retryable_same_contract: bool | None = None
     client_session = session
-    protected_agent_control_call_ids = (
-        _historical_agent_control_call_ids(cast(list[JsonValue], payload.input))
+    protected_agent_control_output_keys = (
+        _historical_agent_control_output_keys(cast(list[JsonValue], payload.input))
         if isinstance(payload.input, list)
         else set()
     )
@@ -3611,7 +3618,7 @@ async def _stream_responses_with_session(
             try:
                 async for event_block, event_type in _stream_responses_via_websocket(
                     payload_dict=payload_dict,
-                    protected_agent_control_call_ids=protected_agent_control_call_ids,
+                    protected_agent_control_output_keys=protected_agent_control_output_keys,
                     url=url,
                     headers=upstream_headers,
                     client_session=client_session,
