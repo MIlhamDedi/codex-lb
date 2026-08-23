@@ -21,9 +21,9 @@ from app.core.clients.proxy import (  # noqa: F401
     ImageFetchSession,
     ProxyResponseError,
     UpstreamProxyRouteTrace,
-    _agent_control_function_call_ids,
     _as_image_fetch_session,
     _finalize_responses_lite_reasoning_context,
+    _historical_agent_control_call_ids,
     _inline_content_images,
     _inline_input_image_urls,
     _payload_has_responses_lite_websocket_marker,
@@ -634,7 +634,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 deduped_replayed_input_fingerprint = _fingerprint_input_items(replayed_input_items)
                 payload = payload.model_copy(update={"input": deduped_input_items})
         protected_agent_control_call_ids = (
-            _agent_control_function_call_ids(cast(list[JsonValue], payload.input))
+            _historical_agent_control_call_ids(cast(list[JsonValue], payload.input))
             if isinstance(payload.input, list)
             else set()
         )

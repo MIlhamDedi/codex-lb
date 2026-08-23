@@ -7,6 +7,8 @@
       WebSocket historical slimming loops.
 - [x] 1.3 Classify IDs from the original request before outbound normalization
       strips replay namespaces, while keeping the normalized wire payload.
+- [x] 1.4 Restrict pre-normalization classification to the historical prefix so
+      recent calls cannot protect historical outputs with reused IDs.
 
 ## 2. Regression coverage
 
@@ -16,6 +18,8 @@
 - [x] 2.2 Prove HTTP and WebSocket bridge forwarding preserves both namespaced
       function and custom outputs after wire namespace stripping, while an
       unrelated namespaced custom output is still slimmed.
+- [x] 2.3 Prove a recent namespaced call does not protect a historical output
+      that reuses its call ID.
 
 ## 3. Validation
 

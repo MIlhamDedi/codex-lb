@@ -10,8 +10,8 @@ namespaced collaboration wait or other agent-control call.
   only when its matching pending call has the `collaboration` or
   `multi_agent_v1` namespace.
 - Apply the same call-ID-based rule to the bridge/service and direct WebSocket
-  response-create slim paths, classifying from the original request before
-  outbound normalization strips replay namespaces.
+  response-create slim paths, classifying only the original historical prefix
+  before outbound normalization strips replay namespaces.
 - Keep unrelated oversized outputs, including bare-name user tools, eligible
   for the existing omission policy.
 

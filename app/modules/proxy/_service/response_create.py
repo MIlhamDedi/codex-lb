@@ -19,6 +19,7 @@ from app.core.clients.proxy import (
     ProxyResponseError,
     _agent_control_function_call_ids,
     _finalize_responses_lite_reasoning_context,
+    _historical_agent_control_call_ids,
     _inline_content_images,
     _normalize_responses_lite_websocket_client_metadata,
     _payload_has_responses_lite_websocket_marker,
@@ -214,7 +215,7 @@ def _response_create_text_with_size_guard(
     transport: str,
 ) -> str | None:
     protected_agent_control_call_ids = (
-        _agent_control_function_call_ids(cast(list[JsonValue], payload.input))
+        _historical_agent_control_call_ids(cast(list[JsonValue], payload.input))
         if isinstance(payload.input, list)
         else set()
     )
