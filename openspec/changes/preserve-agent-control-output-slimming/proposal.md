@@ -6,10 +6,12 @@ namespaced collaboration wait or other agent-control call.
 
 ## What Changes
 
-- Preserve a historical `function_call_output` only when its matching pending
-  `function_call` has the `collaboration` or `multi_agent_v1` namespace.
+- Preserve a historical `function_call_output` or `custom_tool_call_output`
+  only when its matching pending call has the `collaboration` or
+  `multi_agent_v1` namespace.
 - Apply the same call-ID-based rule to the bridge/service and direct WebSocket
-  response-create slim paths.
+  response-create slim paths, classifying from the original request before
+  outbound normalization strips replay namespaces.
 - Keep unrelated oversized outputs, including bare-name user tools, eligible
   for the existing omission policy.
 

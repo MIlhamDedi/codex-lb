@@ -10406,6 +10406,91 @@ async def test_stream_responses_uses_websocket_upstream_when_forced(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_websocket_preserves_agent_outputs_before_wire_namespace_strip(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 8.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        trace_channels = frozenset()
+        proxy_request_budget_seconds = 75.0
+        upstream_stream_transport = "websocket"
+        upstream_websocket_mode = "force"
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 40 * 1024)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    agent_custom_output = "agent-custom-result:" + ("c" * (33 * 1024))
+    unrelated_custom_output = "unrelated-custom-result:" + ("u" * (33 * 1024))
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "collaboration",
+                    "name": "wait_agent",
+                    "call_id": "call_agent_custom",
+                    "input": '{"timeout_ms":120000}',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_agent_custom",
+                    "output": agent_custom_output,
+                },
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "unrelated_namespace",
+                    "name": "wait_agent",
+                    "call_id": "call_unrelated_custom",
+                    "input": "{}",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_unrelated_custom",
+                    "output": unrelated_custom_output,
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+    response = _WsResponse(
+        [
+            _WsMessage(
+                proxy_module.aiohttp.WSMsgType.TEXT,
+                json.dumps({"type": "response.completed", "response": {"id": "resp_ws"}}),
+            )
+        ]
+    )
+    session = _WsSession(response)
+
+    events = [
+        event
+        async for event in proxy_module.stream_responses(
+            payload,
+            headers={"originator": "Codex Desktop"},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+    ]
+
+    assert len(events) == 1
+    upstream_input = cast(list[JsonValue], response.sent_json[0]["input"])
+    assert all("namespace" not in item for item in upstream_input if isinstance(item, dict))
+    assert cast(dict[str, JsonValue], upstream_input[1])["output"] == agent_custom_output
+    assert cast(dict[str, JsonValue], upstream_input[3])["output"] == (
+        proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+            bytes=len(unrelated_custom_output.encode("utf-8"))
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_forced_websocket_does_not_fallback_on_handshake_rejection(monkeypatch):
     class Settings:
         upstream_base_url = "https://chatgpt.com/backend-api"
@@ -24261,6 +24346,142 @@ def test_slim_response_create_preserves_only_namespaced_agent_control_outputs(sl
     )
     assert cast(dict[str, JsonValue], slimmed_input[5])["output"] == omission_notice.format(
         bytes=len(shell_output.encode("utf-8"))
+    )
+
+
+@pytest.mark.parametrize(
+    "slimmer",
+    [
+        pytest.param(streaming_helpers_module._slim_response_create_payload_for_upstream, id="service-bridge"),
+        pytest.param(proxy_module._slim_response_create_payload_for_upstream, id="core-websocket"),
+    ],
+)
+def test_slim_response_create_preserves_only_namespaced_agent_control_custom_outputs(slimmer):
+    agent_custom_output = "agent-custom-result:" + ("c" * (33 * 1024))
+    unrelated_custom_output = "unrelated-custom-result:" + ("u" * (33 * 1024))
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "namespace": "collaboration",
+                "name": "wait_agent",
+                "call_id": "call_agent_custom",
+                "input": '{"timeout_ms":120000}',
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_agent_custom",
+                "output": agent_custom_output,
+            },
+            {
+                "type": "custom_tool_call",
+                "namespace": "unrelated_namespace",
+                "name": "wait_agent",
+                "call_id": "call_unrelated_custom",
+                "input": "{}",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_unrelated_custom",
+                "output": unrelated_custom_output,
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+    }
+
+    slimmed_payload, summary = slimmer(payload, max_bytes=256)
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+
+    assert summary is not None
+    assert summary["historical_tool_outputs_slimmed"] == 1
+    assert cast(dict[str, JsonValue], slimmed_input[1])["output"] == agent_custom_output
+    assert cast(dict[str, JsonValue], slimmed_input[3])["output"] == (
+        proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+            bytes=len(unrelated_custom_output.encode("utf-8"))
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        pytest.param(proxy_service._REQUEST_TRANSPORT_HTTP, id="http-bridge"),
+        pytest.param(proxy_service._REQUEST_TRANSPORT_WEBSOCKET, id="websocket-bridge"),
+    ],
+)
+def test_prepare_response_bridge_preserves_namespaced_custom_outputs_before_wire_namespace_strip(
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+):
+    agent_function_output = "agent-function-result:" + ("f" * (33 * 1024))
+    agent_custom_output = "agent-custom-result:" + ("c" * (33 * 1024))
+    unrelated_custom_output = "unrelated-custom-result:" + ("u" * (33 * 1024))
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "input": [
+                {
+                    "type": "function_call",
+                    "namespace": "multi_agent_v1",
+                    "name": "wait_agent",
+                    "call_id": "call_agent_function",
+                    "arguments": '{"timeout_ms":120000}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_agent_function",
+                    "output": agent_function_output,
+                },
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "collaboration",
+                    "name": "wait_agent",
+                    "call_id": "call_agent_custom",
+                    "input": '{"timeout_ms":120000}',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_agent_custom",
+                    "output": agent_custom_output,
+                },
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "unrelated_namespace",
+                    "name": "wait_agent",
+                    "call_id": "call_unrelated_custom",
+                    "input": "{}",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_unrelated_custom",
+                    "output": unrelated_custom_output,
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+    monkeypatch.setattr(proxy_http_bridge_request_submit, "_upstream_response_create_max_bytes", lambda: 256)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+
+    _, text_data = service._prepare_response_bridge_request_state(
+        payload,
+        api_key=None,
+        api_key_reservation=None,
+        include_type_field=True,
+        attach_event_queue=False,
+        transport=transport,
+        client_metadata=None,
+    )
+
+    upstream_input = json.loads(text_data)["input"]
+    assert all("namespace" not in item for item in upstream_input if isinstance(item, dict))
+    assert upstream_input[1]["output"] == agent_function_output
+    assert upstream_input[3]["output"] == agent_custom_output
+    assert upstream_input[5]["output"] == proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+        bytes=len(unrelated_custom_output.encode("utf-8"))
     )
 
 

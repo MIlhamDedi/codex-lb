@@ -21,6 +21,7 @@ from app.core.clients.proxy import (  # noqa: F401
     ImageFetchSession,
     ProxyResponseError,
     UpstreamProxyRouteTrace,
+    _agent_control_function_call_ids,
     _as_image_fetch_session,
     _finalize_responses_lite_reasoning_context,
     _inline_content_images,
@@ -632,6 +633,11 @@ class _HTTPBridgeRequestSubmitMixin:
                 deduped_replayed_input_count = len(replayed_input_items)
                 deduped_replayed_input_fingerprint = _fingerprint_input_items(replayed_input_items)
                 payload = payload.model_copy(update={"input": deduped_input_items})
+        protected_agent_control_call_ids = (
+            _agent_control_function_call_ids(cast(list[JsonValue], payload.input))
+            if isinstance(payload.input, list)
+            else set()
+        )
         upstream_payload = dict(payload.to_payload())
         upstream_payload.pop("stream", None)
         upstream_payload.pop("background", None)
@@ -711,6 +717,7 @@ class _HTTPBridgeRequestSubmitMixin:
             slimmed_payload, slim_summary = _slim_response_create_payload_for_upstream(
                 upstream_payload,
                 max_bytes=max_bytes,
+                protected_agent_control_call_ids=protected_agent_control_call_ids,
             )
             if slim_summary is not None:
                 upstream_payload = slimmed_payload

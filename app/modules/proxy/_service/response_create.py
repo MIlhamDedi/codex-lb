@@ -213,6 +213,11 @@ def _response_create_text_with_size_guard(
     request_state: _WebSocketRequestState,
     transport: str,
 ) -> str | None:
+    protected_agent_control_call_ids = (
+        _agent_control_function_call_ids(cast(list[JsonValue], payload.input))
+        if isinstance(payload.input, list)
+        else set()
+    )
     upstream_payload = dict(payload.to_payload())
     upstream_payload.pop("stream", None)
     upstream_payload.pop("background", None)
@@ -239,6 +244,7 @@ def _response_create_text_with_size_guard(
         slimmed_payload, slim_summary = slim_payload_for_upstream(
             upstream_payload,
             max_bytes=max_bytes,
+            protected_agent_control_call_ids=protected_agent_control_call_ids,
         )
         if slim_summary is not None:
             upstream_payload = slimmed_payload
@@ -303,6 +309,7 @@ def _slim_response_create_payload_for_upstream(
     payload: dict[str, JsonValue],
     *,
     max_bytes: int,
+    protected_agent_control_call_ids: set[str] | None = None,
 ) -> tuple[dict[str, JsonValue], dict[str, int] | None]:
     input_value = payload.get("input")
     if not isinstance(input_value, list) or not input_value:
@@ -315,7 +322,8 @@ def _slim_response_create_payload_for_upstream(
 
     tool_outputs_slimmed = 0
     images_slimmed = 0
-    protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
+    if protected_agent_control_call_ids is None:
+        protected_agent_control_call_ids = _agent_control_function_call_ids(historical)
 
     slimmed_historical: list[JsonValue] = []
     for item in historical:
@@ -467,7 +475,7 @@ def _slim_historical_response_input_item(
     images_slimmed = 0
 
     item_type = item_mapping.get("type")
-    if item_type == "function_call_output":
+    if isinstance(item_type, str) and item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = item_mapping.get("call_id")
         if isinstance(call_id, str) and call_id in protected_agent_control_call_ids:
             return item_mapping, tool_outputs_slimmed, images_slimmed

@@ -1,12 +1,15 @@
 ## ADDED Requirements
 
-### Requirement: Namespaced agent-control function-call outputs survive historical slimming
+### Requirement: Namespaced agent-control tool-call outputs survive historical slimming
 
-Every live upstream path MUST preserve a historical `function_call_output`
+Every live upstream path MUST preserve a historical `function_call_output` or
+`custom_tool_call_output`
 unchanged before forwarding an oversized Responses `response.create` when
-its non-empty `call_id` matches a historical `function_call` whose namespace is
-exactly `collaboration` or `multi_agent_v1`. The service MUST determine this
-from namespace and call ID, not from the tool name alone. Historical outputs
+its non-empty `call_id` matches a historical `function_call` or
+`custom_tool_call` whose namespace is exactly `collaboration` or
+`multi_agent_v1`. The service MUST determine this from the original request
+input before outbound payload normalization removes replay namespaces, and use
+namespace and call ID rather than the tool name alone. Historical outputs
 without such a matching call, including an unnamespaced user tool named
 `wait_agent` or `send_input`, MUST remain eligible for the normal omission
 policy.
@@ -25,3 +28,13 @@ policy.
   `send_input` and has a large matching `function_call_output`
 - **THEN** each live slimming path leaves that output eligible for the normal
   historical tool-output omission policy
+
+#### Scenario: Namespaced custom tool output is retained after wire normalization
+- **WHEN** a historical `collaboration` `custom_tool_call` has a large
+  matching `custom_tool_call_output`, and another custom call uses a namespace
+  outside the agent-control allowlist
+- **THEN** HTTP bridge and WebSocket bridge forwarding preserve the
+  agent-control custom output even though both outbound payloads omit replay
+  namespaces
+- **AND** the unrelated custom output remains eligible for the historical
+  tool-output omission policy
