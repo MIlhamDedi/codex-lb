@@ -7,11 +7,18 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
-from typing import Protocol, TypeVar, cast
+from datetime import datetime, timedelta
+from typing import Literal, Protocol, TypeVar, cast
 
 from app.core import startup as startup_module
 from app.core.config.settings import Settings, get_settings
+from app.core.metrics.prometheus import (
+    PROMETHEUS_AVAILABLE,
+    http_bridge_spool_cleanup_backlog_likely,
+    http_bridge_spool_cleanup_deleted_operations_total,
+    http_bridge_spool_cleanup_duration_seconds,
+    http_bridge_spool_cleanup_runs_total,
+)
 from app.core.utils.time import utcnow
 from app.db.models import DashboardSettings
 from app.db.session import SessionLocal, get_background_session
@@ -39,6 +46,110 @@ _CLEANUP_INTERVAL_SECONDS = 300
 # an owner stuck unavailable well past when it should have recovered gets
 # its mapping dropped (never rebound) so the next request re-resolves fresh.
 _STALE_HARD_CODEX_SESSION_UNAVAILABLE_SECONDS = 6 * 3600
+
+# Transcript cleanup shares SQLite with request traffic and leader renewal.
+# Keep each pass large enough to outpace steady-state expiry, but small enough
+# that a historical backlog is resumed across scheduler ticks instead of
+# monopolizing the database in one drain-all loop.
+_OPERATION_RETENTION_BATCH_SIZE = 50
+_OPERATION_RETENTION_MAX_BATCHES = 4
+_OPERATION_RETENTION_TIME_BUDGET_SECONDS = 5.0
+_OPERATION_RETENTION_BACKLOG_RETRY_SECONDS = 5.0
+
+
+OperationRetentionOutcome = Literal[
+    "completed",
+    "batch_budget_exhausted",
+    "time_budget_exhausted",
+    "failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class OperationRetentionCleanupResult:
+    deleted_operations: int
+    batches: int
+    backlog_likely: bool
+    outcome: OperationRetentionOutcome
+    duration_seconds: float
+
+
+class OperationRetentionCleanupError(RuntimeError):
+    def __init__(self, result: OperationRetentionCleanupResult, *, error_type: str) -> None:
+        super().__init__("durable operation retention batch failed")
+        self.result = result
+        self.error_type = error_type
+
+
+async def _purge_operation_spool_with_budget(
+    bridge_repo: DurableBridgeRepository,
+    *,
+    cutoff: datetime,
+) -> OperationRetentionCleanupResult:
+    started_at = time.monotonic()
+    deleted_operations = 0
+    batches = 0
+    outcome: OperationRetentionOutcome = "completed"
+
+    while True:
+        try:
+            batch_result = await bridge_repo.purge_operation_spool_batch(
+                cutoff=cutoff,
+                batch_size=_OPERATION_RETENTION_BATCH_SIZE,
+            )
+        except Exception as exc:
+            raise OperationRetentionCleanupError(
+                OperationRetentionCleanupResult(
+                    deleted_operations=deleted_operations,
+                    batches=batches,
+                    backlog_likely=True,
+                    outcome="failed",
+                    duration_seconds=max(time.monotonic() - started_at, 0.0),
+                ),
+                error_type=type(exc).__name__,
+            ) from None
+        deleted_operations += batch_result.deleted_operations
+        batches += 1
+        if batch_result.selected_operations < _OPERATION_RETENTION_BATCH_SIZE:
+            break
+        if time.monotonic() - started_at >= _OPERATION_RETENTION_TIME_BUDGET_SECONDS:
+            outcome = "time_budget_exhausted"
+            break
+        if batches >= _OPERATION_RETENTION_MAX_BATCHES:
+            outcome = "batch_budget_exhausted"
+            break
+        await asyncio.sleep(0)
+
+    return OperationRetentionCleanupResult(
+        deleted_operations=deleted_operations,
+        batches=batches,
+        backlog_likely=outcome != "completed",
+        outcome=outcome,
+        duration_seconds=max(time.monotonic() - started_at, 0.0),
+    )
+
+
+def _record_operation_retention_cleanup(result: OperationRetentionCleanupResult) -> None:
+    if not PROMETHEUS_AVAILABLE:
+        return
+    assert http_bridge_spool_cleanup_runs_total is not None
+    assert http_bridge_spool_cleanup_deleted_operations_total is not None
+    assert http_bridge_spool_cleanup_duration_seconds is not None
+    assert http_bridge_spool_cleanup_backlog_likely is not None
+    http_bridge_spool_cleanup_runs_total.labels(outcome=result.outcome).inc()
+    http_bridge_spool_cleanup_deleted_operations_total.inc(result.deleted_operations)
+    http_bridge_spool_cleanup_duration_seconds.observe(result.duration_seconds)
+    http_bridge_spool_cleanup_backlog_likely.set(1.0 if result.backlog_likely else 0.0)
+
+
+def _next_cleanup_delay_seconds(interval_seconds: int, *, backlog_likely: bool) -> float:
+    if backlog_likely:
+        return min(float(interval_seconds), _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
+    return float(interval_seconds)
+
+
+def _merge_backlog_signal(previous: bool, attempted: bool | None) -> bool:
+    return previous if attempted is None else attempted
 
 
 _T = TypeVar("_T")
@@ -103,18 +214,102 @@ class StickySessionCleanupScheduler:
         self._task = None
 
     async def _run_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_full_cleanup_at = loop.time()
+        backlog_likely = False
         while not self._stop.is_set():
-            await self._cleanup_once()
+            if loop.time() >= next_full_cleanup_at:
+                backlog_likely = await self._cleanup_once()
+                next_full_cleanup_at = loop.time() + float(self.interval_seconds)
+            elif backlog_likely:
+                backlog_likely = _merge_backlog_signal(
+                    backlog_likely,
+                    await self._cleanup_operation_retention_once(),
+                )
+            delay_to_full_cleanup = max(next_full_cleanup_at - loop.time(), 0.0)
+            delay_seconds = (
+                min(delay_to_full_cleanup, _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
+                if backlog_likely
+                else delay_to_full_cleanup
+            )
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=delay_seconds,
+                )
             except asyncio.TimeoutError:
                 continue
 
-    async def _cleanup_once(self) -> None:
-        await _get_leader_election().run_if_leader(self._cleanup_as_leader)
+    async def _cleanup_once(self) -> bool:
+        return bool(await _get_leader_election().run_if_leader(self._cleanup_as_leader))
 
-    async def _cleanup_as_leader(self) -> None:
+    async def _cleanup_operation_retention_once(self) -> bool | None:
+        return await _get_leader_election().run_if_leader(self._cleanup_operation_retention_as_leader)
+
+    async def _run_operation_retention(self, bridge_repo: DurableBridgeRepository) -> bool:
+        operation_cutoff = utcnow() - timedelta(
+            seconds=get_settings().http_responses_session_bridge_operation_spool_retention_seconds
+        )
+        retention_started_at = time.monotonic()
+        error_type: str | None = None
+        try:
+            result = await _purge_operation_spool_with_budget(bridge_repo, cutoff=operation_cutoff)
+        except OperationRetentionCleanupError as exc:
+            result = exc.result
+            error_type = exc.error_type
+        except Exception as exc:
+            result = OperationRetentionCleanupResult(
+                deleted_operations=0,
+                batches=0,
+                backlog_likely=True,
+                outcome="failed",
+                duration_seconds=max(time.monotonic() - retention_started_at, 0.0),
+            )
+            error_type = type(exc).__name__
+        _record_operation_retention_cleanup(result)
+        if result.deleted_operations > 0 or result.backlog_likely:
+            logger.info(
+                "HTTP bridge operation transcript retention "
+                "deleted_operations=%s batches=%s outcome=%s "
+                "backlog_likely=%s duration_seconds=%.3f error_type=%s",
+                result.deleted_operations,
+                result.batches,
+                result.outcome,
+                result.backlog_likely,
+                result.duration_seconds,
+                error_type or "none",
+            )
+        return result.backlog_likely
+
+    async def _cleanup_operation_retention_as_leader(self) -> bool:
         async with self._lock:
+            started_at = time.monotonic()
+            try:
+                async with get_background_session() as session:
+                    if not startup_module._bridge_durable_schema_ready and await missing_durable_bridge_tables(session):
+                        return False
+                    return await self._run_operation_retention(DurableBridgeRepository(session))
+            except Exception as exc:
+                result = OperationRetentionCleanupResult(
+                    deleted_operations=0,
+                    batches=0,
+                    backlog_likely=True,
+                    outcome="failed",
+                    duration_seconds=max(time.monotonic() - started_at, 0.0),
+                )
+                _record_operation_retention_cleanup(result)
+                logger.warning(
+                    "HTTP bridge operation transcript retention failed before batching "
+                    "deleted_operations=0 batches=0 outcome=failed backlog_likely=true "
+                    "duration_seconds=%.3f error_type=%s",
+                    result.duration_seconds,
+                    type(exc).__name__,
+                )
+                return True
+
+    async def _cleanup_as_leader(self) -> bool:
+        async with self._lock:
+            backlog_likely = False
             try:
                 async with get_background_session() as session:
                     settings_repo = SettingsRepository(session)
@@ -166,23 +361,7 @@ class StickySessionCleanupScheduler:
                                     retry_circuit_deleted_count,
                                 )
                         if self.operation_retention_enabled:
-                            operation_cutoff = utcnow() - timedelta(
-                                seconds=get_settings().http_responses_session_bridge_operation_spool_retention_seconds
-                            )
-                            operation_deleted_count = 0
-                            # Drain all eligible batches. A single startup pass is
-                            # bounded to protect latency, but a long-lived process
-                            # must continue pruning old prompt/output transcripts.
-                            while True:
-                                deleted_batch = await bridge_repo.purge_operation_spool(cutoff=operation_cutoff)
-                                operation_deleted_count += deleted_batch
-                                if deleted_batch < 500:
-                                    break
-                            if operation_deleted_count > 0:
-                                logger.info(
-                                    "Purged expired HTTP bridge operation transcript rows deleted_count=%s",
-                                    operation_deleted_count,
-                                )
+                            backlog_likely = await self._run_operation_retention(bridge_repo)
                 if self.enabled:
                     ring_cutoff = utcnow() - timedelta(seconds=RING_MEMBER_RETENTION_SECONDS)
                     ring_deleted_count = await RingMembershipService(SessionLocal).purge_stale_before(ring_cutoff)
@@ -190,6 +369,8 @@ class StickySessionCleanupScheduler:
                         logger.info("Purged stale bridge ring members deleted_count=%s", ring_deleted_count)
             except Exception:
                 logger.exception("Sticky session cleanup loop failed")
+                return backlog_likely
+            return backlog_likely
 
 
 def build_sticky_session_cleanup_scheduler() -> StickySessionCleanupScheduler:

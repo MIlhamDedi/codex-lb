@@ -211,6 +211,12 @@ class DurableBridgeOperationEventInput:
     event_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class DurableBridgeOperationPurgeBatchResult:
+    selected_operations: int
+    deleted_operations: int
+
+
 class DurableBridgeRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -1748,7 +1754,12 @@ class DurableBridgeRepository:
         turns.reverse()
         return turns
 
-    async def purge_operation_spool(self, *, cutoff: datetime, batch_size: int = 500) -> int:
+    async def purge_operation_spool_batch(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int = 500,
+    ) -> DurableBridgeOperationPurgeBatchResult:
         """Delete eligible transcript material past retention.
 
         Nonterminal rows are purgeable only after their owning session is
@@ -1797,7 +1808,10 @@ class DurableBridgeRepository:
             operation_ids = [str(operation.operation_id) for operation in selected.scalars().all()]
             if not operation_ids:
                 await self._session.commit()
-                return 0
+                return DurableBridgeOperationPurgeBatchResult(
+                    selected_operations=0,
+                    deleted_operations=0,
+                )
             deleted = await self._session.execute(
                 delete(HttpBridgeOperationRecord)
                 .where(
@@ -1813,7 +1827,15 @@ class DurableBridgeRepository:
                     delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id.in_(deleted_ids))
                 )
             await self._session.commit()
-        return len(deleted_ids)
+        return DurableBridgeOperationPurgeBatchResult(
+            selected_operations=len(operation_ids),
+            deleted_operations=len(deleted_ids),
+        )
+
+    async def purge_operation_spool(self, *, cutoff: datetime, batch_size: int = 500) -> int:
+        """Delete one eligible transcript batch and return actual deletes."""
+        result = await self.purge_operation_spool_batch(cutoff=cutoff, batch_size=batch_size)
+        return result.deleted_operations
 
     async def append_operation_event(
         self,
