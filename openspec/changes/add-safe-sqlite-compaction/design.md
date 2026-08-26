@@ -1,0 +1,58 @@
+# Design: Add safe SQLite compaction
+
+## Context
+
+The current recovery CLI can rebuild a corrupt database, and migration backup
+uses SQLite's online backup API. Neither provides a normal maintenance path
+that reclaims freelist pages while preserving a byte-for-byte rollback source.
+
+## Decisions
+
+### D1. Dry-run is read-only
+
+Dry-run resolves the file-backed SQLite path and reports source size, page
+size/count, freelist pages and bytes, current autovacuum mode, and conservative
+free-space requirement. It uses immutable read-only access, does not run
+integrity check or create files, and rejects non-empty WAL/hot-journal state.
+
+### D2. Execution requires explicit maintenance acknowledgement
+
+`--execute` requires `--confirm-stopped`. The tool also acquires an exclusive
+compaction lock file, performs a zero-busy WAL checkpoint, and rejects an
+observed external `data_version` change. These checks supplement but do not
+replace the operator's responsibility to stop every replica.
+
+### D3. Build and verify before replacement
+
+Use `VACUUM INTO` to create a temporary database inside an atomically allocated
+owner-only directory beneath the source directory. Configure the output for
+incremental autovacuum, running a second output-only `VACUUM` only
+when the copied database did not inherit that mode. Require `quick_check=ok`
+and matching SQLite application/user versions plus Alembic revision rows. The
+free-space gate reserves two source-file sizes for the output and its second
+VACUUM scratch space, and creation runs under `umask 077`.
+
+### D4. Preserve rollback source
+
+Close every SQLite connection before filesystem replacement. Hard-link the
+source to a unique `pre-compact` backup, fsync the directory, then atomically
+replace the source path with the verified temporary file. Preserve source
+mode/uid/gid and fsync the file and directory. If installation or its durability
+checks fail, restore the original. Preserve any stopped-instance sidecar files
+under backup names rather than deleting them. Reject execution on platforms
+where directory-entry durability cannot be enforced.
+
+## Risks / Trade-offs
+
+- Compaction performs at least one full read/write of the database and can take
+  minutes on slow storage.
+- The stopped-service acknowledgement is necessary because generic process
+  discovery cannot prove that every container or remote replica is stopped.
+- Backups consume the original file size until the operator validates and
+  removes them separately.
+
+## Rollback
+
+Stop the service, move the compacted source aside, and restore the reported
+`pre-compact` backup and its preserved sidecars. The tool never removes that
+backup automatically.
