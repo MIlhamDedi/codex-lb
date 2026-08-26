@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import pytest
@@ -16,6 +16,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.modules.proxy.durable_bridge_coordinator as durable_bridge_coordinator_module
+import app.modules.proxy.durable_bridge_repository as durable_repo_module
 from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import Settings
 from app.core.utils.time import utcnow
@@ -25,6 +26,7 @@ from app.db.models import (
     AccountStatus,
     Base,
     BridgeRingMember,
+    HttpBridgeOperationEvent,
     HttpBridgeOperationEventChunk,
     HttpBridgeOperationRecord,
     HttpBridgeRetryCircuit,
@@ -42,6 +44,7 @@ from app.modules.proxy.continuity import make_http_bridge_account_neutral_replay
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
+    DurableBridgeOperationEventInput,
     DurableBridgeRepository,
     durable_bridge_hash,
     durable_bridge_operation_id,
@@ -857,6 +860,306 @@ async def test_chunk_operation_rejects_malformed_persisted_metadata(
         await session.commit()
 
         assert await repository.get_operation_events(operation_id=operation_id) == []
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_writer_persists_batch_and_terminal_atomically(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-writer", session_key_value="sid-chunk-writer")
+        fingerprint = durable_bridge_hash("chunk-writer")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-writer",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+            request_text='{"input":"turn"}',
+        )
+        first_events = ("created", "delta")
+        assert await repository.append_operation_event_chunk(
+            events=[
+                DurableBridgeOperationEventInput(
+                    operation_id=operation_id,
+                    session_id=claim.id,
+                    instance_id="inst-chunk-writer",
+                    owner_epoch=claim.owner_epoch,
+                    event_text=event,
+                )
+                for event in first_events
+            ],
+            max_bytes=1024,
+        )
+        assert await repository.append_terminal_operation_chunk(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-writer",
+            owner_epoch=claim.owner_epoch,
+            event_text='data: {"type":"response.completed"}\n\n',
+            max_bytes=1024,
+            state="completed",
+            response_id="resp-chunk-writer",
+        )
+
+        row = await session.get(HttpBridgeOperationRecord, operation_id)
+        assert row is not None
+        assert row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+        assert row.state == "completed"
+        assert row.response_id == "resp-chunk-writer"
+        assert row.event_spool_complete is True
+        assert (
+            await session.scalar(
+                select(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id == operation_id)
+            )
+            is None
+        )
+        chunks = (
+            (
+                await session.execute(
+                    select(HttpBridgeOperationEventChunk)
+                    .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+                    .order_by(HttpBridgeOperationEventChunk.first_sequence_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(chunk.first_sequence_number, chunk.event_count) for chunk in chunks] == [(1, 2), (3, 1)]
+        assert await repository.get_operation_events(operation_id=operation_id) == [
+            *first_events,
+            'data: {"type":"response.completed"}\n\n',
+        ]
+        assert await repository.get_replayable_transcript(response_id="resp-chunk-writer") is not None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_writer_refuses_mixed_legacy_material(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-conflict", session_key_value="sid-chunk-conflict")
+        fingerprint = durable_bridge_hash("chunk-conflict")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-conflict",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        assert await repository.append_operation_event(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-conflict",
+            owner_epoch=claim.owner_epoch,
+            event_text="legacy",
+            max_bytes=1024,
+        )
+
+        assert not await repository.append_operation_event_chunk(
+            events=[
+                DurableBridgeOperationEventInput(
+                    operation_id=operation_id,
+                    session_id=claim.id,
+                    instance_id="inst-chunk-conflict",
+                    owner_epoch=claim.owner_epoch,
+                    event_text="chunk",
+                )
+            ],
+            max_bytes=1024,
+        )
+        assert not await repository.append_terminal_operation_chunk(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-conflict",
+            owner_epoch=claim.owner_epoch,
+            event_text="terminal",
+            max_bytes=1024,
+            state="failed",
+            response_id="resp-conflict",
+        )
+        row = await session.get(HttpBridgeOperationRecord, operation_id)
+        assert row is not None
+        await session.refresh(row)
+        assert row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
+        assert row.state == "failed"
+        assert row.response_id == "resp-conflict"
+        assert row.event_spool_complete is False
+        assert (
+            await session.scalar(
+                select(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            )
+            is None
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_terminal_chunk_settles_incomplete_operation(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-oversize", session_key_value="sid-chunk-oversize")
+        fingerprint = durable_bridge_hash("chunk-oversize")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-oversize",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        assert not await repository.append_terminal_operation_chunk(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-oversize",
+            owner_epoch=claim.owner_epoch,
+            event_text="too-large",
+            max_bytes=3,
+            state="failed",
+            response_id="resp-oversized",
+        )
+
+        row = await session.get(HttpBridgeOperationRecord, operation_id)
+        assert row is not None
+        assert row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
+        assert row.state == "failed"
+        assert row.response_id == "resp-oversized"
+        assert row.event_spool_complete is False
+        assert (
+            await session.scalar(
+                select(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            )
+            is None
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_writer_enforces_reader_event_count_limit(
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = async_session_factory()
+    try:
+        monkeypatch.setattr(durable_repo_module, "DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS", 2)
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-count", session_key_value="sid-chunk-count")
+        fingerprint = durable_bridge_hash("chunk-count")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-count",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        assert await repository.append_operation_event_chunk(
+            events=[
+                DurableBridgeOperationEventInput(
+                    operation_id=operation_id,
+                    session_id=claim.id,
+                    instance_id="inst-chunk-count",
+                    owner_epoch=claim.owner_epoch,
+                    event_text=event,
+                )
+                for event in ("one", "two")
+            ],
+            max_bytes=1024,
+        )
+        assert not await repository.append_terminal_operation_chunk(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-count",
+            owner_epoch=claim.owner_epoch,
+            event_text="terminal",
+            max_bytes=1024,
+            state="failed",
+            response_id="resp-count-limit",
+        )
+        row = await session.get(HttpBridgeOperationRecord, operation_id)
+        assert row is not None
+        assert row.state == "failed"
+        assert row.event_spool_complete is False
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_writer_rejects_before_compression(
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-precompress", session_key_value="sid-precompress")
+        fingerprint = durable_bridge_hash("precompress")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-precompress",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        encoder = MagicMock(side_effect=AssertionError("compression should not run"))
+        monkeypatch.setattr(durable_repo_module, "encode_durable_bridge_transcript_chunk", encoder)
+
+        assert not await repository.append_operation_event_chunk(
+            events=[
+                DurableBridgeOperationEventInput(
+                    operation_id=operation_id,
+                    session_id=claim.id,
+                    instance_id="inst-precompress",
+                    owner_epoch=claim.owner_epoch,
+                    event_text="oversized",
+                )
+            ],
+            max_bytes=1,
+        )
+        assert not await repository.append_operation_event_chunk(
+            events=[
+                DurableBridgeOperationEventInput(
+                    operation_id=operation_id,
+                    session_id=claim.id,
+                    instance_id="wrong-owner",
+                    owner_epoch=claim.owner_epoch,
+                    event_text="small",
+                )
+            ],
+            max_bytes=1024,
+        )
+        encoder.assert_not_called()
     finally:
         await session.close()
 

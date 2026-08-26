@@ -40,6 +40,7 @@ from app.modules.proxy.durable_bridge_transcript_codec import (
     DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS,
     DurableBridgeTranscriptDecodeError,
     decode_durable_bridge_transcript_chunk,
+    encode_durable_bridge_transcript_chunk,
 )
 
 _ANONYMOUS_API_KEY_SCOPE = "__anonymous__"
@@ -252,6 +253,65 @@ class DurableBridgeRepository:
             .limit(1)
         )
         return chunk_sequence is not None
+
+    async def _operation_has_legacy_events(self, operation_id: str) -> bool:
+        event_id = await self._session.scalar(
+            select(HttpBridgeOperationEvent.event_id)
+            .where(HttpBridgeOperationEvent.operation_id == operation_id)
+            .limit(1)
+        )
+        return event_id is not None
+
+    async def _lock_operation_for_chunk_append(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        expected_recovery_dispatch_count: int | None = None,
+    ) -> tuple[HttpBridgeOperationRecord, bool] | None:
+        owner_exists = await self._session.scalar(
+            select(HttpBridgeSessionRecord.id)
+            .where(
+                HttpBridgeSessionRecord.id == session_id,
+                HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+            )
+            .with_for_update()
+        )
+        operation_statement = select(HttpBridgeOperationRecord).where(
+            HttpBridgeOperationRecord.operation_id == operation_id,
+            HttpBridgeOperationRecord.session_id == session_id,
+        )
+        if expected_recovery_dispatch_count is not None:
+            operation_statement = operation_statement.where(
+                HttpBridgeOperationRecord.recovery_dispatch_count == expected_recovery_dispatch_count
+            )
+        operation = await self._session.scalar(operation_statement.with_for_update())
+        if owner_exists is None or operation is None:
+            await self._session.rollback()
+            return None
+        if operation.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
+            if await self._operation_has_legacy_events(operation_id):
+                return operation, False
+            return operation, True
+        if operation.spool_format != HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1:
+            return operation, False
+        if int(operation.event_bytes or 0) != 0 or await self._operation_has_spool_material(operation_id):
+            return operation, False
+        return operation, True
+
+    async def _next_operation_chunk_sequence(self, operation_id: str) -> int:
+        latest = await self._session.scalar(
+            select(HttpBridgeOperationEventChunk)
+            .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            .order_by(HttpBridgeOperationEventChunk.first_sequence_number.desc())
+            .limit(1)
+        )
+        if latest is None:
+            return 1
+        return int(latest.first_sequence_number) + int(latest.event_count)
 
     async def get_session(
         self,
@@ -1903,6 +1963,153 @@ class DurableBridgeRepository:
                 await self._delete_operation_spool_material(deleted_ids)
             await self._session.commit()
         return len(deleted_ids)
+
+    async def append_operation_event_chunk(
+        self,
+        *,
+        events: Sequence[DurableBridgeOperationEventInput],
+        max_bytes: int,
+    ) -> bool:
+        """Append one compressed v2 chunk under the durable owner fence."""
+        if not events:
+            return True
+        first = events[0]
+        if any(
+            event.operation_id != first.operation_id
+            or event.session_id != first.session_id
+            or event.instance_id != first.instance_id
+            or event.owner_epoch != first.owner_epoch
+            for event in events
+        ):
+            return False
+        event_texts = [event.event_text for event in events]
+        event_bytes = sum(len(event_text.encode("utf-8")) for event_text in event_texts)
+        if event_bytes > max_bytes:
+            return False
+        async with sqlite_writer_section():
+            locked_operation = await self._lock_operation_for_chunk_append(
+                operation_id=first.operation_id,
+                session_id=first.session_id,
+                instance_id=first.instance_id,
+                owner_epoch=first.owner_epoch,
+            )
+            if locked_operation is None:
+                return False
+            operation, append_allowed = locked_operation
+            if not append_allowed:
+                await self._session.rollback()
+                return False
+            if int(operation.event_bytes or 0) + event_bytes > max_bytes:
+                operation.event_spool_complete = False
+                await self._session.commit()
+                return False
+            first_sequence_number = await self._next_operation_chunk_sequence(first.operation_id)
+            if first_sequence_number - 1 + len(event_texts) > DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS:
+                operation.event_spool_complete = False
+                await self._session.commit()
+                return False
+            try:
+                encoded = encode_durable_bridge_transcript_chunk(event_texts)
+            except ValueError:
+                await self._session.rollback()
+                return False
+            self._session.add(
+                HttpBridgeOperationEventChunk(
+                    operation_id=first.operation_id,
+                    first_sequence_number=first_sequence_number,
+                    event_count=encoded.event_count,
+                    codec=encoded.codec,
+                    uncompressed_bytes=encoded.uncompressed_bytes,
+                    payload=encoded.payload,
+                    payload_sha256=encoded.payload_sha256,
+                )
+            )
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+            operation.event_bytes = int(operation.event_bytes or 0) + event_bytes
+            await self._session.commit()
+        return True
+
+    async def append_terminal_operation_chunk(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_text: str,
+        max_bytes: int,
+        state: str,
+        expected_recovery_dispatch_count: int = 0,
+        response_id: str | None = None,
+    ) -> bool:
+        """Append a terminal v2 chunk and expose its outcome atomically."""
+        event_bytes = len(event_text.encode("utf-8"))
+        async with sqlite_writer_section():
+            locked_operation = await self._lock_operation_for_chunk_append(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+            )
+            if locked_operation is None:
+                return False
+            operation, append_allowed = locked_operation
+            if not append_allowed:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            if int(operation.event_bytes or 0) + event_bytes > max_bytes:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            first_sequence_number = await self._next_operation_chunk_sequence(operation_id)
+            if first_sequence_number > DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            try:
+                encoded = encode_durable_bridge_transcript_chunk((event_text,))
+            except ValueError:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            self._session.add(
+                HttpBridgeOperationEventChunk(
+                    operation_id=operation_id,
+                    first_sequence_number=first_sequence_number,
+                    event_count=encoded.event_count,
+                    codec=encoded.codec,
+                    uncompressed_bytes=encoded.uncompressed_bytes,
+                    payload=encoded.payload,
+                    payload_sha256=encoded.payload_sha256,
+                )
+            )
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+            operation.event_bytes = int(operation.event_bytes or 0) + event_bytes
+            operation.state = state
+            if response_id is not None:
+                operation.response_id = response_id
+            operation.event_spool_complete = True
+            operation.updated_at = utcnow()
+            await self._session.commit()
+        return True
 
     async def append_operation_event(
         self,
