@@ -17,7 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
+    HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+    HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
     HttpBridgeOperationEvent,
+    HttpBridgeOperationEventChunk,
     HttpBridgeOperationRecord,
     HttpBridgeRecoveryAttemptRecord,
     HttpBridgeRecoveryAttemptState,
@@ -33,6 +36,11 @@ from app.modules.proxy.continuity import (
     HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS,
     is_http_bridge_account_neutral_replay,
 )
+from app.modules.proxy.durable_bridge_transcript_codec import (
+    DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS,
+    DurableBridgeTranscriptDecodeError,
+    decode_durable_bridge_transcript_chunk,
+)
 
 _ANONYMOUS_API_KEY_SCOPE = "__anonymous__"
 REQUIRED_DURABLE_BRIDGE_TABLES = (
@@ -42,6 +50,7 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_recovery_attempts",
     "http_bridge_operations",
     "http_bridge_operation_events",
+    "http_bridge_operation_event_chunks",
 )
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
 _PURGE_CLOSED_BATCH_SIZE = 500
@@ -218,6 +227,31 @@ class DurableBridgeRepository:
     async def _commit_writer_section(self) -> None:
         async with sqlite_writer_section():
             await self._session.commit()
+
+    async def _delete_operation_spool_material(self, operation_ids: Sequence[str]) -> None:
+        if not operation_ids:
+            return
+        await self._session.execute(
+            delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id.in_(operation_ids))
+        )
+        await self._session.execute(
+            delete(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id.in_(operation_ids))
+        )
+
+    async def _operation_has_spool_material(self, operation_id: str) -> bool:
+        legacy_event = await self._session.scalar(
+            select(HttpBridgeOperationEvent.event_id)
+            .where(HttpBridgeOperationEvent.operation_id == operation_id)
+            .limit(1)
+        )
+        if legacy_event is not None:
+            return True
+        chunk_sequence = await self._session.scalar(
+            select(HttpBridgeOperationEventChunk.first_sequence_number)
+            .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            .limit(1)
+        )
+        return chunk_sequence is not None
 
     async def get_session(
         self,
@@ -1394,13 +1428,10 @@ class DurableBridgeRepository:
                     # previous attempt's SSE spool atomically so a later
                     # successful retry cannot replay a stale response.failed
                     # event before its fresh response.created sequence.
-                    await self._session.execute(
-                        delete(HttpBridgeOperationEvent).where(
-                            HttpBridgeOperationEvent.operation_id == operation.operation_id
-                        )
-                    )
+                    await self._delete_operation_spool_material((operation.operation_id,))
                     operation.event_bytes = 0
                     operation.event_spool_complete = False
+                    operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
                     operation.updated_at = utcnow()
                     rebound = True
                 if request_text is not None and operation.request_text is None:
@@ -1430,6 +1461,7 @@ class DurableBridgeRepository:
                 # relying on a backend-specific schema default (notably the
                 # pre-existing SQLite default on migrated databases).
                 event_spool_complete=False,
+                spool_format=HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
             )
             self._session.add(operation)
             try:
@@ -1497,11 +1529,10 @@ class DurableBridgeRepository:
             if owner_exists is None or operation is None:
                 await self._session.rollback()
                 return False
-            await self._session.execute(
-                delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id == operation_id)
-            )
+            await self._delete_operation_spool_material((operation_id,))
             operation.event_bytes = 0
             operation.event_spool_complete = False
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
             operation.updated_at = utcnow()
             await self._session.commit()
         return True
@@ -1548,14 +1579,13 @@ class DurableBridgeRepository:
             if max_recovery_dispatches is not None and operation.recovery_dispatch_count >= max_recovery_dispatches:
                 await self._session.rollback()
                 return False
-            await self._session.execute(
-                delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id == operation_id)
-            )
+            await self._delete_operation_spool_material((operation_id,))
             operation.state = "submitted"
             operation.response_id = None
             operation.recovery_dispatch_count += 1
             operation.event_bytes = 0
             operation.event_spool_complete = False
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
             operation.updated_at = utcnow()
             await self._session.commit()
         return True
@@ -1653,12 +1683,7 @@ class DurableBridgeRepository:
             if owner_exists is None or operation is None:
                 await self._session.rollback()
                 return False
-            has_events = await self._session.scalar(
-                select(HttpBridgeOperationEvent.event_id)
-                .where(HttpBridgeOperationEvent.operation_id == operation_id)
-                .limit(1)
-            )
-            if has_events is not None:
+            if await self._operation_has_spool_material(operation_id):
                 await self._session.rollback()
                 return False
             if restore_rebound:
@@ -1692,13 +1717,69 @@ class DurableBridgeRepository:
         operation = await self._session.scalar(statement)
         return _to_operation_snapshot(operation) if operation is not None else None
 
-    async def get_operation_events(self, *, operation_id: str) -> list[str]:
-        result = await self._session.execute(
-            select(HttpBridgeOperationEvent.event_text)
-            .where(HttpBridgeOperationEvent.operation_id == operation_id)
-            .order_by(HttpBridgeOperationEvent.sequence_number.asc())
-        )
-        return [str(value) for value in result.scalars().all()]
+    async def get_operation_events(self, *, operation_id: str, max_bytes: int = 8 * 1024 * 1024) -> list[str]:
+        operation = (
+            await self._session.execute(
+                select(
+                    HttpBridgeOperationRecord.spool_format,
+                    HttpBridgeOperationRecord.event_bytes,
+                ).where(HttpBridgeOperationRecord.operation_id == operation_id)
+            )
+        ).one_or_none()
+        if operation is None:
+            return []
+        spool_format = str(operation.spool_format)
+        expected_event_bytes = int(operation.event_bytes or 0)
+        if expected_event_bytes < 0 or expected_event_bytes > max_bytes:
+            return []
+        if spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1:
+            result = await self._session.execute(
+                select(HttpBridgeOperationEvent.event_text)
+                .where(HttpBridgeOperationEvent.operation_id == operation_id)
+                .order_by(HttpBridgeOperationEvent.sequence_number.asc())
+            )
+            events = [str(value) for value in result.scalars().all()]
+            if sum(len(event.encode("utf-8")) for event in events) != expected_event_bytes:
+                return []
+            return events
+        if spool_format != HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
+            return []
+
+        chunks = (
+            await self._session.execute(
+                select(HttpBridgeOperationEventChunk)
+                .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+                .order_by(HttpBridgeOperationEventChunk.first_sequence_number.asc())
+            )
+        ).scalars()
+        expected_sequence = 1
+        total_event_count = 0
+        remaining_bytes = expected_event_bytes
+        events: list[str] = []
+        for chunk in chunks:
+            if chunk.first_sequence_number != expected_sequence:
+                return []
+            total_event_count += chunk.event_count
+            if total_event_count > DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS:
+                return []
+            try:
+                decoded = decode_durable_bridge_transcript_chunk(
+                    codec=chunk.codec,
+                    payload=bytes(chunk.payload),
+                    event_count=chunk.event_count,
+                    uncompressed_bytes=chunk.uncompressed_bytes,
+                    payload_sha256=chunk.payload_sha256,
+                    max_uncompressed_bytes=remaining_bytes + 4 * chunk.event_count,
+                )
+            except DurableBridgeTranscriptDecodeError:
+                return []
+            decoded_bytes = sum(len(event.encode("utf-8")) for event in decoded)
+            if decoded_bytes > remaining_bytes:
+                return []
+            events.extend(decoded)
+            remaining_bytes -= decoded_bytes
+            expected_sequence += chunk.event_count
+        return events if remaining_bytes == 0 else []
 
     async def get_operation_by_response_id(self, *, response_id: str) -> DurableBridgeOperationSnapshot | None:
         operation = await self._session.scalar(
@@ -1732,7 +1813,13 @@ class DurableBridgeRepository:
             operation = await self.get_operation_by_response_id(response_id=current_response_id)
             if operation is None or operation.request_text is None or not operation.event_spool_complete:
                 return None
-            events = await self.get_operation_events(operation_id=operation.operation_id)
+            remaining_event_bytes = max_bytes - total_bytes - len(operation.request_text.encode("utf-8"))
+            if remaining_event_bytes < 0:
+                return None
+            events = await self.get_operation_events(
+                operation_id=operation.operation_id,
+                max_bytes=remaining_event_bytes,
+            )
             if not events or not any(
                 "response.completed" in event or "response.incomplete" in event for event in events
             ):
@@ -1809,9 +1896,7 @@ class DurableBridgeRepository:
             )
             deleted_ids = [str(value) for value in deleted.scalars().all()]
             if deleted_ids:
-                await self._session.execute(
-                    delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id.in_(deleted_ids))
-                )
+                await self._delete_operation_spool_material(deleted_ids)
             await self._session.commit()
         return len(deleted_ids)
 
@@ -1841,6 +1926,7 @@ class DurableBridgeRepository:
                 .where(
                     HttpBridgeOperationRecord.operation_id == operation_id,
                     HttpBridgeOperationRecord.session_id == session_id,
+                    HttpBridgeOperationRecord.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
                 )
                 .with_for_update()
             )
@@ -1902,6 +1988,7 @@ class DurableBridgeRepository:
                     HttpBridgeOperationRecord.operation_id == operation_id,
                     HttpBridgeOperationRecord.session_id == session_id,
                     HttpBridgeOperationRecord.recovery_dispatch_count == expected_recovery_dispatch_count,
+                    HttpBridgeOperationRecord.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
                 )
                 .with_for_update()
             )
@@ -1979,6 +2066,7 @@ class DurableBridgeRepository:
                 .where(
                     HttpBridgeOperationRecord.operation_id == first.operation_id,
                     HttpBridgeOperationRecord.session_id == first.session_id,
+                    HttpBridgeOperationRecord.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
                 )
                 .with_for_update()
             )
@@ -3083,7 +3171,8 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "SELECT name FROM sqlite_master "
                 "WHERE type = 'table' "
                 "AND name IN ('http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events')"
+                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events', "
+                "'http_bridge_operation_event_chunks')"
             )
         )
     else:
@@ -3093,7 +3182,8 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "WHERE table_schema = 'public' "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events'"
+                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events', "
+                "'http_bridge_operation_event_chunks'"
                 ")"
             )
         )

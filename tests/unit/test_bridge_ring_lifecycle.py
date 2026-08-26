@@ -19,9 +19,12 @@ from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import Settings
 from app.core.utils.time import utcnow
 from app.db.models import (
+    HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+    HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
     AccountStatus,
     Base,
     BridgeRingMember,
+    HttpBridgeOperationEventChunk,
     HttpBridgeOperationRecord,
     HttpBridgeRetryCircuit,
     HttpBridgeSessionAlias,
@@ -41,7 +44,9 @@ from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeRepository,
     durable_bridge_hash,
     durable_bridge_operation_id,
+    missing_durable_bridge_tables,
 )
+from app.modules.proxy.durable_bridge_transcript_codec import encode_durable_bridge_transcript_chunk
 from app.modules.proxy.http_bridge_event_batcher import HttpBridgeOperationEventBatcher
 from app.modules.proxy.ring_membership import RingMembershipService
 
@@ -614,6 +619,9 @@ async def test_operation_ledger_is_fenced_and_idempotent(
         assert created.state == "submitted"
         assert created.request_text == '{"model":"gpt-5.6","input":"turn"}'
         assert created.event_spool_complete is False
+        operation_row = await session.get(HttpBridgeOperationRecord, operation_id)
+        assert operation_row is not None
+        assert operation_row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
 
         existing = await repository.record_operation(
             operation_id=operation_id,
@@ -677,6 +685,309 @@ async def test_operation_ledger_is_fenced_and_idempotent(
         # A missing parent turn makes the chain ineligible rather than
         # silently constructing an incomplete conversation.
         assert await repository.get_replayable_transcript(response_id="resp-completed") is None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_operation_replays_exact_events(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-replay", session_key_value="sid-chunk-replay")
+        fingerprint = durable_bridge_hash("chunk-replay")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        operation = await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-replay",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+            request_text='{"model":"gpt-5.6","input":"turn"}',
+        )
+        assert operation is not None
+        first_events = (
+            'data: {"type":"response.created"}\n\n',
+            'data: {"type":"response.output_text.delta","delta":"안녕"}\n\n',
+        )
+        terminal_events = (
+            'data: {"type":"response.completed"}\n\n',
+            'data: {"type":"response.completed"}\n\n',
+        )
+        first_chunk = encode_durable_bridge_transcript_chunk(first_events)
+        terminal_chunk = encode_durable_bridge_transcript_chunk(terminal_events)
+        await session.execute(
+            update(HttpBridgeOperationRecord)
+            .where(HttpBridgeOperationRecord.operation_id == operation_id)
+            .values(
+                spool_format=HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+                state="completed",
+                response_id="resp-chunk-completed",
+                event_spool_complete=True,
+                event_bytes=sum(len(event.encode("utf-8")) for event in first_events + terminal_events),
+            )
+        )
+        session.add_all(
+            [
+                HttpBridgeOperationEventChunk(
+                    operation_id=operation_id,
+                    first_sequence_number=1,
+                    event_count=first_chunk.event_count,
+                    codec=first_chunk.codec,
+                    uncompressed_bytes=first_chunk.uncompressed_bytes,
+                    payload=first_chunk.payload,
+                    payload_sha256=first_chunk.payload_sha256,
+                ),
+                HttpBridgeOperationEventChunk(
+                    operation_id=operation_id,
+                    first_sequence_number=3,
+                    event_count=terminal_chunk.event_count,
+                    codec=terminal_chunk.codec,
+                    uncompressed_bytes=terminal_chunk.uncompressed_bytes,
+                    payload=terminal_chunk.payload,
+                    payload_sha256=terminal_chunk.payload_sha256,
+                ),
+            ]
+        )
+        await session.commit()
+
+        expected = list(first_events + terminal_events)
+        assert await repository.get_operation_events(operation_id=operation_id) == expected
+        transcript = await repository.get_replayable_transcript(response_id="resp-chunk-completed")
+        assert transcript is not None
+        assert len(transcript) == 1
+        assert transcript[0].events == tuple(expected)
+
+        await session.execute(
+            update(HttpBridgeOperationRecord)
+            .where(HttpBridgeOperationRecord.operation_id == operation_id)
+            .values(event_bytes=sum(len(event.encode("utf-8")) for event in expected) - 1)
+        )
+        await session.commit()
+        assert await repository.get_operation_events(operation_id=operation_id) == []
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_sequence_number,payload_sha256", [(2, None), (1, "0" * 64)])
+async def test_chunk_operation_rejects_sequence_gap_or_corruption(
+    async_session_factory: Callable[[], AsyncSession],
+    first_sequence_number: int,
+    payload_sha256: str | None,
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-invalid", session_key_value="sid-chunk-invalid")
+        fingerprint = durable_bridge_hash(f"chunk-invalid:{first_sequence_number}:{payload_sha256}")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-invalid",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+            request_text='{"input":"turn"}',
+        )
+        encoded = encode_durable_bridge_transcript_chunk(('data: {"type":"response.completed"}\n\n',))
+        await session.execute(
+            update(HttpBridgeOperationRecord)
+            .where(HttpBridgeOperationRecord.operation_id == operation_id)
+            .values(
+                spool_format=HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+                state="completed",
+                response_id=f"resp-{operation_id}",
+                event_spool_complete=True,
+            )
+        )
+        session.add(
+            HttpBridgeOperationEventChunk(
+                operation_id=operation_id,
+                first_sequence_number=first_sequence_number,
+                event_count=encoded.event_count,
+                codec=encoded.codec,
+                uncompressed_bytes=encoded.uncompressed_bytes,
+                payload=encoded.payload,
+                payload_sha256=payload_sha256 or encoded.payload_sha256,
+            )
+        )
+        await session.commit()
+
+        assert await repository.get_operation_events(operation_id=operation_id) == []
+        assert await repository.get_replayable_transcript(response_id=f"resp-{operation_id}") is None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_spool_blocks_rollback_and_is_cleared_by_reset(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-reset", session_key_value="sid-chunk-reset")
+        fingerprint = durable_bridge_hash("chunk-reset")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-reset",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        encoded = encode_durable_bridge_transcript_chunk(("event",))
+        await session.execute(
+            update(HttpBridgeOperationRecord)
+            .where(HttpBridgeOperationRecord.operation_id == operation_id)
+            .values(spool_format=HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2)
+        )
+        await session.commit()
+        assert not await repository.append_operation_event(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-reset",
+            owner_epoch=claim.owner_epoch,
+            event_text="must-not-mix-formats",
+            max_bytes=1024,
+        )
+        session.add(
+            HttpBridgeOperationEventChunk(
+                operation_id=operation_id,
+                first_sequence_number=1,
+                event_count=encoded.event_count,
+                codec=encoded.codec,
+                uncompressed_bytes=encoded.uncompressed_bytes,
+                payload=encoded.payload,
+                payload_sha256=encoded.payload_sha256,
+            )
+        )
+        await session.commit()
+
+        assert not await repository.rollback_operation_before_dispatch(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-reset",
+            owner_epoch=claim.owner_epoch,
+        )
+        assert await repository.reset_operation_event_spool(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-reset",
+            owner_epoch=claim.owner_epoch,
+        )
+        assert (
+            await session.scalar(
+                select(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            )
+            is None
+        )
+        reset_row = await session.get(HttpBridgeOperationRecord, operation_id)
+        assert reset_row is not None
+        assert reset_row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_presence_query_includes_chunk_table(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        assert await missing_durable_bridge_tables(session) == ()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_chunk_format_resets_on_failed_rebind_and_unknown_claim(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-format-reset", session_key_value="sid-format-reset")
+        encoded = encode_durable_bridge_transcript_chunk(("event",))
+
+        async def seed(operation_id: str, fingerprint: str, state: str) -> None:
+            assert await repository.record_operation(
+                operation_id=operation_id,
+                session_id=claim.id,
+                instance_id="inst-format-reset",
+                owner_epoch=claim.owner_epoch,
+                request_fingerprint=fingerprint,
+                account_id="account-operation",
+                model="gpt-5.6",
+                parent_response_id=None,
+            )
+            await session.execute(
+                update(HttpBridgeOperationRecord)
+                .where(HttpBridgeOperationRecord.operation_id == operation_id)
+                .values(
+                    state=state,
+                    spool_format=HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+                    event_bytes=len("event"),
+                )
+            )
+            session.add(
+                HttpBridgeOperationEventChunk(
+                    operation_id=operation_id,
+                    first_sequence_number=1,
+                    event_count=encoded.event_count,
+                    codec=encoded.codec,
+                    uncompressed_bytes=encoded.uncompressed_bytes,
+                    payload=encoded.payload,
+                    payload_sha256=encoded.payload_sha256,
+                )
+            )
+            await session.commit()
+
+        failed_fingerprint = durable_bridge_hash("failed-format-reset")
+        failed_operation_id = durable_bridge_operation_id(claim.id, failed_fingerprint)
+        await seed(failed_operation_id, failed_fingerprint, "failed")
+        rebound = await repository.record_operation(
+            operation_id=failed_operation_id,
+            session_id=claim.id,
+            instance_id="inst-format-reset",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=failed_fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        assert rebound is not None and rebound.rebound is True
+        failed_row = await session.get(HttpBridgeOperationRecord, failed_operation_id)
+        assert failed_row is not None
+        assert failed_row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
+        assert failed_row.event_bytes == 0
+
+        unknown_fingerprint = durable_bridge_hash("unknown-format-reset")
+        unknown_operation_id = durable_bridge_operation_id(claim.id, unknown_fingerprint)
+        await seed(unknown_operation_id, unknown_fingerprint, "unknown")
+        assert await repository.claim_unknown_operation_for_recovery(
+            operation_id=unknown_operation_id,
+            session_id=claim.id,
+            instance_id="inst-format-reset",
+            owner_epoch=claim.owner_epoch,
+        )
+        unknown_row = await session.get(HttpBridgeOperationRecord, unknown_operation_id)
+        assert unknown_row is not None
+        await session.refresh(unknown_row)
+        assert unknown_row.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
+        assert unknown_row.event_bytes == 0
     finally:
         await session.close()
 
@@ -1465,10 +1776,25 @@ async def test_operation_spool_purge_expires_stale_nonterminal_rows(
             owner_epoch=claim.owner_epoch,
             state="unknown",
         )
+        encoded = encode_durable_bridge_transcript_chunk(("stale-event",))
+        session.add(
+            HttpBridgeOperationEventChunk(
+                operation_id=operation_id,
+                first_sequence_number=1,
+                event_count=encoded.event_count,
+                codec=encoded.codec,
+                uncompressed_bytes=encoded.uncompressed_bytes,
+                payload=encoded.payload,
+                payload_sha256=encoded.payload_sha256,
+            )
+        )
         await session.execute(
             update(HttpBridgeOperationRecord)
             .where(HttpBridgeOperationRecord.operation_id == operation_id)
-            .values(updated_at=stale_at)
+            .values(
+                updated_at=stale_at,
+                spool_format=HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+            )
         )
         await session.commit()
 
@@ -1476,6 +1802,12 @@ async def test_operation_spool_purge_expires_stale_nonterminal_rows(
         # session is still owned and leased; it may be a long-running recovery
         # request whose duplicate-suppression fence must remain intact.
         assert await repository.purge_operation_spool(cutoff=datetime.now(timezone.utc).replace(tzinfo=None)) == 0
+        assert (
+            await session.scalar(
+                select(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            )
+            is not None
+        )
         await session.execute(
             update(HttpBridgeSessionRecord)
             .where(HttpBridgeSessionRecord.id == claim.id)
@@ -1484,6 +1816,12 @@ async def test_operation_spool_purge_expires_stale_nonterminal_rows(
         await session.commit()
         assert await repository.purge_operation_spool(cutoff=datetime.now(timezone.utc).replace(tzinfo=None)) == 1
         assert await repository.get_operation(operation_id=operation_id) is None
+        assert (
+            await session.scalar(
+                select(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            )
+            is None
+        )
     finally:
         await session.close()
 

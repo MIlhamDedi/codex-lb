@@ -1908,3 +1908,136 @@ async def test_file_account_pins_migration_upgrade_and_downgrade(tmp_path):
             assert await conn.run_sync(_schema_state) is not None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_event_chunks_migration_preserves_legacy_and_guards_downgrade(tmp_path):
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'http-bridge-event-chunks.sqlite'}"
+    parent_revision = "20260821_000000_add_retry_circuit_admission_generation"
+    chunk_revision = "20260826_000000_add_http_bridge_event_chunks"
+
+    def _schema_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        return {
+            "has_chunks": inspector.has_table("http_bridge_operation_event_chunks"),
+            "operation_columns": {column["name"] for column in inspector.get_columns("http_bridge_operations")},
+        }
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO http_bridge_sessions (
+                        id, session_key_kind, session_key_value, session_key_hash,
+                        api_key_scope, owner_epoch, state, created_at, updated_at, last_seen_at
+                    ) VALUES (
+                        'session-legacy', 'session_header', 'legacy', 'legacy-hash',
+                        '__anonymous__', 0, 'closed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO http_bridge_operations (
+                        operation_id, session_id, request_fingerprint, request_text,
+                        state, response_id, recovery_dispatch_count, event_bytes,
+                        event_spool_complete, created_at, updated_at
+                    ) VALUES (
+                        'operation-legacy', 'session-legacy', 'fingerprint-legacy', '{}',
+                        'completed', 'response-legacy', 0, 8, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO http_bridge_operation_events (
+                        event_id, operation_id, sequence_number, event_fingerprint, event_text, created_at
+                    ) VALUES (
+                        'event-legacy', 'operation-legacy', 1, 'event-fingerprint',
+                        'legacy-event', CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, chunk_revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+            assert state["has_chunks"] is True
+            assert "spool_format" in state["operation_columns"]
+            assert (
+                await conn.execute(
+                    text("SELECT spool_format FROM http_bridge_operations WHERE operation_id = 'operation-legacy'")
+                )
+            ).scalar_one() == "rows_v1"
+            assert (
+                await conn.execute(
+                    text("SELECT event_text FROM http_bridge_operation_events WHERE event_id = 'event-legacy'")
+                )
+            ).scalar_one() == "legacy-event"
+
+        config = _build_alembic_config(db_url)
+        await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+            assert state["has_chunks"] is False
+            assert "spool_format" not in state["operation_columns"]
+            assert (
+                await conn.execute(
+                    text("SELECT event_text FROM http_bridge_operation_events WHERE event_id = 'event-legacy'")
+                )
+            ).scalar_one() == "legacy-event"
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, chunk_revision, bootstrap_legacy=False))
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE http_bridge_operations SET spool_format = 'chunks_v2' "
+                    "WHERE operation_id = 'operation-legacy'"
+                )
+            )
+
+        with pytest.raises(RuntimeError, match="cannot downgrade while chunks_v2 operations exist"):
+            await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE http_bridge_operations SET spool_format = 'rows_v1' WHERE operation_id = 'operation-legacy'"
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO http_bridge_operation_event_chunks (
+                        operation_id, first_sequence_number, event_count, codec,
+                        uncompressed_bytes, payload, payload_sha256, created_at
+                    ) VALUES (
+                        'operation-legacy', 1, 1, 'test-codec', 1, X'00', 'chunk-hash', CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+
+        with pytest.raises(RuntimeError, match="cannot downgrade while durable transcript chunks exist"):
+            await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(_schema_state)
+            assert state["has_chunks"] is True
+            assert "spool_format" in state["operation_columns"]
+            assert (
+                await conn.execute(text("SELECT COUNT(*) FROM http_bridge_operation_event_chunks"))
+            ).scalar_one() == 1
+    finally:
+        await engine.dispose()
