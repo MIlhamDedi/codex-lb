@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.clients.proxy import ProxyResponseError
@@ -769,6 +769,70 @@ async def test_chunk_operation_replays_exact_events(
             .values(event_bytes=sum(len(event.encode("utf-8")) for event in expected) - 1)
         )
         await session.commit()
+        assert await repository.get_operation_events(operation_id=operation_id) == []
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("table_name", "column_name", "value"),
+    [
+        ("http_bridge_operations", "event_bytes", 1.5),
+        ("http_bridge_operation_event_chunks", "event_count", "not-an-integer"),
+        ("http_bridge_operation_event_chunks", "payload", "not-binary"),
+    ],
+)
+async def test_chunk_operation_rejects_malformed_persisted_metadata(
+    async_session_factory: Callable[[], AsyncSession],
+    table_name: str,
+    column_name: str,
+    value: object,
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(repository, instance_id="inst-chunk-metadata", session_key_value="sid-chunk-metadata")
+        fingerprint = durable_bridge_hash(f"chunk-metadata:{table_name}:{column_name}")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-chunk-metadata",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-operation",
+            model="gpt-5.6",
+            parent_response_id=None,
+            request_text='{"input":"turn"}',
+        )
+        encoded = encode_durable_bridge_transcript_chunk(("a",))
+        await session.execute(
+            update(HttpBridgeOperationRecord)
+            .where(HttpBridgeOperationRecord.operation_id == operation_id)
+            .values(
+                spool_format=HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+                event_bytes=1,
+            )
+        )
+        session.add(
+            HttpBridgeOperationEventChunk(
+                operation_id=operation_id,
+                first_sequence_number=1,
+                event_count=encoded.event_count,
+                codec=encoded.codec,
+                uncompressed_bytes=encoded.uncompressed_bytes,
+                payload=encoded.payload,
+                payload_sha256=encoded.payload_sha256,
+            )
+        )
+        await session.commit()
+        await session.execute(
+            text(f"UPDATE {table_name} SET {column_name} = :value WHERE operation_id = :operation_id"),
+            {"value": value, "operation_id": operation_id},
+        )
+        await session.commit()
+
         assert await repository.get_operation_events(operation_id=operation_id) == []
     finally:
         await session.close()

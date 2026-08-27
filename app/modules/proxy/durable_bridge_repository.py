@@ -1729,7 +1729,9 @@ class DurableBridgeRepository:
         if operation is None:
             return []
         spool_format = str(operation.spool_format)
-        expected_event_bytes = int(operation.event_bytes or 0)
+        if type(operation.event_bytes) is not int:
+            return []
+        expected_event_bytes = operation.event_bytes
         if expected_event_bytes < 0 or expected_event_bytes > max_bytes:
             return []
         if spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1:
@@ -1757,6 +1759,8 @@ class DurableBridgeRepository:
         remaining_bytes = expected_event_bytes
         events: list[str] = []
         for chunk in chunks:
+            if type(chunk.event_count) is not int or not isinstance(chunk.payload, bytes):
+                return []
             if chunk.first_sequence_number != expected_sequence:
                 return []
             total_event_count += chunk.event_count

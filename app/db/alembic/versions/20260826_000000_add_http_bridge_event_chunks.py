@@ -95,7 +95,13 @@ def downgrade() -> None:
         op.drop_table(_CHUNKS_TABLE)
     if _FORMAT_COLUMN in _columns(bind, _OPERATIONS_TABLE):
         if bind.dialect.name == "sqlite":
-            with op.batch_alter_table(_OPERATIONS_TABLE) as batch_op:
-                batch_op.drop_column(_FORMAT_COLUMN)
+            # SQLite batch migrations recreate and drop the parent table. Keep
+            # its legacy event rows from cascading away while that happens.
+            bind.execute(sa.text("PRAGMA foreign_keys=OFF"))
+            try:
+                with op.batch_alter_table(_OPERATIONS_TABLE) as batch_op:
+                    batch_op.drop_column(_FORMAT_COLUMN)
+            finally:
+                bind.execute(sa.text("PRAGMA foreign_keys=ON"))
         else:
             op.drop_column(_OPERATIONS_TABLE, _FORMAT_COLUMN)

@@ -4,7 +4,8 @@ from collections.abc import Callable
 
 import pytest
 from anyio import to_thread
-from sqlalchemy import text
+from sqlalchemy import event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.auth import DEFAULT_PLAN
@@ -1928,6 +1929,13 @@ async def test_http_bridge_event_chunks_migration_preserves_legacy_and_guards_do
             "operation_columns": {column["name"] for column in inspector.get_columns("http_bridge_operations")},
         }
 
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
     await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
     engine = create_async_engine(db_url, future=True)
     try:
@@ -1989,7 +1997,11 @@ async def test_http_bridge_event_chunks_migration_preserves_legacy_and_guards_do
             ).scalar_one() == "legacy-event"
 
         config = _build_alembic_config(db_url)
-        await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        event.listen(Engine, "connect", _enable_sqlite_foreign_keys)
+        try:
+            await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        finally:
+            event.remove(Engine, "connect", _enable_sqlite_foreign_keys)
         async with engine.connect() as conn:
             state = await conn.run_sync(_schema_state)
             assert state["has_chunks"] is False
