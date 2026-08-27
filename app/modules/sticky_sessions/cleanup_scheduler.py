@@ -293,7 +293,9 @@ class StickySessionCleanupScheduler:
                 result.duration_seconds,
                 error_type or "none",
             )
-        return None if result.outcome == "failed" else result.backlog_likely
+        if result.outcome == "failed":
+            return result.backlog_likely if result.deleted_operations > 0 else None
+        return result.backlog_likely
 
     async def _cleanup_operation_retention_as_leader(self) -> bool | None:
         async with self._lock:

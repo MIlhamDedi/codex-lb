@@ -317,6 +317,35 @@ async def test_operation_retention_failure_log_omits_exception_detail(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_operation_retention_partial_failure_keeps_backlog_retry(monkeypatch) -> None:
+    partial_failure = cleanup_scheduler.OperationRetentionCleanupError(
+        cleanup_scheduler.OperationRetentionCleanupResult(
+            deleted_operations=3,
+            batches=1,
+            backlog_likely=True,
+            outcome="failed",
+            duration_seconds=1.0,
+        ),
+        error_type="RuntimeError",
+    )
+    monkeypatch.setattr(
+        cleanup_scheduler,
+        "get_settings",
+        lambda: SimpleNamespace(http_responses_session_bridge_operation_spool_retention_seconds=604800.0),
+    )
+    monkeypatch.setattr(
+        cleanup_scheduler,
+        "_purge_operation_spool_with_budget",
+        AsyncMock(side_effect=partial_failure),
+    )
+    scheduler = cleanup_scheduler.StickySessionCleanupScheduler(interval_seconds=60, enabled=False)
+
+    backlog_likely = await scheduler._run_operation_retention(AsyncMock())
+
+    assert backlog_likely is True
+
+
+@pytest.mark.asyncio
 async def test_operation_retention_catchup_does_not_run_other_maintenance(monkeypatch) -> None:
     bridge_repo = AsyncMock()
     run_retention = AsyncMock(return_value=False)

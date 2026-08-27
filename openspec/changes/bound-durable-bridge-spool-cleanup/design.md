@@ -27,6 +27,8 @@ so the aggregate catch-up rate is not artificially capped below ingest
 throughput. Leader-election skips and failed attempts retain the backlog signal
 but use the bounded retry delay. Repository eligibility and owner fencing stay
 unchanged, so retries are idempotent across ticks and leaders.
+When a failed pass has already committed deletions, its full selected batch is
+evidence of remaining backlog and therefore keeps the retry-bearing signal.
 
 ### D3. Low-cardinality observability
 
