@@ -865,11 +865,30 @@ async def test_chunk_operation_rejects_malformed_persisted_metadata(
 
 
 @pytest.mark.asyncio
+async def test_next_operation_chunk_sequence_selects_only_metadata() -> None:
+    result = SimpleNamespace(one_or_none=lambda: (4, 3))
+    session = SimpleNamespace(execute=AsyncMock(return_value=result))
+    repository = DurableBridgeRepository(cast(AsyncSession, session))
+
+    assert await repository._next_operation_chunk_sequence("operation") == 7
+
+    statement = session.execute.call_args.args[0]
+    assert tuple(statement.selected_columns.keys()) == ("first_sequence_number", "event_count")
+
+
+@pytest.mark.asyncio
 async def test_chunk_writer_persists_batch_and_terminal_atomically(
     async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = async_session_factory()
     try:
+
+        async def encode_off_loop(function, *args):
+            return function(*args)
+
+        encode = AsyncMock(side_effect=encode_off_loop)
+        monkeypatch.setattr(durable_repo_module.asyncio, "to_thread", encode)
         repository = DurableBridgeRepository(session)
         claim = await _claim(repository, instance_id="inst-chunk-writer", session_key_value="sid-chunk-writer")
         fingerprint = durable_bridge_hash("chunk-writer")
@@ -939,6 +958,7 @@ async def test_chunk_writer_persists_batch_and_terminal_atomically(
             'data: {"type":"response.completed"}\n\n',
         ]
         assert await repository.get_replayable_transcript(response_id="resp-chunk-writer") is not None
+        assert encode.await_count == 2
     finally:
         await session.close()
 

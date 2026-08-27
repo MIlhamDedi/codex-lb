@@ -30,8 +30,10 @@ previous chunk's range. The terminal path drains pending chunks first, then
 writes a terminal one-event chunk and operation state in one transaction.
 Logical `event_bytes` remains the sum of UTF-8 event bytes, not compressed or
 framed bytes, preserving the existing cap. Ownership, logical byte capacity,
-and cumulative event count are checked before compression so rejected input
-does not spend event-loop CPU on zlib work.
+and cumulative event count are revalidated by the fenced write. Stateless
+checks and an unfenced ownership preflight reject obvious invalid input before
+the chunk is compressed on a worker thread, while sequence allocation reads
+only the latest chunk's sequence metadata rather than its payload.
 
 ### D4. Fail closed on format conflict
 
