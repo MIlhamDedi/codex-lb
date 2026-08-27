@@ -1318,10 +1318,10 @@ async def test_codex_realtime_call_failure_logs_redact_account_identifiers(
         fake_fresh_with_failover,
     )
     if failure_branch == "before-upstream":
-        remaining = iter((1.0, 0.0))
+        remaining = iter((0.0,))
         monkeypatch.setattr(proxy_module, "_remaining_budget_seconds", lambda _deadline: next(remaining))
     elif failure_branch == "before-forced-refresh":
-        remaining = iter((1.0, 1.0, 0.0))
+        remaining = iter((1.0, 0.0))
         monkeypatch.setattr(proxy_module, "_remaining_budget_seconds", lambda _deadline: next(remaining))
     else:
         monkeypatch.setattr(proxy_module, "_remaining_budget_seconds", lambda _deadline: 1.0)
@@ -1389,7 +1389,11 @@ async def test_codex_realtime_call_shared_freshness_budget_log_redacts_account_i
 
     remaining_budget = iter((1.0, 0.0))
     monkeypatch.setattr(proxy_module, "core_codex_control_request", unexpected_codex_control_request)
-    monkeypatch.setattr(proxy_module, "_remaining_budget_seconds", lambda _deadline: next(remaining_budget))
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_remaining_budget_seconds",
+        lambda _self, _deadline: next(remaining_budget),
+    )
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
