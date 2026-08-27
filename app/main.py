@@ -85,7 +85,10 @@ from app.modules.oauth import api as oauth_api
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy.cap_partitioning import refresh_cap_partition
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
-from app.modules.proxy.durable_bridge_repository import missing_durable_bridge_tables
+from app.modules.proxy.durable_bridge_repository import (
+    DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    missing_durable_bridge_tables,
+)
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.proxy.ring_membership import (
@@ -103,7 +106,9 @@ from app.modules.runtime import api as runtime_api
 from app.modules.settings import api as settings_api
 from app.modules.sticky_sessions import api as sticky_sessions_api
 from app.modules.sticky_sessions.cleanup_scheduler import (
+    OperationRetentionCleanupResult,
     _abandoned_bridge_retention_seconds,
+    _record_operation_retention_cleanup,
     build_sticky_session_cleanup_scheduler,
 )
 from app.modules.telemetry import api as telemetry_api
@@ -367,10 +372,24 @@ async def lifespan(app: FastAPI):
                     "deleted": deleted_bridge_rows,
                 },
             )
-        purged_operation_rows = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool(
+        operation_retention_started_at = time.monotonic()
+        operation_purge_result = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool_batch(
             cutoff=utcnow()
             - timedelta(seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds),
         )
+        operation_backlog_likely = (
+            operation_purge_result.selected_operations >= DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
+        )
+        _record_operation_retention_cleanup(
+            OperationRetentionCleanupResult(
+                deleted_operations=operation_purge_result.deleted_operations,
+                batches=1,
+                backlog_likely=operation_backlog_likely,
+                outcome="batch_budget_exhausted" if operation_backlog_likely else "completed",
+                duration_seconds=max(time.monotonic() - operation_retention_started_at, 0.0),
+            )
+        )
+        purged_operation_rows = operation_purge_result.deleted_operations
         if purged_operation_rows > 0:
             logger.info(
                 "Purged expired durable HTTP bridge operation transcript rows",
