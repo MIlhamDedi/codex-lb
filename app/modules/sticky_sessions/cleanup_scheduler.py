@@ -142,10 +142,10 @@ def _record_operation_retention_cleanup(result: OperationRetentionCleanupResult)
     http_bridge_spool_cleanup_backlog_likely.set(1.0 if result.backlog_likely else 0.0)
 
 
-def _next_cleanup_delay_seconds(interval_seconds: int, *, backlog_likely: bool) -> float:
+def _next_cleanup_delay_seconds(delay_to_full_cleanup: float, *, backlog_likely: bool) -> float:
     if backlog_likely:
-        return min(float(interval_seconds), _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
-    return float(interval_seconds)
+        return min(delay_to_full_cleanup, _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
+    return delay_to_full_cleanup
 
 
 def _merge_backlog_signal(previous: bool, attempted: bool | None) -> bool:
@@ -227,10 +227,9 @@ class StickySessionCleanupScheduler:
                     await self._cleanup_operation_retention_once(),
                 )
             delay_to_full_cleanup = max(next_full_cleanup_at - loop.time(), 0.0)
-            delay_seconds = (
-                min(delay_to_full_cleanup, _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
-                if backlog_likely
-                else delay_to_full_cleanup
+            delay_seconds = _next_cleanup_delay_seconds(
+                delay_to_full_cleanup,
+                backlog_likely=backlog_likely,
             )
             try:
                 await asyncio.wait_for(
