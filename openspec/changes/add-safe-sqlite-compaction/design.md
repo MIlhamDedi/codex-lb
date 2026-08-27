@@ -37,14 +37,18 @@ sizes for the output and its second VACUUM scratch space. Before enabling
 incremental autovacuum, it rechecks space against the pointer-map-expanded
 output size on both the source filesystem and SQLite's selected temporary-file
 filesystem; when both paths share one filesystem, it combines their
-simultaneous allocation requirements. Creation runs under `umask 077`.
+simultaneous allocation requirements. Creation runs under `umask 077`; source
+permissions are restored only after the output-only mutations complete and
+before output integrity verification.
 
 ### D4. Preserve rollback source
 
-Close every SQLite connection before filesystem replacement. Hard-link the
-source to a unique `pre-compact` backup, fsync the directory, then atomically
-replace the source path with the verified temporary file. Preserve source
-mode/uid/gid and fsync the file and directory. If installation or its durability
+Close every SQLite connection except the source and replacement connections
+that own the required exclusive locks. Hard-link the source to a unique
+`pre-compact` backup, fsync the directory through descriptors opened before
+their SQLite locks, then atomically replace the source path with the verified
+temporary file. Preserve source mode/uid/gid and fsync the file and directory.
+If installation or its durability
 checks fail, or is interrupted, restore the original. Preserve any
 stopped-instance sidecar files under backup names rather than deleting them;
 choose the backup name only when its base and sidecar paths are all unused.

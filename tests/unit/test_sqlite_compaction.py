@@ -91,6 +91,18 @@ def test_compaction_reclaims_space_and_preserves_backup(tmp_path: Path, monkeypa
     assert not Path(f"{source}.compact.lock").exists()
 
 
+def test_compaction_restores_read_only_source_mode_after_output_mutation(tmp_path: Path) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    source.chmod(0o444)
+
+    outcome = compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.stat().st_mode & 0o777 == 0o444
+    assert outcome.backup.stat().st_mode & 0o777 == 0o444
+    assert _remaining_rows(source) == 100
+
+
 def test_compaction_requires_stopped_confirmation(tmp_path: Path) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)
@@ -512,6 +524,38 @@ def test_compaction_blocks_concurrent_writer_during_replacement_install(tmp_path
     assert _remaining_rows(source) == 100
 
 
+def test_compaction_keeps_replacement_lock_while_fsyncing(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_replace = compact._replace_path
+    real_fsync_descriptor = compact._fsync_descriptor
+    replacement_installed = False
+
+    def mark_replacement_install(candidate: Path, target: Path) -> None:
+        nonlocal replacement_installed
+        real_replace(candidate, target)
+        if ".compact-" in str(candidate) and target == source:
+            replacement_installed = True
+
+    def assert_writer_is_blocked_during_replacement_fsync(descriptor: int) -> None:
+        if replacement_installed:
+            writer = sqlite3.connect(source, timeout=0)
+            try:
+                writer.execute("PRAGMA busy_timeout=0")
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    writer.execute("INSERT INTO payloads(payload) VALUES ('concurrent-write')")
+            finally:
+                writer.close()
+        real_fsync_descriptor(descriptor)
+
+    monkeypatch.setattr(compact, "_replace_path", mark_replacement_install)
+    monkeypatch.setattr(compact, "_fsync_descriptor", assert_writer_is_blocked_during_replacement_fsync)
+
+    compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert _remaining_rows(source) == 100
+
+
 def test_compaction_restores_source_when_install_rename_fails(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)
@@ -591,18 +635,24 @@ def test_compaction_restores_original_when_post_install_fsync_fails(tmp_path: Pa
     source = tmp_path / "store.db"
     _create_fragmented_database(source)
     before = source.read_bytes()
-    real_fsync_file = compact._fsync_file
-    source_fsync_count = 0
+    real_replace = compact._replace_path
+    replacement_installed = False
+    failure_injected = False
 
-    def fail_replacement_fsync(path: Path) -> None:
-        nonlocal source_fsync_count
-        if path == source:
-            source_fsync_count += 1
-            if source_fsync_count == 2:
-                raise OSError("injected replacement fsync failure")
-        real_fsync_file(path)
+    def mark_replacement_install(candidate: Path, target: Path) -> None:
+        nonlocal replacement_installed
+        real_replace(candidate, target)
+        if ".compact-" in str(candidate) and target == source:
+            replacement_installed = True
 
-    monkeypatch.setattr(compact, "_fsync_file", fail_replacement_fsync)
+    def fail_replacement_fsync(_descriptor: int) -> None:
+        nonlocal failure_injected
+        if replacement_installed and not failure_injected:
+            failure_injected = True
+            raise OSError("injected replacement fsync failure")
+
+    monkeypatch.setattr(compact, "_replace_path", mark_replacement_install)
+    monkeypatch.setattr(compact, "_fsync_descriptor", fail_replacement_fsync)
 
     with pytest.raises(OSError, match="injected replacement fsync failure"):
         compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)

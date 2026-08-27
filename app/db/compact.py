@@ -225,6 +225,14 @@ def _fsync_file(path: Path) -> None:
         os.fsync(handle.fileno())
 
 
+def _open_sync_descriptor(path: Path) -> int:
+    return os.open(path, os.O_RDONLY)
+
+
+def _fsync_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
 def _fsync_directory(path: Path) -> None:
     if os.name == "nt":
         return
@@ -331,9 +339,12 @@ def execute_sqlite_compaction(
     backup_created = False
     replacement_installed = False
     replacement_connection: sqlite3.Connection | None = None
+    source_sync_descriptor: int | None = None
+    temporary_sync_descriptor: int | None = None
     completed = False
     moved_sidecars: list[tuple[Path, Path]] = []
     try:
+        source_sync_descriptor = _open_sync_descriptor(source)
         os.write(lock_descriptor, f"pid={os.getpid()}\n".encode())
         os.fsync(lock_descriptor)
         source_integrity = check_sqlite_integrity(source, mode=SqliteIntegrityCheckMode.QUICK)
@@ -357,7 +368,6 @@ def execute_sqlite_compaction(
                 source_connection.execute("VACUUM INTO ?", (str(temporary),))
             finally:
                 os.umask(previous_umask)
-            _preserve_file_metadata(temporary, original_source_stat)
             if _data_version(source_connection) != data_version:
                 raise RuntimeError("source database changed during compaction; keep the application stopped")
             with sqlite_connection(temporary) as compacted_connection:
@@ -391,9 +401,11 @@ def execute_sqlite_compaction(
                 compacted_identity = _schema_identity(compacted_connection)
             if compacted_identity != source_identity:
                 raise RuntimeError("compacted SQLite schema identity does not match the source")
+            _preserve_file_metadata(temporary, original_source_stat)
             compacted_integrity = check_sqlite_integrity(temporary, mode=SqliteIntegrityCheckMode.QUICK)
             if not compacted_integrity.ok:
                 raise RuntimeError(f"compacted SQLite quick_check failed: {compacted_integrity.details}")
+            temporary_sync_descriptor = _open_sync_descriptor(temporary)
             # Block SQLite writers until the verified replacement is durable. A
             # file lock alone cannot prevent a process with an open SQLite
             # connection from committing between the final checks and rename.
@@ -409,8 +421,8 @@ def execute_sqlite_compaction(
                 source_stat.st_size,
                 source_stat.st_mtime_ns,
             )
-            _fsync_file(source)
-            _fsync_file(temporary)
+            _fsync_descriptor(source_sync_descriptor)
+            _fsync_descriptor(temporary_sync_descriptor)
             current_source_stat = source.stat()
             if (
                 current_source_stat.st_dev,
@@ -444,7 +456,7 @@ def execute_sqlite_compaction(
                         backup.unlink(missing_ok=True)
                         backup_created = False
                 raise
-            _fsync_file(source)
+            _fsync_descriptor(temporary_sync_descriptor)
             _fsync_directory(source.parent)
             after_bytes = source.stat().st_size
         completed = True
@@ -462,7 +474,8 @@ def execute_sqlite_compaction(
             _replace_path(backup, source)
             backup_created = False
             _restore_sidecars(moved_sidecars)
-            _fsync_file(source)
+            if source_sync_descriptor is not None:
+                _fsync_descriptor(source_sync_descriptor)
             _fsync_directory(source.parent)
         if not completed and backup_created:
             backup.unlink(missing_ok=True)
@@ -474,7 +487,15 @@ def execute_sqlite_compaction(
                 if replacement_connection is not None:
                     replacement_connection.close()
             finally:
-                os.close(lock_descriptor)
+                try:
+                    if temporary_sync_descriptor is not None:
+                        os.close(temporary_sync_descriptor)
+                finally:
+                    try:
+                        if source_sync_descriptor is not None:
+                            os.close(source_sync_descriptor)
+                    finally:
+                        os.close(lock_descriptor)
 
 
 __all__ = [
