@@ -65,8 +65,21 @@ from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_e
 from app.modules.proxy.http_bridge_event_batcher import TerminalOperationEventAppendResult
 from app.modules.proxy.http_bridge_forwarding import OwnerForwardRelayFailure
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, CatalogOmissionQuotaAdmission
+from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 
 pytestmark = pytest.mark.unit
+
+
+class _RecordingVirtualScheduler(VirtualScheduler):
+    def __init__(self, clock: VirtualClock) -> None:
+        super().__init__(clock)
+        self.task_names: list[str | None] = []
+        self.task_coroutines: list[str] = []
+
+    def create_task(self, coroutine: Any, *, name: str | None = None) -> asyncio.Task[Any]:
+        self.task_names.append(name)
+        self.task_coroutines.append(coroutine.cr_code.co_name)
+        return super().create_task(coroutine, name=name)
 
 
 def _durable_owner_lookup(*, process_epoch: str, lease_expires_at: datetime) -> DurableBridgeLookup:
@@ -13086,7 +13099,8 @@ async def test_close_http_bridge_session_fails_pending_downstream_requests() -> 
 async def test_close_http_bridge_session_uses_one_resource_owner_for_concurrent_callers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    scheduler = _RecordingVirtualScheduler(VirtualClock())
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), scheduler=scheduler)
     session = _make_bridge_session(key_value="close-single-flight")
     close_started = asyncio.Event()
     release_close = asyncio.Event()
@@ -13113,6 +13127,7 @@ async def test_close_http_bridge_session_uses_one_resource_owner_for_concurrent_
     assert upstream_close_calls == 1
     release_account_lease.assert_awaited_once()
     assert service._http_bridge_detached_sessions == {}
+    assert any(name and name.startswith("http-bridge-resource-close-") for name in scheduler.task_names)
 
 
 @pytest.mark.asyncio
@@ -22311,7 +22326,8 @@ async def test_recovery_submit_owner_fence_rejection_retires_before_send() -> No
 
 @pytest.mark.asyncio
 async def test_recovery_submit_cancellation_after_alias_commit_restores_previous_owner() -> None:
-    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    scheduler = _RecordingVirtualScheduler(VirtualClock())
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), scheduler=scheduler)
     key = _make_account_neutral_replay_session_key("alias-commit-cancel")
     send_text = AsyncMock()
     close = AsyncMock()
@@ -22402,6 +22418,9 @@ async def test_recovery_submit_cancellation_after_alias_commit_restores_previous
     assert session.closed is True
     assert session.queued_request_count == 0
     assert session.pending_requests == deque()
+    # Registration and its cancellation rollback are both scheduler-owned.
+    assert scheduler.task_coroutines.count("_register_http_bridge_recovery_turn_state_locked") == 1
+    assert scheduler.task_coroutines.count("rollback_recovery_turn_state_registration") == 1
 
 
 @pytest.mark.asyncio
@@ -26629,7 +26648,8 @@ async def test_http_bridge_liveness_send_receive_race_settles_request_once(
                 error_code=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
             )
 
-    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    scheduler = _RecordingVirtualScheduler(VirtualClock())
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), scheduler=scheduler)
     sibling_queue: asyncio.Queue[str | None] = asyncio.Queue()
     sibling_state = proxy_service._WebSocketRequestState(
         request_id="req-bridge-liveness-race-sibling",
@@ -26745,6 +26765,8 @@ async def test_http_bridge_liveness_send_receive_race_settles_request_once(
     retry_circuit_attempt_selection = retire_call.kwargs["retry_circuit_attempt_selection"]
     assert retry_circuit_attempt_selection.attempt is request_state.response_create_attempt
     assert request_state.response_create_attempt.disarmed is True
+    assert "http-bridge-liveness-send-settlement" in scheduler.task_names
+    assert "_settle_claimed_http_bridge_liveness_failure" in scheduler.task_coroutines
 
 
 @pytest.mark.asyncio

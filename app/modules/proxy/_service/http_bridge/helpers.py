@@ -1059,7 +1059,7 @@ async def _close_http_bridge_session(
             not existing.done() or (not existing.cancelled() and existing.exception() is None)
         ):
             return existing
-        created = asyncio.create_task(
+        created = scheduler_for(service).create_task(
             _close_http_bridge_session_resources(
                 service,
                 session,

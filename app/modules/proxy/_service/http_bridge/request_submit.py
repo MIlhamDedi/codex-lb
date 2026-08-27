@@ -356,7 +356,7 @@ async def _rollback_http_bridge_recovery_turn_state_registration(
     service: Any,
     receipt: DurableBridgeAliasRegistrationReceipt,
 ) -> tuple[bool, asyncio.CancelledError | None]:
-    rollback_task = asyncio.create_task(
+    rollback_task = scheduler_for(service).create_task(
         service._durable_bridge.rollback_recovery_turn_state_registration(receipt=receipt)
     )
     return await _await_task_deferring_cancellation(rollback_task)
@@ -1567,7 +1567,7 @@ class _HTTPBridgeRequestSubmitMixin:
             # error so a later reconnect is not fenced as already dispatched.
             if getattr(session, "unanchored_reservation_id", None) == request_scope_id:
                 session.unanchored_reservation_id = None
-            cleanup_task = asyncio.create_task(
+            cleanup_task = scheduler_for(self).create_task(
                 self._cleanup_http_bridge_submit_interruption(
                     session,
                     request_state=request_state,
@@ -2074,7 +2074,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 # Publish the cleanup task before the first await after the
                 # claim. Shielding it makes cancellation wait for settlement,
                 # so the claim can never outlive its exactly-once owner.
-                settlement_task = asyncio.create_task(
+                settlement_task = scheduler_for(self).create_task(
                     _settle_claimed_http_bridge_liveness_failure(
                         self,
                         session,
