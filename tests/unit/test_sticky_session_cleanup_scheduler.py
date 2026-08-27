@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from types import SimpleNamespace
@@ -12,7 +13,12 @@ import app.modules.sticky_sessions.cleanup_scheduler as cleanup_scheduler
 from app.core.config.settings import Settings
 from app.core.utils.time import utcnow
 from app.db.models import DashboardSettings
-from app.modules.proxy.durable_bridge_repository import DurableBridgeOperationPurgeBatchResult
+from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
+from app.modules.proxy.durable_bridge_repository import (
+    DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    DurableBridgeOperationPurgeBatchResult,
+    DurableBridgeRepository,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -167,12 +173,22 @@ async def test_operation_retention_cleanup_failure_preserves_committed_progress(
     assert captured.value.__cause__ is None
 
 
-def test_cleanup_delay_accelerates_while_backlog_is_likely(monkeypatch) -> None:
-    monkeypatch.setattr(cleanup_scheduler, "_OPERATION_RETENTION_BACKLOG_RETRY_SECONDS", 5.0)
-
-    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=True) == 5.0
-    assert cleanup_scheduler._next_cleanup_delay_seconds(3, backlog_likely=True) == 3.0
+def test_cleanup_delay_retries_immediately_while_backlog_is_likely() -> None:
+    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=True) == 0.0
+    assert cleanup_scheduler._next_cleanup_delay_seconds(3, backlog_likely=True) == 0.0
     assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=False) == 300.0
+
+
+def test_startup_and_scheduler_share_the_bounded_spool_purge_size() -> None:
+    assert cleanup_scheduler._OPERATION_RETENTION_BATCH_SIZE == DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
+    assert (
+        inspect.signature(DurableBridgeRepository.purge_operation_spool).parameters["batch_size"].default
+        == DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
+    )
+    assert (
+        inspect.signature(DurableBridgeSessionCoordinator.purge_operation_spool).parameters["batch_size"].default
+        == DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
+    )
 
 
 def test_leader_skip_preserves_existing_backlog_signal() -> None:
@@ -363,7 +379,7 @@ async def test_prebatch_retention_failure_records_aggregate_metrics(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_unrelated_cleanup_failure_does_not_request_fast_retention_retry(monkeypatch) -> None:
+async def test_unrelated_cleanup_failure_preserves_existing_backlog_retry(monkeypatch) -> None:
     class FakeSession:
         async def __aenter__(self):
             return AsyncMock()
@@ -380,7 +396,8 @@ async def test_unrelated_cleanup_failure_does_not_request_fast_retention_retry(m
     ):
         backlog_likely = await scheduler._cleanup_as_leader()
 
-    assert backlog_likely is False
+    assert backlog_likely is None
+    assert cleanup_scheduler._merge_backlog_signal(True, backlog_likely) is True
 
 
 @pytest.mark.asyncio

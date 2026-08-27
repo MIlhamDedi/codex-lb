@@ -21,9 +21,10 @@ still makes bounded forward progress.
 ### D2. Resume instead of drain
 
 A short batch proves the eligible backlog is drained. A full final batch when
-the count or time budget is exhausted is reported as likely backlog and left
-for the next scheduler tick. Repository eligibility and owner fencing stay
-unchanged, so retries are idempotent across ticks and leaders.
+the count or time budget is exhausted is reported as likely backlog and retried
+immediately in another bounded pass, so the aggregate catch-up rate is not
+artificially capped below ingest throughput. Repository eligibility and owner
+fencing stay unchanged, so retries are idempotent across ticks and leaders.
 
 ### D3. Low-cardinality observability
 

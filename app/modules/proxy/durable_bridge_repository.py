@@ -44,6 +44,7 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_operation_events",
 )
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
+DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE = 50
 _PURGE_CLOSED_BATCH_SIZE = 500
 # Claim retry budget: insert races and epoch-CAS losses re-read and retry;
 # each round has a winner, so a small budget converges under any realistic
@@ -1832,7 +1833,12 @@ class DurableBridgeRepository:
             deleted_operations=len(deleted_ids),
         )
 
-    async def purge_operation_spool(self, *, cutoff: datetime, batch_size: int = 500) -> int:
+    async def purge_operation_spool(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    ) -> int:
         """Delete one eligible transcript batch and return actual deletes."""
         result = await self.purge_operation_spool_batch(cutoff=cutoff, batch_size=batch_size)
         return result.deleted_operations

@@ -23,6 +23,7 @@ from app.core.utils.time import utcnow
 from app.db.models import DashboardSettings
 from app.db.session import SessionLocal, get_background_session
 from app.modules.proxy.durable_bridge_repository import (
+    DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
     DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS,
     DurableBridgeRepository,
     missing_durable_bridge_tables,
@@ -51,10 +52,9 @@ _STALE_HARD_CODEX_SESSION_UNAVAILABLE_SECONDS = 6 * 3600
 # Keep each pass large enough to outpace steady-state expiry, but small enough
 # that a historical backlog is resumed across scheduler ticks instead of
 # monopolizing the database in one drain-all loop.
-_OPERATION_RETENTION_BATCH_SIZE = 50
+_OPERATION_RETENTION_BATCH_SIZE = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
 _OPERATION_RETENTION_MAX_BATCHES = 4
 _OPERATION_RETENTION_TIME_BUDGET_SECONDS = 5.0
-_OPERATION_RETENTION_BACKLOG_RETRY_SECONDS = 5.0
 
 
 OperationRetentionOutcome = Literal[
@@ -144,7 +144,7 @@ def _record_operation_retention_cleanup(result: OperationRetentionCleanupResult)
 
 def _next_cleanup_delay_seconds(delay_to_full_cleanup: float, *, backlog_likely: bool) -> float:
     if backlog_likely:
-        return min(delay_to_full_cleanup, _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
+        return 0.0
     return delay_to_full_cleanup
 
 
@@ -309,9 +309,10 @@ class StickySessionCleanupScheduler:
                 )
                 return True
 
-    async def _cleanup_as_leader(self) -> bool:
+    async def _cleanup_as_leader(self) -> bool | None:
         async with self._lock:
             backlog_likely = False
+            retention_attempted = False
             try:
                 async with get_background_session() as session:
                     settings_repo = SettingsRepository(session)
@@ -363,6 +364,7 @@ class StickySessionCleanupScheduler:
                                     retry_circuit_deleted_count,
                                 )
                         if self.operation_retention_enabled:
+                            retention_attempted = True
                             backlog_likely = await self._run_operation_retention(bridge_repo)
                 if self.enabled:
                     ring_cutoff = utcnow() - timedelta(seconds=RING_MEMBER_RETENTION_SECONDS)
@@ -371,7 +373,7 @@ class StickySessionCleanupScheduler:
                         logger.info("Purged stale bridge ring members deleted_count=%s", ring_deleted_count)
             except Exception:
                 logger.exception("Sticky session cleanup loop failed")
-                return backlog_likely
+                return backlog_likely if retention_attempted else None
             return backlog_likely
 
 
