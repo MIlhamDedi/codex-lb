@@ -55,6 +55,7 @@ _STALE_HARD_CODEX_SESSION_UNAVAILABLE_SECONDS = 6 * 3600
 _OPERATION_RETENTION_BATCH_SIZE = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
 _OPERATION_RETENTION_MAX_BATCHES = 4
 _OPERATION_RETENTION_TIME_BUDGET_SECONDS = 5.0
+_OPERATION_RETENTION_BACKLOG_RETRY_SECONDS = 5.0
 
 
 OperationRetentionOutcome = Literal[
@@ -142,9 +143,16 @@ def _record_operation_retention_cleanup(result: OperationRetentionCleanupResult)
     http_bridge_spool_cleanup_backlog_likely.set(1.0 if result.backlog_likely else 0.0)
 
 
-def _next_cleanup_delay_seconds(delay_to_full_cleanup: float, *, backlog_likely: bool) -> float:
-    if backlog_likely:
+def _next_cleanup_delay_seconds(
+    delay_to_full_cleanup: float,
+    *,
+    backlog_likely: bool,
+    retry_immediately: bool,
+) -> float:
+    if backlog_likely and retry_immediately:
         return 0.0
+    if backlog_likely:
+        return min(delay_to_full_cleanup, _OPERATION_RETENTION_BACKLOG_RETRY_SECONDS)
     return delay_to_full_cleanup
 
 
@@ -218,21 +226,25 @@ class StickySessionCleanupScheduler:
         next_full_cleanup_at = loop.time()
         backlog_likely = False
         while not self._stop.is_set():
+            retention_attempted: bool | None = None
             if loop.time() >= next_full_cleanup_at:
+                retention_attempted = await self._cleanup_once()
                 backlog_likely = _merge_backlog_signal(
                     backlog_likely,
-                    await self._cleanup_once(),
+                    retention_attempted,
                 )
                 next_full_cleanup_at = loop.time() + float(self.interval_seconds)
             elif backlog_likely:
+                retention_attempted = await self._cleanup_operation_retention_once()
                 backlog_likely = _merge_backlog_signal(
                     backlog_likely,
-                    await self._cleanup_operation_retention_once(),
+                    retention_attempted,
                 )
             delay_to_full_cleanup = max(next_full_cleanup_at - loop.time(), 0.0)
             delay_seconds = _next_cleanup_delay_seconds(
                 delay_to_full_cleanup,
                 backlog_likely=backlog_likely,
+                retry_immediately=retention_attempted is True,
             )
             try:
                 await asyncio.wait_for(
@@ -248,7 +260,7 @@ class StickySessionCleanupScheduler:
     async def _cleanup_operation_retention_once(self) -> bool | None:
         return await _get_leader_election().run_if_leader(self._cleanup_operation_retention_as_leader)
 
-    async def _run_operation_retention(self, bridge_repo: DurableBridgeRepository) -> bool:
+    async def _run_operation_retention(self, bridge_repo: DurableBridgeRepository) -> bool | None:
         operation_cutoff = utcnow() - timedelta(
             seconds=get_settings().http_responses_session_bridge_operation_spool_retention_seconds
         )
@@ -281,9 +293,9 @@ class StickySessionCleanupScheduler:
                 result.duration_seconds,
                 error_type or "none",
             )
-        return result.backlog_likely
+        return None if result.outcome == "failed" else result.backlog_likely
 
-    async def _cleanup_operation_retention_as_leader(self) -> bool:
+    async def _cleanup_operation_retention_as_leader(self) -> bool | None:
         async with self._lock:
             started_at = time.monotonic()
             try:
@@ -307,7 +319,7 @@ class StickySessionCleanupScheduler:
                     result.duration_seconds,
                     type(exc).__name__,
                 )
-                return True
+                return None
 
     async def _cleanup_as_leader(self) -> bool | None:
         async with self._lock:

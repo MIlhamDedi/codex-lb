@@ -174,9 +174,11 @@ async def test_operation_retention_cleanup_failure_preserves_committed_progress(
 
 
 def test_cleanup_delay_retries_immediately_while_backlog_is_likely() -> None:
-    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=True) == 0.0
-    assert cleanup_scheduler._next_cleanup_delay_seconds(3, backlog_likely=True) == 0.0
-    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=False) == 300.0
+    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=True, retry_immediately=True) == 0.0
+    assert cleanup_scheduler._next_cleanup_delay_seconds(3, backlog_likely=True, retry_immediately=True) == 0.0
+    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=True, retry_immediately=False) == 5.0
+    assert cleanup_scheduler._next_cleanup_delay_seconds(3, backlog_likely=True, retry_immediately=False) == 3.0
+    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=False, retry_immediately=False) == 300.0
 
 
 def test_startup_and_scheduler_share_the_bounded_spool_purge_size() -> None:
@@ -307,7 +309,7 @@ async def test_operation_retention_failure_log_omits_exception_detail(monkeypatc
     with caplog.at_level("INFO", logger=cleanup_scheduler.__name__):
         backlog_likely = await scheduler._run_operation_retention(bridge_repo)
 
-    assert backlog_likely is True
+    assert backlog_likely is None
     assert "deleted_operations=0 batches=0" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
     assert "operation_id=secret" not in caplog.text
@@ -368,7 +370,7 @@ async def test_prebatch_retention_failure_records_aggregate_metrics(monkeypatch,
     ):
         backlog_likely = await scheduler._cleanup_operation_retention_as_leader()
 
-    assert backlog_likely is True
+    assert backlog_likely is None
     result = recorded.call_args.args[0]
     assert result.outcome == "failed"
     assert result.deleted_operations == 0
