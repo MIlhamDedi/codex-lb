@@ -33,7 +33,9 @@ bytes.
 `first_sequence_number` order, requires contiguous sequence ranges beginning
 at one, and returns no events on any decode or integrity failure. Existing
 replay eligibility then rejects the incomplete transcript without upstream
-redispatch.
+redispatch. The replay reader uses the configured operation spool byte limit,
+so a valid configured transcript is never rejected by a smaller reader-only
+cap.
 
 ### D4. Dual-format lifecycle cleanup
 

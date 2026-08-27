@@ -8,6 +8,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clients.proxy import ProxyResponseError
+from app.core.config.settings import get_settings
 from app.core.errors import openai_error
 from app.core.utils.time import to_utc_naive
 from app.db.models import HttpBridgeSessionState
@@ -570,7 +571,14 @@ class DurableBridgeSessionCoordinator:
 
     async def get_operation_events(self, *, operation_id: str) -> list[str]:
         async with self._session() as session:
-            return await DurableBridgeRepository(session).get_operation_events(operation_id=operation_id)
+            return await DurableBridgeRepository(session).get_operation_events(
+                operation_id=operation_id,
+                max_bytes=int(
+                    getattr(
+                        get_settings(), "http_responses_session_bridge_operation_event_spool_max_bytes", 2 * 1024 * 1024
+                    )
+                ),
+            )
 
     async def get_replayable_transcript(
         self,

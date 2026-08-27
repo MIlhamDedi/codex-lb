@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.modules.proxy.durable_bridge_coordinator as durable_bridge_coordinator_module
 from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import Settings
 from app.core.utils.time import utcnow
@@ -60,6 +61,28 @@ def _share_proxy_dashboard_settings(monkeypatch: pytest.MonkeyPatch) -> None:
             return proxy_service.get_settings()
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache())
+
+
+@pytest.mark.asyncio
+async def test_operation_event_reader_uses_configured_spool_limit(monkeypatch) -> None:
+    session = AsyncMock()
+    repository = AsyncMock()
+    repository.get_operation_events = AsyncMock(return_value=["event"])
+    close_session = AsyncMock()
+    max_bytes = 9 * 1024 * 1024
+    monkeypatch.setattr(durable_bridge_coordinator_module, "DurableBridgeRepository", lambda _session: repository)
+    monkeypatch.setattr(durable_bridge_coordinator_module, "close_session", close_session)
+    monkeypatch.setattr(
+        durable_bridge_coordinator_module,
+        "get_settings",
+        lambda: SimpleNamespace(http_responses_session_bridge_operation_event_spool_max_bytes=max_bytes),
+    )
+    coordinator = DurableBridgeSessionCoordinator(lambda: session)
+
+    assert await coordinator.get_operation_events(operation_id="operation") == ["event"]
+
+    repository.get_operation_events.assert_awaited_once_with(operation_id="operation", max_bytes=max_bytes)
+    close_session.assert_awaited_once_with(session)
 
 
 @pytest.fixture
