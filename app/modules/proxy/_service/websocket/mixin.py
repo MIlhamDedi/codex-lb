@@ -840,7 +840,8 @@ async def _close_websocket_upstream_for_cleanup(
     request ownership and leases within its bounded cleanup budget.
     """
 
-    close_task = asyncio.create_task(
+    scheduler = scheduler_for(proxy)
+    close_task = scheduler.create_task(
         upstream.close(),
         name="proxy-websocket-upstream-close",
     )
@@ -865,7 +866,7 @@ async def _close_websocket_upstream_for_cleanup(
         await cancel_close_task()
         return
     try:
-        await asyncio.wait_for(asyncio.shield(close_task), timeout=effective_timeout)
+        await scheduler.wait_for(asyncio.shield(close_task), timeout=effective_timeout)
     except TimeoutError:
         _facade().logger.debug(
             "Upstream websocket close continued after cleanup budget timeout_seconds=%.3f",

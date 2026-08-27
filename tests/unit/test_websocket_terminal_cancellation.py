@@ -20,6 +20,7 @@ from app.db.models import Account
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service.websocket import mixin as websocket_mixin
+from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 
 pytestmark = pytest.mark.unit
 
@@ -1434,6 +1435,51 @@ async def test_stuck_upstream_close_is_cancelled_after_scope_cleanup_timeout() -
     assert close_cancelled is True
     assert service._background_cleanup_tasks == set()
     release_close.set()
+
+
+@pytest.mark.asyncio
+async def test_upstream_close_cleanup_uses_injected_scheduler_timeout() -> None:
+    @asynccontextmanager
+    async def repo_factory() -> AsyncIterator[SimpleNamespace]:
+        yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
+
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    service = proxy_service.ProxyService(
+        cast(proxy_service.ProxyRepoFactory, repo_factory),
+        clock=clock,
+        scheduler=scheduler,
+    )
+    close_started = asyncio.Event()
+    close_cancelled = False
+
+    async def close() -> None:
+        nonlocal close_cancelled
+        close_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            close_cancelled = True
+            raise
+
+    upstream = cast(UpstreamWebSocket, SimpleNamespace(close=close))
+    cleanup = scheduler.create_task(
+        websocket_mixin._close_websocket_upstream_for_cleanup(
+            service,
+            upstream,
+            timeout_seconds=1.0,
+        )
+    )
+
+    await scheduler.drain()
+    assert close_started.is_set()
+    assert not cleanup.done()
+
+    await scheduler.advance(0.25)
+    await cleanup
+
+    assert close_cancelled is True
+    assert service._background_cleanup_tasks == set()
 
 
 @pytest.mark.asyncio
