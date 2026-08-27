@@ -24,8 +24,10 @@ concatenate the frames, and compress the canonical bytes with zlib. Store the
 codec name, event count, uncompressed byte count, compressed payload, and
 SHA-256 of the canonical bytes. Decoding is bounded by the existing transcript
 byte budget and rejects unknown codecs, oversized output, malformed framing,
-invalid UTF-8, hash mismatch, non-contiguous sequence ranges, and trailing
-bytes.
+invalid UTF-8, hash mismatch, non-contiguous sequence ranges, trailing bytes,
+and more than 65,536 events across one operation. The later chunk writer uses
+the same operation-wide event-count limit, so the reader treats a larger
+persisted value as invalid rather than replaying an unbounded event list.
 
 ### D3. Exact fail-closed replay
 

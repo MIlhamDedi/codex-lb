@@ -29,7 +29,9 @@ deployments do not expose chunk-only data to an older replica.
 ### Requirement: Chunk transcript decoding fails closed
 
 Chunk decoding MUST enforce the operation's logical transcript byte bound and
-MUST reject unknown codecs, decompression beyond the declared bound, hash or
+the 65,536-event operation-wide chunk transcript limit. The chunk writer MUST
+reject transcript growth beyond that same limit. Chunk decoding MUST reject
+unknown codecs, decompression beyond the declared bound, hash or
 byte-count mismatch, non-hexadecimal or incorrectly sized hashes, malformed
 framing, invalid UTF-8, incorrect event count,
 non-contiguous sequence ranges, and trailing bytes. Any rejected chunk MUST
