@@ -1349,7 +1349,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                             timeout=receive_timeout.timeout_seconds if receive_timeout is not None else None,
                         )
                     except asyncio.TimeoutError:
-                        done = set()
+                        # The scheduler deadline can fire while either child
+                        # finishes. Recheck before classifying the race as a
+                        # transport timeout: ``asyncio.wait`` itself was
+                        # cancelled by the wrapper, not these persistent
+                        # reader children.
+                        done = {task for task in (receive_task, wakeup_task) if task is not None and task.done()}
                     if receive_task in done:
                         message = receive_task.result()
                         receive_task = None
