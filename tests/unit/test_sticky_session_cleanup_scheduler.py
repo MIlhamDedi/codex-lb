@@ -309,7 +309,9 @@ async def test_operation_retention_failure_log_omits_exception_detail(monkeypatc
     with caplog.at_level("INFO", logger=cleanup_scheduler.__name__):
         backlog_likely = await scheduler._run_operation_retention(bridge_repo)
 
-    assert backlog_likely is None
+    assert backlog_likely is True
+    assert scheduler._operation_retention_attempt_failed is True
+    assert cleanup_scheduler._next_cleanup_delay_seconds(300, backlog_likely=True, retry_immediately=False) == 5.0
     assert "deleted_operations=0 batches=0" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
     assert "operation_id=secret" not in caplog.text
@@ -343,6 +345,7 @@ async def test_operation_retention_partial_failure_keeps_backlog_retry(monkeypat
     backlog_likely = await scheduler._run_operation_retention(AsyncMock())
 
     assert backlog_likely is True
+    assert scheduler._operation_retention_attempt_failed is True
 
 
 @pytest.mark.asyncio
@@ -399,7 +402,8 @@ async def test_prebatch_retention_failure_records_aggregate_metrics(monkeypatch,
     ):
         backlog_likely = await scheduler._cleanup_operation_retention_as_leader()
 
-    assert backlog_likely is None
+    assert backlog_likely is True
+    assert scheduler._operation_retention_attempt_failed is True
     result = recorded.call_args.args[0]
     assert result.outcome == "failed"
     assert result.deleted_operations == 0

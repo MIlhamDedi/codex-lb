@@ -203,6 +203,7 @@ class StickySessionCleanupScheduler:
     _task: asyncio.Task[None] | None = None
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _operation_retention_attempt_failed: bool = False
 
     async def start(self) -> None:
         if not self.enabled and not self.operation_retention_enabled:
@@ -244,7 +245,7 @@ class StickySessionCleanupScheduler:
             delay_seconds = _next_cleanup_delay_seconds(
                 delay_to_full_cleanup,
                 backlog_likely=backlog_likely,
-                retry_immediately=retention_attempted is True,
+                retry_immediately=retention_attempted is True and not self._operation_retention_attempt_failed,
             )
             try:
                 await asyncio.wait_for(
@@ -293,8 +294,7 @@ class StickySessionCleanupScheduler:
                 result.duration_seconds,
                 error_type or "none",
             )
-        if result.outcome == "failed":
-            return result.backlog_likely if result.deleted_operations > 0 else None
+        self._operation_retention_attempt_failed = result.outcome == "failed"
         return result.backlog_likely
 
     async def _cleanup_operation_retention_as_leader(self) -> bool | None:
@@ -321,7 +321,8 @@ class StickySessionCleanupScheduler:
                     result.duration_seconds,
                     type(exc).__name__,
                 )
-                return None
+                self._operation_retention_attempt_failed = True
+                return True
 
     async def _cleanup_as_leader(self) -> bool | None:
         async with self._lock:
