@@ -199,13 +199,12 @@ def _data_version(connection: sqlite3.Connection) -> int:
     return int(connection.execute("PRAGMA data_version").fetchone()[0])
 
 
-def _incremental_auto_vacuum_required_free_bytes(connection: sqlite3.Connection) -> int:
+def _incremental_auto_vacuum_output_bytes(connection: sqlite3.Connection) -> int:
     page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
     page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
     pointer_map_interval = max(1, page_size // 5)
     pointer_map_pages = (page_count + pointer_map_interval - 1) // pointer_map_interval + 1
-    output_bytes = (page_count + pointer_map_pages) * page_size
-    return output_bytes + _MIN_FREE_SPACE_RESERVE
+    return (page_count + pointer_map_pages) * page_size
 
 
 def _sqlite_temporary_directory() -> Path:
@@ -215,6 +214,10 @@ def _sqlite_temporary_directory() -> Path:
         if candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK):
             return candidate
     raise RuntimeError("no writable SQLite temporary-file directory is available")
+
+
+def _same_filesystem(first: Path, second: Path) -> bool:
+    return first.stat().st_dev == second.stat().st_dev
 
 
 def _fsync_file(path: Path) -> None:
@@ -360,18 +363,29 @@ def execute_sqlite_compaction(
             with sqlite_connection(temporary) as compacted_connection:
                 compacted_connection.execute("PRAGMA journal_mode=DELETE")
                 if int(compacted_connection.execute("PRAGMA auto_vacuum").fetchone()[0]) != _INCREMENTAL_AUTO_VACUUM:
+                    output_bytes = _incremental_auto_vacuum_output_bytes(compacted_connection)
+                    required_free_bytes = output_bytes + _MIN_FREE_SPACE_RESERVE
+                    sqlite_temporary_directory = _sqlite_temporary_directory()
                     free_bytes = shutil.disk_usage(source.parent).free
-                    required_free_bytes = _incremental_auto_vacuum_required_free_bytes(compacted_connection)
-                    if free_bytes < required_free_bytes:
-                        raise RuntimeError(
-                            f"insufficient free space for compaction: required={required_free_bytes} free={free_bytes}"
-                        )
-                    temporary_free_bytes = shutil.disk_usage(_sqlite_temporary_directory()).free
-                    if temporary_free_bytes < required_free_bytes:
-                        raise RuntimeError(
-                            "insufficient free space for SQLite temporary files: "
-                            f"required={required_free_bytes} free={temporary_free_bytes}"
-                        )
+                    if _same_filesystem(source.parent, sqlite_temporary_directory):
+                        combined_required_free_bytes = 2 * output_bytes + _MIN_FREE_SPACE_RESERVE
+                        if free_bytes < combined_required_free_bytes:
+                            raise RuntimeError(
+                                "insufficient free space for compaction: "
+                                f"required={combined_required_free_bytes} free={free_bytes}"
+                            )
+                    else:
+                        if free_bytes < required_free_bytes:
+                            raise RuntimeError(
+                                "insufficient free space for compaction: "
+                                f"required={required_free_bytes} free={free_bytes}"
+                            )
+                        temporary_free_bytes = shutil.disk_usage(sqlite_temporary_directory).free
+                        if temporary_free_bytes < required_free_bytes:
+                            raise RuntimeError(
+                                "insufficient free space for SQLite temporary files: "
+                                f"required={required_free_bytes} free={temporary_free_bytes}"
+                            )
                     compacted_connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
                     compacted_connection.execute("VACUUM")
                 compacted_identity = _schema_identity(compacted_connection)
@@ -416,6 +430,9 @@ def execute_sqlite_compaction(
             _fsync_directory(source.parent)
             try:
                 moved_sidecars = _backup_sidecars(source, backup)
+                replacement_connection = sqlite3.connect(str(temporary))
+                replacement_connection.execute("PRAGMA busy_timeout=0")
+                replacement_connection.execute("BEGIN EXCLUSIVE")
                 try:
                     _replace_path(temporary, source)
                 finally:
@@ -427,9 +444,6 @@ def execute_sqlite_compaction(
                         backup.unlink(missing_ok=True)
                         backup_created = False
                 raise
-            replacement_connection = sqlite3.connect(str(source))
-            replacement_connection.execute("PRAGMA busy_timeout=0")
-            replacement_connection.execute("BEGIN EXCLUSIVE")
             _fsync_file(source)
             _fsync_directory(source.parent)
             after_bytes = source.stat().st_size
