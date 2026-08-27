@@ -224,6 +224,33 @@ def test_compaction_rejects_insufficient_space_without_artifacts(tmp_path: Path,
     assert {path.name for path in tmp_path.iterdir()} == {"store.db"}
 
 
+def test_compaction_free_space_budget_includes_pending_wal(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    wal = Path(f"{source}-wal")
+    wal.write_bytes(b"pending-wal-data" * 1024)
+    source_bytes = source.stat().st_size
+    required_free_bytes = 2 * (source_bytes + wal.stat().st_size) + compact._MIN_FREE_SPACE_RESERVE
+    disk_usage_type = type(compact.shutil.disk_usage(tmp_path))
+    monkeypatch.setattr(
+        compact.shutil,
+        "disk_usage",
+        lambda _path: disk_usage_type(required_free_bytes, required_free_bytes, required_free_bytes - 1),
+    )
+    monkeypatch.setattr(
+        compact,
+        "_checkpoint_wal",
+        lambda _connection: (_ for _ in ()).throw(AssertionError("checkpoint should not start")),
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient free space"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.exists()
+    assert wal.exists()
+    assert not Path(f"{source}.compact.lock").exists()
+
+
 def test_compaction_rejects_busy_checkpoint_and_existing_lock(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)

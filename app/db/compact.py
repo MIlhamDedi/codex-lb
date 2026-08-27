@@ -275,10 +275,11 @@ def execute_sqlite_compaction(
     if os.name == "nt":
         raise RuntimeError("safe SQLite compaction execution is unsupported on Windows")
     source = _resolve_source(database_url)
-    source_bytes = source.stat().st_size
+    pending_wal_bytes = _path_signature(Path(f"{source}-wal")).size
+    source_bytes = source.stat().st_size + pending_wal_bytes
     free_bytes = shutil.disk_usage(source.parent).free
-    # One source-sized budget covers VACUUM INTO output and the second covers
-    # SQLite's rewrite while enabling incremental auto-vacuum on that output.
+    # A checkpoint can fold committed WAL pages into the main database before
+    # VACUUM INTO starts, so reserve against the logical source size first.
     required_free_bytes = 2 * source_bytes + _MIN_FREE_SPACE_RESERVE
     if free_bytes < required_free_bytes:
         raise RuntimeError(f"insufficient free space for compaction: required={required_free_bytes} free={free_bytes}")
@@ -311,6 +312,13 @@ def execute_sqlite_compaction(
         with sqlite_connection(source) as source_connection:
             source_connection.execute("PRAGMA busy_timeout=0")
             _checkpoint_wal(source_connection)
+            source_bytes = source.stat().st_size
+            free_bytes = shutil.disk_usage(source.parent).free
+            required_free_bytes = 2 * source_bytes + _MIN_FREE_SPACE_RESERVE
+            if free_bytes < required_free_bytes:
+                raise RuntimeError(
+                    f"insufficient free space for compaction: required={required_free_bytes} free={free_bytes}"
+                )
             source_identity = _schema_identity(source_connection)
             data_version = _data_version(source_connection)
             previous_umask = os.umask(0o077)

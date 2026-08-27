@@ -23,7 +23,7 @@ change during inspection.
 
 Executing compaction MUST require explicit acknowledgement that all application
 replicas are stopped. The tool MUST reject concurrent compaction, a busy WAL
-checkpoint, free disk below two source-file sizes plus its fixed reserve,
+checkpoint, free disk below two checkpointed logical source-file sizes plus its fixed reserve,
 failed source or output integrity, schema identity mismatch, or an observed
 external write before replacing the source.
 It MUST create and verify the compacted database in the source directory,

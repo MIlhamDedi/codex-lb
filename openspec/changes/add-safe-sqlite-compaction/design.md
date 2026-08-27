@@ -31,8 +31,10 @@ owner-only directory beneath the source directory. Configure the output for
 incremental autovacuum, running a second output-only `VACUUM` only
 when the copied database did not inherit that mode. Require `quick_check=ok`
 and matching SQLite application/user versions plus Alembic revision rows. The
-free-space gate reserves two source-file sizes for the output and its second
-VACUUM scratch space, and creation runs under `umask 077`.
+free-space gate first accounts for pending WAL bytes, then rechecks the
+checkpointed logical source size before `VACUUM INTO`; it reserves two source
+sizes for the output and its second VACUUM scratch space. Creation runs under
+`umask 077`.
 
 ### D4. Preserve rollback source
 
