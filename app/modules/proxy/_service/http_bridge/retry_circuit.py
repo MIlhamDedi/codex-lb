@@ -606,8 +606,8 @@ class _HTTPBridgeRetryCircuitMixin:
             return 0.0
         return max(
             0.0,
-            generation[3] - time.time(),
-            generation[6] - time.monotonic(),
+            generation[3] - self._http_bridge_retry_circuit_clock.time(),
+            generation[6] - self._http_bridge_retry_circuit_clock.monotonic(),
         )
 
     async def _record_http_bridge_retry_circuit_failure(
