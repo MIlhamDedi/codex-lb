@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,6 +38,7 @@ from app.modules.proxy.load_balancer import (
     _select_long_window_entry,
     _state_above_sticky_budget_threshold,
     _state_from_account,
+    _usage_entry_is_recent_enough,
     background_recovery_state_from_account,
 )
 from tests.simulation.virtual_time import VirtualClock
@@ -1679,9 +1680,8 @@ def test_select_account_caps_cooldown_retry_hint():
     assert states[0].cooldown_until == now + 86_400
 
 
-def test_apply_usage_quota_sets_fallback_reset_for_primary_window(monkeypatch):
+def test_apply_usage_quota_sets_fallback_reset_from_evaluation_time():
     now = 1_700_000_000.0
-    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
     status, used_percent, reset_at = apply_usage_quota(
         status=AccountStatus.ACTIVE,
         primary_used=100.0,
@@ -1690,11 +1690,21 @@ def test_apply_usage_quota_sets_fallback_reset_for_primary_window(monkeypatch):
         runtime_reset=None,
         secondary_used=None,
         secondary_reset=None,
+        now=now,
     )
     assert status == AccountStatus.RATE_LIMITED
     assert used_percent == 100.0
     assert reset_at is not None
     assert reset_at == pytest.approx(now + 60.0)
+
+
+def test_usage_recency_uses_injected_evaluation_time() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    recent = datetime.fromtimestamp(clock.time() - 179.0, tz=timezone.utc)
+    stale = datetime.fromtimestamp(clock.time() - 181.0, tz=timezone.utc)
+
+    assert _usage_entry_is_recent_enough(recent, now=clock.time())
+    assert not _usage_entry_is_recent_enough(stale, now=clock.time())
 
 
 def test_apply_usage_quota_secondary_exhausted_without_credits_sets_quota_exceeded():

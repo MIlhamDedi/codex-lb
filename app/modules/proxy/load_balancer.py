@@ -2313,7 +2313,7 @@ def _state_from_account(
     status_seed = account.status
     long_window_quota_available = (
         effective_secondary_entry is not None
-        and _usage_entry_is_recent_enough(effective_secondary_entry.recorded_at)
+        and _usage_entry_is_recent_enough(effective_secondary_entry.recorded_at, now=now)
         and effective_secondary_entry.used_percent is not None
         and float(effective_secondary_entry.used_percent) < 100.0
     )
@@ -2426,7 +2426,7 @@ def _state_from_account(
         and effective_runtime_reset > now
         and effective_blocked_at is None
         and effective_secondary_entry is not None
-        and _usage_entry_is_recent_enough(effective_secondary_entry.recorded_at)
+        and _usage_entry_is_recent_enough(effective_secondary_entry.recorded_at, now=now)
         and effective_secondary_entry.used_percent is not None
         and float(effective_secondary_entry.used_percent) < 100.0
         and effective_secondary_entry.reset_at is not None
@@ -2492,7 +2492,7 @@ def _state_from_account(
             and (primary_used is not None or secondary_used is not None)
         )
         rejected_reset_recovery_evidence = all_quota_windows_available and _usage_entry_is_recent_available(
-            rejected_reset_freshness_entry
+            rejected_reset_freshness_entry, now=now
         )
         if effective_blocked_at is not None:
             # A sample predating the 429 cannot disprove the persisted block.
@@ -2775,7 +2775,7 @@ def background_recovery_state_from_account(
                     cooldown_until=max(reset_at, minimum_floor_deadline),
                 )
         elif blocked_at is None and reset_at is not None and reset_at <= now:
-            if not _usage_entry_is_recent_available(freshness_entry):
+            if not _usage_entry_is_recent_available(freshness_entry, now=now):
                 return replace(
                     state,
                     status=AccountStatus.RATE_LIMITED,
@@ -2837,10 +2837,10 @@ def _rate_limited_freshness_entry(
     return primary_entry
 
 
-def _usage_entry_is_recent_available(entry: _UsageWindowEntry | None) -> bool:
+def _usage_entry_is_recent_available(entry: _UsageWindowEntry | None, *, now: float) -> bool:
     return (
         entry is not None
-        and _usage_entry_is_recent_enough(entry.recorded_at)
+        and _usage_entry_is_recent_enough(entry.recorded_at, now=now)
         and entry.used_percent is not None
         and float(entry.used_percent) < 100.0
     )
@@ -2875,12 +2875,10 @@ def _extract_credit_status(
     return None, None, None
 
 
-def _usage_entry_is_recent_enough(recorded_at: datetime | None) -> bool:
+def _usage_entry_is_recent_enough(recorded_at: datetime | None, *, now: float) -> bool:
     if recorded_at is None:
         return False
-    current_time = utcnow()
-    if current_time.tzinfo is None:
-        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_time = datetime.fromtimestamp(now, tz=timezone.utc)
     interval_seconds = max(_usage_refresh_interval_seconds() * 2, 180)
     recorded_time = recorded_at if recorded_at.tzinfo is not None else recorded_at.replace(tzinfo=timezone.utc)
     return recorded_time >= current_time - timedelta(seconds=interval_seconds)

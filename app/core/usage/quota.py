@@ -68,7 +68,7 @@ def apply_usage_quota(
                 if primary_reset is not None:
                     reset_at = primary_reset
                 else:
-                    reset_at = _fallback_primary_reset(primary_window_minutes) or reset_at
+                    reset_at = _fallback_primary_reset(primary_window_minutes, now=now) or reset_at
                 status = AccountStatus.RATE_LIMITED
                 return status, used_percent, reset_at
         if status == AccountStatus.RATE_LIMITED:
@@ -93,11 +93,11 @@ def apply_usage_quota(
     return status, used_percent, reset_at
 
 
-def _fallback_primary_reset(primary_window_minutes: int | None) -> float | None:
+def _fallback_primary_reset(primary_window_minutes: int | None, *, now: float) -> float | None:
     window_minutes = primary_window_minutes or usage_core.default_window_minutes("primary")
     if not window_minutes:
         return None
-    return time.time() + float(window_minutes) * 60.0
+    return now + float(window_minutes) * 60.0
 
 
 def _has_credit_override(

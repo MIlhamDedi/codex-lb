@@ -13532,6 +13532,46 @@ async def test_await_cancelled_task_defers_stubborn_child_cleanup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_await_cancelled_task_timeout_uses_injected_scheduler() -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    child_cancelled = asyncio.Event()
+    release_child = asyncio.Event()
+
+    async def stubborn_child() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            await release_child.wait()
+
+    child = scheduler.create_task(stubborn_child())
+    cleanup_tasks: set[asyncio.Task[None]] = set()
+    waiter = scheduler.create_task(
+        proxy_service._await_cancelled_task(
+            child,
+            timeout_seconds=0.25,
+            label="virtual stubborn cleanup",
+            cleanup_tasks=cleanup_tasks,
+            scheduler=scheduler,
+        )
+    )
+    await scheduler.drain()
+
+    assert child_cancelled.is_set()
+    assert not waiter.done()
+
+    await scheduler.advance(0.25)
+
+    assert await waiter is False
+    assert cleanup_tasks
+    release_child.set()
+    await child
+    await scheduler.drain()
+    assert cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
 async def test_close_http_bridge_session_bounded_cancellation_keeps_close_task_tracked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
