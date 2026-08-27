@@ -754,6 +754,74 @@ async def test_direct_credential_handshake_rejection_stays_account_evidence(
 
 
 @pytest.mark.asyncio
+async def test_direct_edge_challenge_handshake_is_classified_as_transport_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 403 carrying explicit Cloudflare edge-challenge evidence is the edge
+    # refusing the websocket upgrade itself, not account evidence: it must
+    # share the transport-failure provenance so the failover decision
+    # surfaces it without an account penalty, arms the 426 handshake-denial
+    # marker, and the HTTP paths pin the upstream transport to HTTP.
+    exc = await _direct_connect_failure(
+        monkeypatch,
+        InvalidStatus(
+            Response(
+                403,
+                "Forbidden",
+                Headers({"Content-Type": "text/html; charset=UTF-8", "cf-mitigated": "challenge"}),
+                b"<html><title>Just a moment...</title></html>",
+            )
+        ),
+    )
+
+    assert exc.status_code == 403
+    assert exc.failure_detail == UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL
+    assert _classify(exc) is not None
+
+
+@pytest.mark.asyncio
+async def test_direct_unmarked_403_html_handshake_stays_account_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An ordinary reverse-proxy HTML 403 carries no challenge evidence, so it
+    # keeps the fail-closed classify-penalize-failover path: treating every
+    # 403 as a transport outage would let one misconfigured deny rule push
+    # the whole instance onto HTTP.
+    exc = await _direct_connect_failure(
+        monkeypatch,
+        InvalidStatus(
+            Response(
+                403,
+                "Forbidden",
+                Headers({"Content-Type": "text/html", "Server": "nginx"}),
+                b"<html><h1>403 Forbidden</h1></html>",
+            )
+        ),
+    )
+
+    assert exc.failure_detail is None
+    assert _classify(exc) is None
+
+
+@pytest.mark.asyncio
+async def test_edge_challenge_connect_failure_surfaces_without_penalty() -> None:
+    # Product path for the challenge recovery: the classified 403 rides the
+    # same decision as a direct 5xx handshake rejection — surface to the
+    # client without an account penalty and arm the marker so the next
+    # handshake is denied with 426 and Codex switches to HTTP transport.
+    harness = _DecisionHarness()
+
+    action = await _decide(
+        harness,
+        _transport_error(403, "upstream_error", "<html><title>Just a moment...</title></html>"),
+    )
+
+    assert action == "surface"
+    assert harness.penalty_calls == []
+    assert transport_health.upstream_websocket_transport_recently_failed() is True
+
+
+@pytest.mark.asyncio
 async def test_direct_connect_timeout_is_classified_as_transport_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

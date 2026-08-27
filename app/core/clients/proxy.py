@@ -237,6 +237,13 @@ _WEBSOCKET_HANDSHAKE_ERROR_HINTS = (
     ("rate_limit_exceeded", "rate limit"),
 )
 
+_EDGE_CHALLENGE_BODY_MARKERS = (
+    "cf-chl-",
+    "challenge-platform",
+    "enable javascript and cookies",
+    "just a moment",
+)
+
 logger = logging.getLogger(__name__)
 _STREAM_CONNECT_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "stream_connect_timeout_override",
@@ -2157,11 +2164,59 @@ def _should_fallback_to_http_after_websocket_handshake_error(
     transport_mode: str,
     exc: aiohttp.WSServerHandshakeError,
 ) -> bool:
-    return _should_fallback_to_http_after_websocket_status(transport_mode, exc.status)
+    if transport_mode != "auto":
+        return False
+    if exc.status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES:
+        return True
+    # Body evidence is transport-dependent: the raw-handshake opener in
+    # ``_open_upstream_websocket`` raises with ``message`` set to the response
+    # body, so the HTML challenge markers can match there, while aiohttp's own
+    # ``ws_connect`` raises with a fixed handshake diagnostic (for example
+    # "Invalid response status"), leaving ``cf-mitigated: challenge`` as the
+    # only effective evidence on that path. Both stay fail-closed on a miss.
+    return _is_upstream_edge_challenge(
+        exc.status,
+        headers=getattr(exc, "headers", None),
+        body=exc.message or str(exc),
+    )
 
 
 def _should_fallback_to_http_after_websocket_status(transport_mode: str, status: int | None) -> bool:
     return transport_mode == "auto" and status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES
+
+
+def _is_upstream_edge_challenge(
+    status: int | None,
+    *,
+    headers: Mapping[str, str] | None = None,
+    body: str | bytes | bytearray | None = None,
+) -> bool:
+    """Return whether a 403 is an explicit browser/edge challenge response.
+
+    A bare 403 is intentionally not enough: application permission errors,
+    the local IP firewall, and ordinary reverse-proxy denials must retain their
+    existing fail-closed behavior. Cloudflare's ``cf-mitigated: challenge``
+    marker is authoritative; the body heuristic is accepted only when the
+    response also identifies Cloudflare and HTML content.
+    """
+
+    if status != 403:
+        return False
+    normalized_headers = {
+        str(key).lower(): str(value).lower() for key, value in (headers.items() if headers is not None else ())
+    }
+    if normalized_headers.get("cf-mitigated") == "challenge":
+        return True
+    if "cloudflare" not in normalized_headers.get("server", ""):
+        return False
+    if "html" not in normalized_headers.get("content-type", ""):
+        return False
+    if isinstance(body, (bytes, bytearray)):
+        body_text = bytes(body[: 16 * 1024]).decode("utf-8", errors="replace")
+    else:
+        body_text = (body or "")[: 16 * 1024]
+    lowered_body = body_text.lower()
+    return any(marker in lowered_body for marker in _EDGE_CHALLENGE_BODY_MARKERS)
 
 
 async def _open_upstream_websocket(
