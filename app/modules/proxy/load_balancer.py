@@ -2290,8 +2290,7 @@ def _state_from_account(
     # while waiting for the next usage refresh. Expired samples map to 0.0
     # rather than None because usage-derived status recovery only evaluates
     # non-None percentages.
-    now_epoch = int(now)
-    if primary_used is not None and primary_reset is not None and primary_reset <= now_epoch:
+    if primary_used is not None and primary_reset is not None and primary_reset <= int(now):
         primary_used = 0.0
         primary_reset = None
     # A strictly newer long-window row proves a later fetch no longer
@@ -2307,7 +2306,7 @@ def _state_from_account(
         > _SIBLING_FETCH_MARGIN_SECONDS
     ):
         primary_window_minutes = None
-    if secondary_used is not None and secondary_reset is not None and secondary_reset <= now_epoch:
+    if secondary_used is not None and secondary_reset is not None and secondary_reset <= int(now):
         secondary_used = 0.0
         secondary_reset = None
     ignore_zero_capacity_primary_runtime_reset = False
@@ -2524,6 +2523,7 @@ def _state_from_account(
         credits_unlimited=credits_unlimited,
         credits_balance=credits_balance,
         infer_status_from_usage=False,
+        now=now,
     )
     if resetless_rate_limit_without_evidence and primary_used is None and status == AccountStatus.ACTIVE:
         status = AccountStatus.RATE_LIMITED

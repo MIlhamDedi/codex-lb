@@ -40,6 +40,7 @@ from app.modules.proxy.load_balancer import (
     _state_from_account,
     background_recovery_state_from_account,
 )
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.unit
 
@@ -1792,6 +1793,64 @@ def test_apply_usage_quota_respects_runtime_reset_for_quota_exceeded(monkeypatch
     assert status == AccountStatus.QUOTA_EXCEEDED
     assert used_percent == 50.0
     assert reset_at == future
+
+
+@pytest.mark.parametrize(
+    ("status", "primary_used", "secondary_used"),
+    [
+        (AccountStatus.QUOTA_EXCEEDED, None, 50.0),
+        (AccountStatus.RATE_LIMITED, 50.0, None),
+        (AccountStatus.RATE_LIMITED, None, 50.0),
+    ],
+)
+def test_apply_usage_quota_uses_explicit_evaluation_time_for_runtime_recovery(
+    status: AccountStatus,
+    primary_used: float | None,
+    secondary_used: float | None,
+) -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+
+    recovered, _, reset_at = apply_usage_quota(
+        status=status,
+        primary_used=primary_used,
+        primary_reset=None,
+        primary_window_minutes=None,
+        runtime_reset=clock.time() - 1.0,
+        secondary_used=secondary_used,
+        secondary_reset=None,
+        now=clock.time(),
+    )
+    blocked, _, blocked_reset_at = apply_usage_quota(
+        status=status,
+        primary_used=primary_used,
+        primary_reset=None,
+        primary_window_minutes=None,
+        runtime_reset=clock.time() + 1.0,
+        secondary_used=secondary_used,
+        secondary_reset=None,
+        now=clock.time(),
+    )
+
+    assert recovered == AccountStatus.ACTIVE
+    assert reset_at is None
+    assert blocked == status
+    assert blocked_reset_at == clock.time() + 1.0
+
+
+def test_state_from_account_passes_injected_time_to_runtime_recovery() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=int(clock.time() - 1.0))
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=_make_test_usage(window="primary", used_percent=50.0),
+        secondary_entry=None,
+        runtime=RuntimeState(reset_at=clock.time() - 1.0),
+        now=clock.time(),
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
 
 
 def test_apply_usage_quota_respects_runtime_reset_for_rate_limited(monkeypatch):

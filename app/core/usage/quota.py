@@ -19,7 +19,9 @@ def apply_usage_quota(
     credits_unlimited: bool | None = None,
     credits_balance: float | None = None,
     infer_status_from_usage: bool = True,
+    now: float | None = None,
 ) -> tuple[AccountStatus, float | None, float | None]:
+    now = time.time() if now is None else now
     used_percent = primary_used
     reset_at = runtime_reset
 
@@ -45,7 +47,7 @@ def apply_usage_quota(
                     status = AccountStatus.QUOTA_EXCEEDED
                     return status, used_percent, reset_at
         if status == AccountStatus.QUOTA_EXCEEDED:
-            if runtime_reset and runtime_reset > time.time():
+            if runtime_reset and runtime_reset > now:
                 reset_at = runtime_reset
             else:
                 status = AccountStatus.ACTIVE
@@ -70,7 +72,7 @@ def apply_usage_quota(
                 status = AccountStatus.RATE_LIMITED
                 return status, used_percent, reset_at
         if status == AccountStatus.RATE_LIMITED:
-            if runtime_reset and runtime_reset > time.time():
+            if runtime_reset and runtime_reset > now:
                 reset_at = runtime_reset
             else:
                 status = AccountStatus.ACTIVE
@@ -82,7 +84,7 @@ def apply_usage_quota(
         # account rate-limited indefinitely. Callers that cannot tie the
         # sample to a reset deadline or post-block evidence must preserve
         # the block themselves.
-        if runtime_reset and runtime_reset > time.time():
+        if runtime_reset and runtime_reset > now:
             reset_at = runtime_reset
         else:
             status = AccountStatus.ACTIVE
