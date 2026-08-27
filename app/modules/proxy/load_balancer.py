@@ -1017,6 +1017,7 @@ class LoadBalancer:
             return None
         result = select_account(
             states,
+            now=self._clock.time(),
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
@@ -1040,7 +1041,7 @@ class LoadBalancer:
         # This is not a health observation, so it must not advance ``version``
         # and invalidate an operator Force Probe that is loading usage.
         previous_last_selected_at = runtime.last_selected_at
-        reserved_at = time.time()
+        reserved_at = self._clock.time()
         runtime.last_selected_at = reserved_at
         return ProbeReservation(
             account_id=result.account.account_id,
@@ -1079,7 +1080,7 @@ class LoadBalancer:
         # Only a selection that survived sticky persistence and final local
         # admission consumes the quiet interval. Unlike reserve/release, this
         # committed observation must invalidate older Force Probe settlement.
-        runtime.last_selected_at = time.time()
+        runtime.last_selected_at = self._clock.time()
         runtime.version += 1
         runtime.health_version += 1
         return True
@@ -1959,7 +1960,7 @@ class LoadBalancer:
         runtime = self._runtime.setdefault(account.id, RuntimeState())
         if expected_version is not None and runtime.version != expected_version:
             if selected:
-                runtime.last_selected_at = time.time()
+                runtime.last_selected_at = self._clock.time()
                 runtime.version += 1
             return False
 
@@ -1985,7 +1986,7 @@ class LoadBalancer:
             dirty = True
         health_dirty = dirty
         if selected:
-            runtime.last_selected_at = time.time()
+            runtime.last_selected_at = self._clock.time()
             dirty = True
         if dirty:
             runtime.version += 1

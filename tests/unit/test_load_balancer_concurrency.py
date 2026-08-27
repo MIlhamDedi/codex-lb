@@ -40,8 +40,72 @@ from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickyOwnerLookup
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.unit
+
+
+def test_selected_probe_timestamps_use_injected_clock() -> None:
+    clock = VirtualClock(epoch_value=1_700_000_123.0)
+    balancer = LoadBalancer(cast(Any, None), clock=clock)
+    account = _make_account("acc-virtual-clock")
+    balancer._runtime[account.id] = RuntimeState(last_selected_at=10.0)
+    reservation = load_balancer_module.ProbeReservation(
+        account_id=account.id,
+        previous_last_selected_at=None,
+        reserved_at=10.0,
+        expected_runtime_version=0,
+    )
+
+    assert balancer._commit_due_probe_reservation_locked(reservation)
+    assert balancer._runtime[account.id].last_selected_at == clock.time()
+
+    state = balancer._state_for(account)
+    clock.advance(1.0)
+    assert balancer._sync_runtime_state(
+        account,
+        state,
+        selected=True,
+        expected_version=balancer._runtime[account.id].version,
+    )
+    assert balancer._runtime[account.id].last_selected_at == clock.time()
+
+
+def test_probe_selection_uses_injected_clock() -> None:
+    clock = VirtualClock(epoch_value=1_700_000_123.0)
+    balancer = LoadBalancer(cast(Any, None), clock=clock)
+    healthy = _make_account("acc-virtual-clock-healthy")
+    probing = _make_account("acc-virtual-clock-probing")
+    recent_selection = clock.time() - 1.0
+    balancer._runtime[probing.id] = RuntimeState(
+        health_tier=HEALTH_TIER_PROBING,
+        last_selected_at=recent_selection,
+    )
+
+    reservation = balancer._reserve_due_probe_locked(
+        [
+            AccountState(
+                account_id=healthy.id,
+                status=AccountStatus.ACTIVE,
+                health_tier=HEALTH_TIER_HEALTHY,
+            ),
+            AccountState(
+                account_id=probing.id,
+                status=AccountStatus.ACTIVE,
+                last_selected_at=recent_selection,
+                health_tier=HEALTH_TIER_PROBING,
+            ),
+        ],
+        prefer_earlier_reset=False,
+        prefer_earlier_reset_window="secondary",
+        routing_strategy="usage_weighted",
+        relative_availability_power=2.0,
+        relative_availability_top_k=5,
+        traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        routing_costs_by_account_id=None,
+    )
+
+    assert reservation is None
 
 
 @pytest.fixture(autouse=True)
