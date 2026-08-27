@@ -72,7 +72,7 @@ from app.core.clients.usage import (
     ConsumeRateLimitResetCreditResponse as UpstreamConsumeRateLimitResetCreditResponse,
 )
 from app.core.clients.usage import UsageFetchError, consume_rate_limit_reset_credit
-from app.core.clock import REAL_SCHEDULER, Scheduler
+from app.core.clock import REAL_CLOCK, REAL_SCHEDULER, Clock, Scheduler
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
@@ -621,13 +621,14 @@ _V1_MAX_OUTPUT_TOKEN_OVERRIDES: Final[dict[str, int]] = {
 class _CapacityStartupReadyEvent(asyncio.Event):
     """Track when admission became ready so its startup probe cannot reset."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock = REAL_CLOCK) -> None:
         super().__init__()
+        self._clock = clock
         self.set_at: float | None = None
 
     def set(self) -> None:
         if not self.is_set():
-            self.set_at = time.monotonic()
+            self.set_at = self._clock.monotonic()
         super().set()
 
     def clear(self) -> None:
@@ -6931,6 +6932,7 @@ async def _wait_for_first_stream_probe(
     capacity_wait_event: asyncio.Event | None,
     capacity_ready_event: asyncio.Event | None = None,
     scheduler: Scheduler = REAL_SCHEDULER,
+    clock: Clock = REAL_CLOCK,
 ) -> bool:
     try:
         timeout_task = scheduler.create_task(scheduler.sleep(timeout_seconds))
@@ -6969,15 +6971,15 @@ async def _wait_for_first_stream_probe(
                         scheduler.create_task(capacity_ready_event.wait()) if capacity_ready_event is not None else None
                     )
                     try:
-                        recovery_waiters = {first_task}
+                        recovery_waiters = {first_task, signal_timeout_task}
                         if recovery_ready_task is not None:
                             recovery_waiters.add(recovery_ready_task)
                         recovery_done, _pending = await asyncio.wait(
                             recovery_waiters,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        if first_task not in recovery_done:
-                            continue
+                        if first_task not in recovery_done and signal_timeout_task in recovery_done:
+                            return False
                     finally:
                         if recovery_ready_task is not None and not recovery_ready_task.done():
                             recovery_ready_task.cancel()
@@ -6994,7 +6996,7 @@ async def _wait_for_first_stream_probe(
                     if isinstance(capacity_ready_event, _CapacityStartupReadyEvent):
                         ready_set_at = capacity_ready_event.set_at
                         if ready_set_at is not None:
-                            post_ready_timeout = max(0.0, timeout_seconds - (time.monotonic() - ready_set_at))
+                            post_ready_timeout = max(0.0, timeout_seconds - (clock.monotonic() - ready_set_at))
                     if post_ready_timeout <= 0:
                         return False
                     post_ready_timeout_task = scheduler.create_task(scheduler.sleep(post_ready_timeout))

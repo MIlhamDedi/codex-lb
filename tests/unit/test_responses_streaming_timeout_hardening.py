@@ -144,8 +144,9 @@ async def test_capacity_ready_probe_timeout_uses_virtual_scheduler() -> None:
     clock = VirtualClock()
     scheduler = VirtualScheduler(clock)
     first_task = scheduler.create_task(scheduler.sleep(1.0, result="response.created"))
-    capacity_ready_event = proxy_api._CapacityStartupReadyEvent()
+    capacity_ready_event = proxy_api._CapacityStartupReadyEvent(clock=clock)
     capacity_ready_event.set()
+    assert capacity_ready_event.set_at == clock.monotonic()
     probe_task = scheduler.create_task(
         proxy_api._wait_for_first_stream_probe(
             first_task,
@@ -153,12 +154,11 @@ async def test_capacity_ready_probe_timeout_uses_virtual_scheduler() -> None:
             capacity_wait_event=asyncio.Event(),
             capacity_ready_event=capacity_ready_event,
             scheduler=scheduler,
+            clock=clock,
         )
     )
 
     await scheduler.drain()
-    assert probe_task.done() is False
-    await scheduler.advance(0.05)
     assert probe_task.done() is False
     await scheduler.advance(0.05)
 
@@ -167,11 +167,10 @@ async def test_capacity_ready_probe_timeout_uses_virtual_scheduler() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capacity_signal_discovery_timeout_uses_virtual_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_capacity_signal_discovery_timeout_uses_virtual_scheduler() -> None:
     clock = VirtualClock()
     scheduler = VirtualScheduler(clock)
     first_task = scheduler.create_task(scheduler.sleep(1.0, result="response.created"))
-    monkeypatch.setattr(proxy_api, "_CAPACITY_WAIT_MARKER_GRACE_SECONDS", 0.05)
     probe_task = scheduler.create_task(
         proxy_api._wait_for_first_stream_probe(
             first_task,
@@ -188,3 +187,83 @@ async def test_capacity_signal_discovery_timeout_uses_virtual_scheduler(monkeypa
 
     assert await probe_task is False
     await scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+async def test_capacity_recovery_wait_ends_at_signal_timeout() -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    first_task = scheduler.create_task(scheduler.sleep(1.0, result="response.created"))
+    capacity_wait_event = asyncio.Event()
+    capacity_wait_event.set()
+    probe_task = scheduler.create_task(
+        proxy_api._wait_for_first_stream_probe(
+            first_task,
+            timeout_seconds=0.01,
+            capacity_wait_event=capacity_wait_event,
+            scheduler=scheduler,
+            clock=clock,
+        )
+    )
+
+    await scheduler.drain()
+    await scheduler.advance(0.01)
+    assert probe_task.done() is False
+    await scheduler.advance(proxy_api._CAPACITY_WAIT_MARKER_GRACE_SECONDS)
+
+    assert await probe_task is False
+    await scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+async def test_capacity_recovery_ready_preserves_first_item_probe() -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    first_task = scheduler.create_task(scheduler.sleep(0.03, result="response.created"))
+    capacity_wait_event = asyncio.Event()
+    capacity_wait_event.set()
+    capacity_ready_event = proxy_api._CapacityStartupReadyEvent(clock=clock)
+
+    async def mark_capacity_ready() -> None:
+        await scheduler.sleep(0.02)
+        capacity_wait_event.clear()
+        capacity_ready_event.set()
+
+    scheduler.create_task(mark_capacity_ready())
+    probe_task = scheduler.create_task(
+        proxy_api._wait_for_first_stream_probe(
+            first_task,
+            timeout_seconds=0.01,
+            capacity_wait_event=capacity_wait_event,
+            capacity_ready_event=capacity_ready_event,
+            scheduler=scheduler,
+            clock=clock,
+        )
+    )
+
+    await scheduler.drain()
+    await scheduler.advance(0.01)
+    assert probe_task.done() is False
+    await scheduler.advance(0.01)
+    assert capacity_ready_event.set_at == clock.monotonic()
+    await scheduler.advance(0.01)
+
+    assert await probe_task is True
+    await scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+async def test_capacity_probe_immediate_completion_keeps_real_scheduler_default() -> None:
+    async def first_item() -> str:
+        return "response.created"
+
+    first_task = asyncio.create_task(first_item())
+
+    assert (
+        await proxy_api._wait_for_first_stream_probe(
+            first_task,
+            timeout_seconds=0.05,
+            capacity_wait_event=asyncio.Event(),
+        )
+        is True
+    )
