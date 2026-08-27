@@ -1166,6 +1166,81 @@ class _SilentEventlessUpstream:
         self.closed = True
 
 
+@pytest.mark.asyncio
+async def test_http_bridge_reader_receive_deadline_uses_injected_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked receive must time out on virtual, not wall-clock, time.
+
+    The reader keeps its receive task alive while it races the wakeup event.
+    The deadline wrapper must therefore use the service scheduler without
+    taking ownership of either child task; normal reader cleanup still owns
+    their cancellation.
+    """
+
+    class _BlockedUpstream:
+        def __init__(self) -> None:
+            self.receive_started = asyncio.Event()
+            self.receive_cancelled = asyncio.Event()
+            self.active_receives = 0
+
+        async def receive(self) -> UpstreamWebSocketMessage:
+            self.active_receives += 1
+            self.receive_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.receive_cancelled.set()
+                raise
+            finally:
+                self.active_receives -= 1
+            raise AssertionError("blocked upstream receive returned")
+
+        async def close(self) -> None:
+            return None
+
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    service = proxy_service.ProxyService(cast(Any, nullcontext()), clock=clock, scheduler=scheduler)
+    upstream = _BlockedUpstream()
+    session = _make_bridge_session(key_value="virtual-reader-deadline")
+    session.upstream = cast(UpstreamWebSocket, upstream)
+    receive_timeout = SimpleNamespace(
+        timeout_seconds=5.0,
+        error_code="stream_idle_timeout",
+        error_message="Upstream stream idle timeout",
+    )
+    fail_reader = AsyncMock()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service, "_next_websocket_receive_timeout", AsyncMock(return_value=receive_timeout))
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", AsyncMock(return_value=False))
+    monkeypatch.setattr(service, "_fail_http_bridge_reader_and_maybe_retire", fail_reader)
+
+    reader_task = scheduler.create_task(service._relay_http_bridge_upstream_messages(session))
+    await scheduler.drain()
+    assert upstream.receive_started.is_set()
+    assert reader_task.done() is False
+
+    await scheduler.advance(4.999)
+    assert reader_task.done() is False
+    assert upstream.active_receives == 1
+
+    await scheduler.advance(0.001)
+    await reader_task
+
+    assert clock.monotonic() == pytest.approx(5.0)
+    assert upstream.receive_cancelled.is_set()
+    assert upstream.active_receives == 0
+    fail_reader.assert_awaited_once()
+    assert fail_reader.await_args.args == (session,)
+    assert fail_reader.await_args.kwargs["error_code"] == "stream_idle_timeout"
+    assert fail_reader.await_args.kwargs["error_message"] == "Upstream stream idle timeout"
+    assert fail_reader.await_args.kwargs["retry_circuit_attempt_selection"].kind == "absent"
+    assert session.closed is True
+    await scheduler.drain()
+    assert scheduler._tasks == set()
+
+
 def test_http_bridge_eventless_precreated_deadline_uses_current_send_and_client_safe_cap() -> None:
     request_state = _make_eventless_http_bridge_owner()
 

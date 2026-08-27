@@ -1340,11 +1340,16 @@ class _HTTPBridgeUpstreamEventsMixin:
                     timed_out = True
                 else:
                     wakeup_task = scheduler_for(self).create_task(session.upstream_reader_wakeup.wait())
-                    done, _pending = await asyncio.wait(
-                        (receive_task, wakeup_task),
-                        timeout=receive_timeout.timeout_seconds if receive_timeout is not None else None,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    try:
+                        done, _pending = await scheduler_for(self).wait_for(
+                            asyncio.wait(
+                                (receive_task, wakeup_task),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            ),
+                            timeout=receive_timeout.timeout_seconds if receive_timeout is not None else None,
+                        )
+                    except asyncio.TimeoutError:
+                        done = set()
                     if receive_task in done:
                         message = receive_task.result()
                         receive_task = None
