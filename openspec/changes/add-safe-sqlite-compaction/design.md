@@ -33,8 +33,9 @@ when the copied database did not inherit that mode. Require `quick_check=ok`
 and matching SQLite application/user versions plus Alembic revision rows. The
 free-space gate first accounts for pending WAL bytes, then rechecks the
 checkpointed logical source size before `VACUUM INTO`; it reserves two source
-sizes for the output and its second VACUUM scratch space. Creation runs under
-`umask 077`.
+sizes for the output and its second VACUUM scratch space. Before enabling
+incremental autovacuum, it rechecks space against the pointer-map-expanded
+output size. Creation runs under `umask 077`.
 
 ### D4. Preserve rollback source
 
@@ -46,8 +47,10 @@ checks fail, or is interrupted, restore the original. Preserve any
 stopped-instance sidecar files under backup names rather than deleting them;
 choose the backup name only when its base and sidecar paths are all unused.
 Record the source inode before compaction and reject a path replacement before
-installing the output. Reject execution on platforms where directory-entry
-durability cannot be enforced.
+installing the output. After replacement, hold a second exclusive SQLite lock
+on the new inode through file and directory durability so a restarted writer
+cannot modify it before success or rollback is settled. Reject execution on
+platforms where directory-entry durability cannot be enforced.
 
 ## Risks / Trade-offs
 

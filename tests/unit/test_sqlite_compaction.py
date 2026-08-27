@@ -203,6 +203,21 @@ def test_compaction_dry_run_rejects_state_change_during_read(tmp_path: Path, mon
         compact.plan_sqlite_compaction(_database_url(source))
 
 
+def test_compaction_dry_run_reports_size_from_verified_snapshot(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    signature = (
+        compact._PathSignature(exists=True, size=123),
+        compact._PathSignature(exists=False),
+        compact._PathSignature(exists=False),
+    )
+    monkeypatch.setattr(compact, "_database_state_signature", lambda _source: signature)
+
+    plan = compact._read_plan(source)
+
+    assert plan.source_bytes == 123
+
+
 def test_compaction_fails_when_uid_gid_cannot_be_preserved(tmp_path: Path, monkeypatch) -> None:
     compacted = tmp_path / "compacted.db"
     compacted.write_bytes(b"sqlite")
@@ -260,6 +275,25 @@ def test_compaction_free_space_budget_includes_pending_wal(tmp_path: Path, monke
     assert source.exists()
     assert wal.exists()
     assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_rechecks_space_before_auto_vacuum(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    disk_usage_type = type(compact.shutil.disk_usage(tmp_path))
+    ample_free_bytes = 4 * source.stat().st_size + compact._MIN_FREE_SPACE_RESERVE
+    free_bytes = iter((ample_free_bytes, ample_free_bytes, 0))
+    monkeypatch.setattr(
+        compact.shutil,
+        "disk_usage",
+        lambda _path: disk_usage_type(ample_free_bytes, ample_free_bytes, next(free_bytes)),
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient free space"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert _remaining_rows(source) == 100
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
 
 
 def test_compaction_rejects_busy_checkpoint_and_existing_lock(tmp_path: Path, monkeypatch) -> None:
@@ -374,6 +408,33 @@ def test_compaction_blocks_concurrent_writer_before_replacement(tmp_path: Path, 
         real_replace(candidate, target)
 
     monkeypatch.setattr(compact, "_replace_path", assert_writer_is_blocked)
+
+    compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert _remaining_rows(source) == 100
+
+
+def test_compaction_blocks_concurrent_writer_after_replacement(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_fsync_file = compact._fsync_file
+    source_fsync_count = 0
+
+    def assert_replacement_writer_is_blocked(path: Path) -> None:
+        nonlocal source_fsync_count
+        if path == source:
+            source_fsync_count += 1
+            if source_fsync_count == 2:
+                writer = sqlite3.connect(source, timeout=0)
+                try:
+                    writer.execute("PRAGMA busy_timeout=0")
+                    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                        writer.execute("INSERT INTO payloads(payload) VALUES ('concurrent-write')")
+                finally:
+                    writer.close()
+        real_fsync_file(path)
+
+    monkeypatch.setattr(compact, "_fsync_file", assert_replacement_writer_is_blocked)
 
     compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
 

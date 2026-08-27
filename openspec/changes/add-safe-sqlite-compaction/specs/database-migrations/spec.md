@@ -9,8 +9,8 @@ requirement. Dry-run MUST NOT run `VACUUM`, create a backup or temporary
 database, checkpoint WAL, or modify the source. It MUST use an immutable
 read-only connection, reject a non-empty WAL or rollback journal with a
 non-zero hot-journal header whose committed state cannot be included without
-recovery or sidecar mutation, and fail if the database or those sidecars
-change during inspection.
+recovery or sidecar mutation, report the source size from the verified
+snapshot, and fail if the database or those sidecars change during inspection.
 
 #### Scenario: Dry-run reports reclaimable storage
 
@@ -35,6 +35,10 @@ uid, and gid immediately after creation before longer verification begins.
 Before the final source validation, it MUST acquire an exclusive SQLite write
 lock and hold it through sidecar handling and replacement, so a concurrent
 writer cannot commit into the validation-and-replacement window.
+When enabling incremental autovacuum, it MUST recheck free space for the
+pointer-map-expanded output before the output-only `VACUUM`, and it MUST hold
+an exclusive lock on the replacement inode through its file and directory
+durability checks.
 It MUST reject replacement of the source path with a different inode while
 compaction is running, reserve a backup name only when its main and sidecar
 paths are unused, and restore the original database and sidecars if

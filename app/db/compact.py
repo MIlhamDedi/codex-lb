@@ -132,7 +132,7 @@ def _read_plan(source: Path) -> SqliteCompactionPlan:
         connection.close()
     if _database_state_signature(source) != before_signature:
         raise RuntimeError("SQLite database or sidecar changed during dry-run; stop writers and retry")
-    source_bytes = source.stat().st_size
+    source_bytes = before_signature[0].size
     free_bytes = shutil.disk_usage(source.parent).free
     required_free_bytes = 2 * source_bytes + _MIN_FREE_SPACE_RESERVE
     return SqliteCompactionPlan(
@@ -197,6 +197,15 @@ def _checkpoint_wal(connection: sqlite3.Connection) -> None:
 
 def _data_version(connection: sqlite3.Connection) -> int:
     return int(connection.execute("PRAGMA data_version").fetchone()[0])
+
+
+def _incremental_auto_vacuum_required_free_bytes(connection: sqlite3.Connection) -> int:
+    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    pointer_map_interval = max(1, page_size // 5)
+    pointer_map_pages = (page_count + pointer_map_interval - 1) // pointer_map_interval + 1
+    output_bytes = (page_count + pointer_map_pages) * page_size
+    return output_bytes + _MIN_FREE_SPACE_RESERVE
 
 
 def _fsync_file(path: Path) -> None:
@@ -309,6 +318,7 @@ def execute_sqlite_compaction(
     original_source_identity = (original_source_stat.st_dev, original_source_stat.st_ino)
     backup_created = False
     replacement_installed = False
+    replacement_connection: sqlite3.Connection | None = None
     completed = False
     moved_sidecars: list[tuple[Path, Path]] = []
     try:
@@ -341,6 +351,12 @@ def execute_sqlite_compaction(
             with sqlite_connection(temporary) as compacted_connection:
                 compacted_connection.execute("PRAGMA journal_mode=DELETE")
                 if int(compacted_connection.execute("PRAGMA auto_vacuum").fetchone()[0]) != _INCREMENTAL_AUTO_VACUUM:
+                    free_bytes = shutil.disk_usage(source.parent).free
+                    required_free_bytes = _incremental_auto_vacuum_required_free_bytes(compacted_connection)
+                    if free_bytes < required_free_bytes:
+                        raise RuntimeError(
+                            f"insufficient free space for compaction: required={required_free_bytes} free={free_bytes}"
+                        )
                     compacted_connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
                     compacted_connection.execute("VACUUM")
                 compacted_identity = _schema_identity(compacted_connection)
@@ -396,6 +412,9 @@ def execute_sqlite_compaction(
                         backup.unlink(missing_ok=True)
                         backup_created = False
                 raise
+            replacement_connection = sqlite3.connect(str(source))
+            replacement_connection.execute("PRAGMA busy_timeout=0")
+            replacement_connection.execute("BEGIN EXCLUSIVE")
             _fsync_file(source)
             _fsync_directory(source.parent)
             after_bytes = source.stat().st_size
@@ -422,7 +441,11 @@ def execute_sqlite_compaction(
         try:
             _unlink_owned_lock(lock_path, lock_descriptor)
         finally:
-            os.close(lock_descriptor)
+            try:
+                if replacement_connection is not None:
+                    replacement_connection.close()
+            finally:
+                os.close(lock_descriptor)
 
 
 __all__ = [
