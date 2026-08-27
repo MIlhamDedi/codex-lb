@@ -2531,12 +2531,12 @@ def _state_from_account(
         status = AccountStatus.RATE_LIMITED
         reset_at = float(account.reset_at)
 
-    if status == AccountStatus.QUOTA_EXCEEDED:
-        next_blocked_at = effective_blocked_at
-    elif status == AccountStatus.RATE_LIMITED and account.status != AccountStatus.QUOTA_EXCEEDED:
-        next_blocked_at = effective_blocked_at
-    else:
-        next_blocked_at = None
+    next_blocked_at = (
+        effective_blocked_at
+        if status == AccountStatus.QUOTA_EXCEEDED
+        or (status == AccountStatus.RATE_LIMITED and account.status != AccountStatus.QUOTA_EXCEEDED)
+        else None
+    )
 
     settings = get_settings()
     new_tier = _sync_runtime_health_tier(
@@ -2728,28 +2728,24 @@ def background_recovery_state_from_account(
     account: Account,
     primary_entry: UsageHistory | None,
     secondary_entry: UsageHistory | None,
-    now: float | None = None,
 ) -> AccountState:
-    """Evaluate recovery for a persisted blocked account without live runtime state.
+    """Evaluate recovery without live runtime state.
 
-    The usage refresh scheduler only needs to know whether a persisted blocked
-    account can safely return to `active`. Seed a throwaway runtime snapshot
-    from the persisted block marker so fresh post-block usage rows can clear a
-    stale reset guard even when the original balancer process is gone.
+    Seed a throwaway runtime from the persisted block marker so post-block usage
+    can clear stale reset guards after a balancer restart.
     """
 
     runtime = RuntimeState()
     blocked_at = float(account.blocked_at) if account.blocked_at is not None else None
-    now = REAL_CLOCK.time() if now is None else now
+    now = REAL_CLOCK.time()
     reset_at = float(account.reset_at) if account.reset_at is not None else None
     valid_reset_at = plausible_rate_limit_reset_at(reset_at, now=now)
 
     if blocked_at is not None:
         runtime.blocked_at = blocked_at
 
-    if account.status == AccountStatus.RATE_LIMITED and blocked_at is not None:
-        if valid_reset_at is not None:
-            runtime.cooldown_until = valid_reset_at
+    if account.status == AccountStatus.RATE_LIMITED and blocked_at is not None and valid_reset_at is not None:
+        runtime.cooldown_until = valid_reset_at
     state = _state_from_account(
         account=account,
         primary_entry=primary_entry,
