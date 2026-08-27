@@ -337,6 +337,37 @@ class DurableBridgeRepository:
             )
         ) is not None
 
+    async def _chunk_append_preflight_allows_encoding(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_bytes: int,
+        event_count: int,
+        max_bytes: int,
+    ) -> bool:
+        if not await self._chunk_append_owner_exists(
+            session_id=session_id,
+            instance_id=instance_id,
+            owner_epoch=owner_epoch,
+        ):
+            return False
+        current_event_bytes = await self._session.scalar(
+            select(HttpBridgeOperationRecord.event_bytes).where(
+                HttpBridgeOperationRecord.operation_id == operation_id,
+                HttpBridgeOperationRecord.session_id == session_id,
+            )
+        )
+        if current_event_bytes is None:
+            return False
+        first_sequence_number = await self._next_operation_chunk_sequence(operation_id)
+        return (
+            int(current_event_bytes) + event_bytes <= max_bytes
+            and first_sequence_number - 1 + event_count <= DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS
+        )
+
     async def get_session(
         self,
         *,
@@ -2010,10 +2041,14 @@ class DurableBridgeRepository:
         event_bytes = sum(len(event_text.encode("utf-8")) for event_text in event_texts)
         if event_bytes > max_bytes:
             return False
-        if not await self._chunk_append_owner_exists(
+        if not await self._chunk_append_preflight_allows_encoding(
+            operation_id=first.operation_id,
             session_id=first.session_id,
             instance_id=first.instance_id,
             owner_epoch=first.owner_epoch,
+            event_bytes=event_bytes,
+            event_count=len(event_texts),
+            max_bytes=max_bytes,
         ):
             return False
         try:
@@ -2073,16 +2108,19 @@ class DurableBridgeRepository:
     ) -> bool:
         """Append a terminal v2 chunk and expose its outcome atomically."""
         event_bytes = len(event_text.encode("utf-8"))
-        if not await self._chunk_append_owner_exists(
+        preflight_allows_encoding = await self._chunk_append_preflight_allows_encoding(
+            operation_id=operation_id,
             session_id=session_id,
             instance_id=instance_id,
             owner_epoch=owner_epoch,
-        ):
-            return False
+            event_bytes=event_bytes,
+            event_count=1,
+            max_bytes=max_bytes,
+        )
         try:
             encoded = (
                 await asyncio.to_thread(encode_durable_bridge_transcript_chunk, (event_text,))
-                if event_bytes <= max_bytes
+                if preflight_allows_encoding
                 else None
             )
         except ValueError:

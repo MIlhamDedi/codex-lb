@@ -1179,6 +1179,24 @@ async def test_chunk_writer_rejects_before_compression(
             ],
             max_bytes=1024,
         )
+        await session.execute(
+            update(HttpBridgeOperationRecord)
+            .where(HttpBridgeOperationRecord.operation_id == operation_id)
+            .values(event_bytes=1024)
+        )
+        await session.commit()
+        assert not await repository.append_operation_event_chunk(
+            events=[
+                DurableBridgeOperationEventInput(
+                    operation_id=operation_id,
+                    session_id=claim.id,
+                    instance_id="inst-precompress",
+                    owner_epoch=claim.owner_epoch,
+                    event_text="small",
+                )
+            ],
+            max_bytes=1024,
+        )
         encoder.assert_not_called()
     finally:
         await session.close()
