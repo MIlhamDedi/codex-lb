@@ -945,6 +945,9 @@ class ProxyService(
         self._work_admission: WorkAdmissionController | None = None
         self._request_log_tasks: set[asyncio.Task[None]] = set()
 
+    def _remaining_budget_seconds(self, deadline: float) -> float:
+        return max(0.0, deadline - self._clock.monotonic())
+
     def _get_work_admission(self) -> WorkAdmissionController:
         if self._work_admission is None:
             settings = get_settings()
@@ -1025,7 +1028,7 @@ class ProxyService(
                 nonlocal route_fallback_used, route_mode, route_pool_id, route_endpoint_id
                 access_token = self._encryptor.decrypt(target.access_token_encrypted)
                 upstream_account_id = _header_account_id(target.chatgpt_account_id)
-                remaining_budget = _remaining_budget_seconds(deadline)
+                remaining_budget = self._remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
                         "Thread goal request budget exhausted before upstream call request_id=%s operation=%s "
@@ -1124,7 +1127,7 @@ class ProxyService(
                         return response
                 if exc.status_code == 401:
                     try:
-                        remaining_budget = _remaining_budget_seconds(deadline)
+                        remaining_budget = self._remaining_budget_seconds(deadline)
                         if remaining_budget <= 0:
                             logger.warning(
                                 "Thread goal request budget exhausted before forced refresh retry request_id=%s "
@@ -1174,7 +1177,7 @@ class ProxyService(
                                     account_id_value = account.id
                                     account = await self._ensure_fresh_with_budget_or_auth_error(
                                         account,
-                                        timeout_seconds=_remaining_budget_seconds(deadline),
+                                        timeout_seconds=self._remaining_budget_seconds(deadline),
                                     )
                                     try:
                                         response = await _call_goal(account)
@@ -1459,7 +1462,7 @@ class ProxyService(
             account,
             force=force,
             deadline=deadline,
-            remaining_budget_seconds=_remaining_budget_seconds,
+            remaining_budget_seconds=self._remaining_budget_seconds,
             request_id=get_request_id(),
             privacy_policy=privacy_policy,
         )
@@ -1483,7 +1486,7 @@ class ProxyService(
         force_current = force
         while True:
             attempt += 1
-            remaining_budget = _remaining_budget_seconds(deadline)
+            remaining_budget = self._remaining_budget_seconds(deadline)
             if remaining_budget <= 0:
                 logger.warning(
                     "%s request budget exhausted before freshness check request_id=%s account_id=%s",
@@ -1568,7 +1571,7 @@ class ProxyService(
                 self,
                 account,
                 force=force,
-                timeout_seconds=_remaining_budget_seconds(deadline),
+                timeout_seconds=self._remaining_budget_seconds(deadline),
                 privacy_policy=privacy_policy,
             )
 
@@ -1597,7 +1600,7 @@ class ProxyService(
             failover_failed_account = _proxy_response_failed_account(failover_exc, next_account)
             setattr(failover_exc, _FAILED_ACCOUNT_ATTR, failover_failed_account)
             if failover_exc.status_code == 401:
-                remaining_budget = _remaining_budget_seconds(deadline)
+                remaining_budget = self._remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     _raise_proxy_budget_exhausted()
                 try:
@@ -1710,7 +1713,7 @@ class ProxyService(
         traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
         redact_sensitive_details: bool = False,
     ) -> AccountSelection:
-        remaining_budget = _remaining_budget_seconds(deadline)
+        remaining_budget = self._remaining_budget_seconds(deadline)
         if remaining_budget <= 0:
             logger.warning(
                 "%s request budget exhausted before account selection request_id=%s", kind.title(), request_id
