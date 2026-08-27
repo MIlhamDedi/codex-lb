@@ -2016,6 +2016,7 @@ class _HTTPBridgeMixin(
                         old_reader,
                         label="http bridge upstream reader",
                         cleanup_tasks=self._background_cleanup_tasks,
+                        scheduler=scheduler_for(self),
                     )
                 except BaseException:
                     session.closed = True

@@ -1429,6 +1429,7 @@ class _WebSocketMixin:
                     upstream_reader,
                     label="proxy websocket upstream reader",
                     cleanup_tasks=proxy._background_cleanup_tasks,
+                    scheduler=scheduler_for(proxy),
                 )
                 upstream_reader = None
             upstream_control = None
@@ -1472,6 +1473,7 @@ class _WebSocketMixin:
                     reader_to_await,
                     label="proxy websocket upstream reader",
                     cancel=False,
+                    scheduler=scheduler_for(proxy),
                 )
             except Exception:
                 # A completed reader failure must not hide an ownership
@@ -2842,6 +2844,7 @@ class _WebSocketMixin:
                             label="proxy websocket upstream reader",
                             cancel=False,
                             cleanup_tasks=proxy._background_cleanup_tasks,
+                            scheduler=scheduler_for(proxy),
                         )
                     except Exception:
                         # Reader failure must not skip lease release or the
@@ -2859,6 +2862,7 @@ class _WebSocketMixin:
                             timeout_seconds=task_cleanup_timeout,
                             label="proxy websocket retired create lease release",
                             cancel=False,
+                            scheduler=scheduler_for(proxy),
                         )
                     except Exception:
                         _facade().logger.warning(
@@ -2874,6 +2878,7 @@ class _WebSocketMixin:
                             timeout_seconds=task_cleanup_timeout,
                             label="proxy websocket unsent request finalization",
                             cancel=False,
+                            scheduler=scheduler_for(proxy),
                         )
                     except Exception:
                         _facade().logger.warning(

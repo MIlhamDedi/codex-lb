@@ -157,7 +157,7 @@ async def run_unbound_selection_path(
                 else build_routing_costs(
                     settings=selection_inputs.quota_planner_settings,
                     states=states,
-                    now=datetime.now(timezone.utc),
+                    now=datetime.fromtimestamp(owner._clock.time(), timezone.utc),
                 )
             )
             fair_share_denial = owner._api_key_stream_fair_share_denial_locked(

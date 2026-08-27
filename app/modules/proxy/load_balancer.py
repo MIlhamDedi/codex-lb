@@ -1698,6 +1698,7 @@ class LoadBalancer:
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_states,
             sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
+            now=self._clock.time(),
         )
 
     _persist_sticky_mutation = staticmethod(_persist_sticky_mutation)

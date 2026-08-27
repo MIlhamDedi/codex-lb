@@ -23,6 +23,7 @@ from app.core.balancer import (
     TrafficClass,
     select_account,
 )
+from app.core.clock import Clock
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
 from app.modules.accounts.repository import AccountsRepository
@@ -86,6 +87,7 @@ SelectionInputsT = TypeVar("SelectionInputsT", bound=SelectionInputsProtocol)
 
 
 class StickySelectionOwner(Protocol):
+    _clock: Clock
     _runtime_lock: asyncio.Lock
     _repo_factory: ProxyRepoFactory
 
@@ -437,7 +439,7 @@ async def run_sticky_selection_path(
                 else build_routing_costs(
                     settings=selection_inputs.quota_planner_settings,
                     states=states,
-                    now=datetime.now(timezone.utc),
+                    now=datetime.fromtimestamp(owner._clock.time(), timezone.utc),
                 )
             )
             # Key shape is deliberately irrelevant here. Only typed
@@ -1169,6 +1171,7 @@ async def _select_with_stickiness(
     allow_usage_exhaustion_error: bool = True,
     usage_exhaustion_states: Iterable[AccountState] | None = None,
     sticky_refresh_skip_deadline: datetime | None = None,
+    now: float,
 ) -> _StickySelectionOutcome:
     if not sticky_key or not sticky_repo:
         return _StickySelectionOutcome(
@@ -1273,7 +1276,6 @@ async def _select_with_stickiness(
             # budget threshold. That preserves continuity below the
             # threshold while avoiding obvious short-window failures once
             # the session is skating on the edge of exhaustion.
-            now = time.time()
             budget_pressured = (
                 sticky_kind
                 in (
@@ -1398,7 +1400,7 @@ async def _select_with_stickiness(
                 grace_copy = replace(pinned)
                 grace_result = select_account(
                     [grace_copy],
-                    now=time.time() + _STICKY_GRACE_PERIOD_SECONDS,
+                    now=now + _STICKY_GRACE_PERIOD_SECONDS,
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
                     routing_strategy=routing_strategy,
