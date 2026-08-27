@@ -35,7 +35,8 @@ free-space gate first accounts for pending WAL bytes, then rechecks the
 checkpointed logical source size before `VACUUM INTO`; it reserves two source
 sizes for the output and its second VACUUM scratch space. Before enabling
 incremental autovacuum, it rechecks space against the pointer-map-expanded
-output size. Creation runs under `umask 077`.
+output size on both the source filesystem and SQLite's selected temporary-file
+filesystem. Creation runs under `umask 077`.
 
 ### D4. Preserve rollback source
 

@@ -296,6 +296,31 @@ def test_compaction_rechecks_space_before_auto_vacuum(tmp_path: Path, monkeypatc
     assert list(tmp_path.glob("*.pre-compact-*")) == []
 
 
+def test_compaction_rechecks_sqlite_temporary_file_space(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    sqlite_temp_directory = tmp_path / "sqlite-temp"
+    sqlite_temp_directory.mkdir()
+    _create_fragmented_database(source)
+    disk_usage_type = type(compact.shutil.disk_usage(tmp_path))
+    ample_free_bytes = 4 * source.stat().st_size + compact._MIN_FREE_SPACE_RESERVE
+    monkeypatch.setenv("SQLITE_TMPDIR", str(sqlite_temp_directory))
+    monkeypatch.setattr(
+        compact.shutil,
+        "disk_usage",
+        lambda path: disk_usage_type(
+            ample_free_bytes,
+            ample_free_bytes,
+            0 if Path(path) == sqlite_temp_directory else ample_free_bytes,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="SQLite temporary files"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert _remaining_rows(source) == 100
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+
+
 def test_compaction_rejects_busy_checkpoint_and_existing_lock(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)

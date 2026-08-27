@@ -39,6 +39,8 @@ When enabling incremental autovacuum, it MUST recheck free space for the
 pointer-map-expanded output before the output-only `VACUUM`, and it MUST hold
 an exclusive lock on the replacement inode through its file and directory
 durability checks.
+That auto-vacuum check MUST also validate the writable filesystem SQLite will
+use for its temporary files.
 It MUST reject replacement of the source path with a different inode while
 compaction is running, reserve a backup name only when its main and sidecar
 paths are unused, and restore the original database and sidecars if

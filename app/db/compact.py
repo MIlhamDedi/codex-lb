@@ -208,6 +208,15 @@ def _incremental_auto_vacuum_required_free_bytes(connection: sqlite3.Connection)
     return output_bytes + _MIN_FREE_SPACE_RESERVE
 
 
+def _sqlite_temporary_directory() -> Path:
+    candidates = [Path(value) for name in ("SQLITE_TMPDIR", "TMPDIR") if (value := os.environ.get(name))]
+    candidates.extend((Path("/var/tmp"), Path("/usr/tmp"), Path("/tmp"), Path.cwd()))
+    for candidate in candidates:
+        if candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK):
+            return candidate
+    raise RuntimeError("no writable SQLite temporary-file directory is available")
+
+
 def _fsync_file(path: Path) -> None:
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
@@ -356,6 +365,12 @@ def execute_sqlite_compaction(
                     if free_bytes < required_free_bytes:
                         raise RuntimeError(
                             f"insufficient free space for compaction: required={required_free_bytes} free={free_bytes}"
+                        )
+                    temporary_free_bytes = shutil.disk_usage(_sqlite_temporary_directory()).free
+                    if temporary_free_bytes < required_free_bytes:
+                        raise RuntimeError(
+                            "insufficient free space for SQLite temporary files: "
+                            f"required={required_free_bytes} free={temporary_free_bytes}"
                         )
                     compacted_connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
                     compacted_connection.execute("VACUUM")
