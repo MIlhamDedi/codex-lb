@@ -108,6 +108,59 @@ def test_probe_selection_uses_injected_clock() -> None:
     assert reservation is None
 
 
+@pytest.mark.asyncio
+async def test_record_errors_uses_injected_clock() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    account = _make_account("acc-virtual-clock-error")
+    balancer = LoadBalancer(
+        lambda: _repo_factory(_StubAccountsRepository([account]), _StubUsageRepository({}, {})),
+        clock=clock,
+    )
+
+    await balancer.record_errors(account, 2)
+
+    runtime = balancer._runtime[account.id]
+    assert runtime.error_count == 2
+    assert runtime.last_error_at == clock.time()
+
+
+@pytest.mark.asyncio
+async def test_record_errors_uses_real_clock_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_epoch = 2_000_000_001.0
+    monkeypatch.setattr("app.core.clock.time.time", lambda: real_epoch)
+    account = _make_account("acc-real-clock-error")
+    balancer = LoadBalancer(lambda: _repo_factory(_StubAccountsRepository([account]), _StubUsageRepository({}, {})))
+
+    await balancer.record_error(account)
+
+    assert balancer._runtime[account.id].last_error_at == real_epoch
+
+
+@pytest.mark.asyncio
+async def test_virtual_clock_controls_state_and_probe_health_transitions() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    account = _make_account("acc-virtual-clock-state")
+    primary = _usage_row_with_percent(
+        900,
+        account.id,
+        used_percent=DRAIN_PRIMARY_THRESHOLD_PCT,
+        reset_at=int(clock.time() + 300),
+    )
+    usage_repo = _StubUsageRepository({account.id: primary}, {})
+    balancer = LoadBalancer(lambda: _repo_factory(_StubAccountsRepository([account]), usage_repo), clock=clock)
+    balancer._runtime[account.id] = RuntimeState(health_tier=HEALTH_TIER_PROBING, probe_success_streak=2)
+
+    await balancer.select_account()
+    runtime = balancer._runtime[account.id]
+    assert runtime.health_tier == HEALTH_TIER_DRAINING
+    assert runtime.drain_entered_at == clock.time()
+
+    await balancer.record_probe_result(account_id=account.id, http_status=200)
+
+    assert runtime.health_tier == HEALTH_TIER_DRAINING
+    assert runtime.drain_entered_at == clock.time()
+
+
 @pytest.fixture(autouse=True)
 def _use_dashboard_caps_from_test_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     class _SettingsCache:
