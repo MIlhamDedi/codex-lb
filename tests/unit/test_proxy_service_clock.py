@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -12,13 +13,16 @@ from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 pytestmark = pytest.mark.unit
 
 
-def _service(clock: VirtualClock | None = None) -> proxy_service.ProxyService:
+def _service(
+    clock: VirtualClock | None = None,
+    scheduler: VirtualScheduler | None = None,
+) -> proxy_service.ProxyService:
     if clock is None:
         return proxy_service.ProxyService(cast(Any, SimpleNamespace()))
     return proxy_service.ProxyService(
         cast(Any, SimpleNamespace()),
         clock=clock,
-        scheduler=VirtualScheduler(clock),
+        scheduler=scheduler or VirtualScheduler(clock),
     )
 
 
@@ -84,3 +88,68 @@ async def test_thread_goal_refresh_and_upstream_budget_use_virtual_clock(
     assert refresh_call.kwargs["timeout_seconds"] == 30.0
     assert upstream_call is not None
     assert upstream_call.kwargs["timeout_seconds"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_account_selection_timeout_uses_virtual_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    service = _service(clock, scheduler)
+    selection_started = asyncio.Event()
+    selection_never_finishes = asyncio.Event()
+
+    class SettingsCache:
+        async def get(self) -> object:
+            return proxy_service.get_settings()
+
+    async def blocked_select_account(**_kwargs: object) -> object:
+        selection_started.set()
+        await selection_never_finishes.wait()
+        raise AssertionError("blocked selection unexpectedly resumed")
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: SettingsCache())
+    monkeypatch.setattr(service._load_balancer, "select_account", blocked_select_account)
+
+    selection_task = scheduler.create_task(
+        service._select_account_with_budget(
+            deadline=clock.monotonic() + 30.0,
+            request_id="req-virtual-selection-timeout",
+            kind="thread_goal_get",
+        )
+    )
+    await scheduler.drain()
+    assert selection_started.is_set()
+
+    await scheduler.advance(30.0)
+
+    assert selection_task.done()
+    with pytest.raises(proxy_service.ProxyResponseError) as exc_info:
+        await selection_task
+    assert exc_info.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_account_selection_keeps_real_scheduler_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service()
+    expected_selection = proxy_service.AccountSelection(None, "No active accounts available")
+    select_account = AsyncMock(return_value=expected_selection)
+
+    class SettingsCache:
+        async def get(self) -> object:
+            return proxy_service.get_settings()
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: SettingsCache())
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+
+    selection = await service._select_account_with_budget(
+        deadline=service._clock.monotonic() + 30.0,
+        request_id="req-real-selection-timeout",
+        kind="thread_goal_get",
+    )
+
+    assert selection is expected_selection
+    select_account.assert_awaited_once()
