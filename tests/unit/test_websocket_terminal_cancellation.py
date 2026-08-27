@@ -1438,7 +1438,9 @@ async def test_stuck_upstream_close_is_cancelled_after_scope_cleanup_timeout() -
 
 
 @pytest.mark.asyncio
-async def test_upstream_close_cleanup_uses_injected_scheduler_timeout() -> None:
+async def test_upstream_close_cleanup_uses_injected_scheduler_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     @asynccontextmanager
     async def repo_factory() -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
@@ -1452,6 +1454,14 @@ async def test_upstream_close_cleanup_uses_injected_scheduler_timeout() -> None:
     )
     close_started = asyncio.Event()
     close_cancelled = False
+    cancellation_schedulers: list[Any] = []
+    original_await_cancelled_task = proxy_service._await_cancelled_task
+
+    async def capture_cancellation_scheduler(*args: Any, **kwargs: Any) -> bool:
+        cancellation_schedulers.append(kwargs["scheduler"])
+        return await original_await_cancelled_task(*args, **kwargs)
+
+    monkeypatch.setattr(proxy_service, "_await_cancelled_task", capture_cancellation_scheduler)
 
     async def close() -> None:
         nonlocal close_cancelled
@@ -1479,6 +1489,7 @@ async def test_upstream_close_cleanup_uses_injected_scheduler_timeout() -> None:
     await cleanup
 
     assert close_cancelled is True
+    assert cancellation_schedulers == [scheduler]
     assert service._background_cleanup_tasks == set()
 
 

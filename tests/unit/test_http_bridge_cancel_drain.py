@@ -166,6 +166,46 @@ async def test_cancelled_task_cleanup_is_scheduler_owned() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_resource_close_uses_service_scheduler_for_reader_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    session = _make_http_bridge_session(deque(), queued_request_count=0)
+
+    async def blocked_reader() -> None:
+        await asyncio.Event().wait()
+
+    reader = scheduler.create_task(blocked_reader())
+    session.upstream_reader = reader
+    await scheduler.drain()
+
+    captured_schedulers: list[Any] = []
+
+    async def await_cancelled_task(task: asyncio.Task[Any], **kwargs: Any) -> bool:
+        captured_schedulers.append(kwargs["scheduler"])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
+    monkeypatch.setattr(http_bridge_helpers, "_await_cancelled_task", await_cancelled_task)
+    service = SimpleNamespace(
+        _scheduler=scheduler,
+        _background_cleanup_tasks=set(),
+        _unregister_http_bridge_turn_states=AsyncMock(),
+        _unregister_http_bridge_previous_response_ids=AsyncMock(),
+        _load_balancer=SimpleNamespace(release_account_lease=AsyncMock()),
+        _fail_pending_websocket_requests=AsyncMock(),
+    )
+
+    await http_bridge_helpers._close_http_bridge_session_resources(service, session)
+
+    assert captured_schedulers == [scheduler]
+    assert reader.cancelled()
+    assert session.upstream_reader is None
+
+
+@pytest.mark.asyncio
 async def test_cancelled_http_bridge_request_retires_session_before_retry_overlap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

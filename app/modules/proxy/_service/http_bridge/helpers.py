@@ -1008,6 +1008,7 @@ async def _close_http_bridge_session_resources(
                 upstream_reader,
                 label="http bridge upstream reader",
                 cleanup_tasks=service._background_cleanup_tasks,
+                scheduler=scheduler_for(service),
             )
             if session.upstream_reader is upstream_reader:
                 session.upstream_reader = None
