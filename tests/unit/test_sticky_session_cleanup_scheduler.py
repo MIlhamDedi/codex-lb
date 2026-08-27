@@ -181,6 +181,18 @@ def test_leader_skip_preserves_existing_backlog_signal() -> None:
     assert cleanup_scheduler._merge_backlog_signal(False, True) is True
 
 
+@pytest.mark.asyncio
+async def test_full_cleanup_leader_skip_preserves_existing_backlog_signal(monkeypatch) -> None:
+    scheduler = cleanup_scheduler.StickySessionCleanupScheduler(interval_seconds=60, enabled=True)
+    leader = SimpleNamespace(run_if_leader=AsyncMock(return_value=None))
+    monkeypatch.setattr(cleanup_scheduler, "_get_leader_election", lambda: leader)
+
+    attempted = await scheduler._cleanup_once()
+
+    assert attempted is None
+    assert cleanup_scheduler._merge_backlog_signal(True, attempted) is True
+
+
 def test_operation_retention_cleanup_records_low_cardinality_metrics(monkeypatch) -> None:
     runs = MagicMock()
     deleted = MagicMock()

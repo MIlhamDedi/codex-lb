@@ -219,7 +219,10 @@ class StickySessionCleanupScheduler:
         backlog_likely = False
         while not self._stop.is_set():
             if loop.time() >= next_full_cleanup_at:
-                backlog_likely = await self._cleanup_once()
+                backlog_likely = _merge_backlog_signal(
+                    backlog_likely,
+                    await self._cleanup_once(),
+                )
                 next_full_cleanup_at = loop.time() + float(self.interval_seconds)
             elif backlog_likely:
                 backlog_likely = _merge_backlog_signal(
@@ -239,8 +242,8 @@ class StickySessionCleanupScheduler:
             except asyncio.TimeoutError:
                 continue
 
-    async def _cleanup_once(self) -> bool:
-        return bool(await _get_leader_election().run_if_leader(self._cleanup_as_leader))
+    async def _cleanup_once(self) -> bool | None:
+        return await _get_leader_election().run_if_leader(self._cleanup_as_leader)
 
     async def _cleanup_operation_retention_once(self) -> bool | None:
         return await _get_leader_election().run_if_leader(self._cleanup_operation_retention_as_leader)
