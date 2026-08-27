@@ -332,6 +332,10 @@ def execute_sqlite_compaction(
             compacted_integrity = check_sqlite_integrity(temporary, mode=SqliteIntegrityCheckMode.QUICK)
             if not compacted_integrity.ok:
                 raise RuntimeError(f"compacted SQLite quick_check failed: {compacted_integrity.details}")
+            # Block SQLite writers until the verified replacement is durable. A
+            # file lock alone cannot prevent a process with an open SQLite
+            # connection from committing between the final checks and rename.
+            source_connection.execute("BEGIN EXCLUSIVE")
             if _data_version(source_connection) != data_version:
                 raise RuntimeError("source database changed during compaction; keep the application stopped")
             source_stat = source.stat()
@@ -341,38 +345,38 @@ def execute_sqlite_compaction(
                 source_stat.st_size,
                 source_stat.st_mtime_ns,
             )
-
-        _fsync_file(source)
-        _fsync_file(temporary)
-        current_source_stat = source.stat()
-        if (
-            current_source_stat.st_dev,
-            current_source_stat.st_ino,
-            current_source_stat.st_size,
-            current_source_stat.st_mtime_ns,
-        ) != source_signature:
-            raise RuntimeError("source database changed before compacted replacement")
-        wal_path = Path(f"{source}-wal")
-        if wal_path.exists() and wal_path.stat().st_size > 0:
-            raise RuntimeError("non-empty SQLite WAL remains after checkpoint")
-        # Preserve the original inode first, then install the verified output
-        # with one atomic replace. The live source path is never absent.
-        _link_path(source, backup)
-        backup_created = True
-        _fsync_directory(source.parent)
-        try:
-            moved_sidecars = _backup_sidecars(source, backup)
-            _replace_path(temporary, source)
-            replacement_installed = True
-        except Exception:
-            _restore_sidecars(moved_sidecars)
-            if backup_created:
-                backup.unlink(missing_ok=True)
-                backup_created = False
-            raise
-        _fsync_file(source)
-        _fsync_directory(source.parent)
-        after_bytes = source.stat().st_size
+            _fsync_file(source)
+            _fsync_file(temporary)
+            current_source_stat = source.stat()
+            if (
+                current_source_stat.st_dev,
+                current_source_stat.st_ino,
+                current_source_stat.st_size,
+                current_source_stat.st_mtime_ns,
+            ) != source_signature:
+                raise RuntimeError("source database changed before compacted replacement")
+            wal_path = Path(f"{source}-wal")
+            if wal_path.exists() and wal_path.stat().st_size > 0:
+                raise RuntimeError("non-empty SQLite WAL remains after checkpoint")
+            # Preserve the original inode first, then install the verified
+            # output with one atomic replace. The live source path is never
+            # absent, and the exclusive SQLite transaction remains held.
+            _link_path(source, backup)
+            backup_created = True
+            _fsync_directory(source.parent)
+            try:
+                moved_sidecars = _backup_sidecars(source, backup)
+                _replace_path(temporary, source)
+                replacement_installed = True
+            except Exception:
+                _restore_sidecars(moved_sidecars)
+                if backup_created:
+                    backup.unlink(missing_ok=True)
+                    backup_created = False
+                raise
+            _fsync_file(source)
+            _fsync_directory(source.parent)
+            after_bytes = source.stat().st_size
         completed = True
         return SqliteCompactionOutcome(
             source=source,

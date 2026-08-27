@@ -32,6 +32,9 @@ the original as a unique timestamped backup, and fsync the replacement and
 directory. The complete `VACUUM INTO` creation window MUST run under a
 restrictive `077` umask, and the temporary copy MUST receive the source mode,
 uid, and gid immediately after creation before longer verification begins.
+Before the final source validation, it MUST acquire an exclusive SQLite write
+lock and hold it through sidecar handling and replacement, so a concurrent
+writer cannot commit into the validation-and-replacement window.
 The original MUST be durably linked at the backup path before the verified
 temporary database atomically replaces the live source path, so the live path
 is never absent between two rename operations. The temporary database MUST be

@@ -297,6 +297,29 @@ def test_compaction_rejects_external_write_and_corrupt_output(tmp_path: Path, mo
     assert list(tmp_path.glob("*.pre-compact-*")) == []
 
 
+def test_compaction_blocks_concurrent_writer_before_replacement(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_replace = compact._replace_path
+
+    def assert_writer_is_blocked(candidate: Path, target: Path) -> None:
+        if ".compact-" in str(candidate) and target == source:
+            writer = sqlite3.connect(source, timeout=0)
+            try:
+                writer.execute("PRAGMA busy_timeout=0")
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    writer.execute("INSERT INTO payloads(payload) VALUES ('concurrent-write')")
+            finally:
+                writer.close()
+        real_replace(candidate, target)
+
+    monkeypatch.setattr(compact, "_replace_path", assert_writer_is_blocked)
+
+    compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert _remaining_rows(source) == 100
+
+
 def test_compaction_restores_source_when_install_rename_fails(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)
@@ -376,6 +399,7 @@ def test_compact_cli_execute_does_not_call_dry_run_planner(monkeypatch, capsys) 
         "plan_sqlite_compaction",
         lambda _url: (_ for _ in ()).throw(AssertionError("dry-run planner called")),
     )
+
     def execute_mock(database_url: str, *, confirm_stopped: bool):
         execute_calls.append((database_url, confirm_stopped))
         return outcome

@@ -19,7 +19,9 @@ integrity check or create files, and rejects non-empty WAL/hot-journal state.
 
 `--execute` requires `--confirm-stopped`. The tool also acquires an exclusive
 compaction lock file, performs a zero-busy WAL checkpoint, and rejects an
-observed external `data_version` change. These checks supplement but do not
+observed external `data_version` change. After output verification, an
+exclusive SQLite transaction blocks writers through the final validation,
+sidecar handling, and replacement window. These checks supplement but do not
 replace the operator's responsibility to stop every replica.
 
 ### D3. Build and verify before replacement
