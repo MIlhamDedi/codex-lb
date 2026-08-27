@@ -15,15 +15,18 @@ running in a fixed order. Lease release is performed by the production helpers
 ``WorkAdmissionController`` gate, so the checker observes product behavior
 rather than a re-implementation of it.
 
-The canary at the bottom runs the same checker against a toy turn with a
-planted double-release-on-cancel bug and asserts that the checker rejects it.
-A checker that cannot catch a planted bug proves nothing.
+After settlement, retry requests run through the production pre-created retry
+operation against the same pending-owner deque. The canaries at the bottom
+plant double-release-on-cancel and post-settlement retry-reacquisition bugs and
+assert that the checker rejects both. A checker that cannot catch a planted bug
+proves nothing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import random
+from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Literal, Protocol, cast
@@ -74,10 +77,11 @@ class _BridgeTurn(Protocol):
 @dataclass(frozen=True, slots=True)
 class _TurnSnapshot:
     terminal_outcomes: tuple[Terminal, ...]
+    terminal_attempts: tuple[Terminal, ...]
     response_create_releases: int
     api_key_releases: int
     account_releases: int
-    retry_terminal_events: tuple[Terminal, ...]
+    retry_results: tuple[bool, ...]
     admission_waiters: int
     admission_waiters_admitted: int
 
@@ -106,13 +110,39 @@ class _RecordingProxyService(proxy_service.ProxyService):
     bound method onto an instance.
     """
 
-    def __init__(self, repo_factory: Any, *, clock: VirtualClock, scheduler: VirtualScheduler) -> None:
+    def __init__(
+        self,
+        repo_factory: Any,
+        *,
+        clock: VirtualClock,
+        scheduler: VirtualScheduler,
+        work_admission: WorkAdmissionController,
+    ) -> None:
         super().__init__(repo_factory, clock=clock, scheduler=scheduler)
         self.api_key_releases = 0
+        self._retry_work_admission = work_admission
 
     async def _release_websocket_reservation(self, reservation: ApiKeyUsageReservationData | None) -> None:
         if reservation is not None:
             self.api_key_releases += 1
+
+    async def _reconnect_http_bridge_session(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _release_retry_account_lease(self, _lease: object) -> None:
+        return None
+
+    def _get_work_admission(self) -> WorkAdmissionController:
+        return self._retry_work_admission
+
+    def _http_bridge_text_with_account_installation_id(
+        self,
+        session: Any,
+        request_state: Any,
+        text_data: str,
+    ) -> str:
+        del session, request_state
+        return text_data
 
 
 class _ProductionBridgeTurn:
@@ -121,16 +151,12 @@ class _ProductionBridgeTurn:
     def __init__(self, scheduler: VirtualScheduler) -> None:
         self.scheduler = scheduler
         self.terminal_outcomes: list[Terminal] = []
-        self.retry_terminal_events: list[Terminal] = []
+        self.terminal_attempts: list[Terminal] = []
+        self.retry_results: list[bool] = []
         self.account_releases = 0
         self.admission_waiters = 0
         self.admission_waiters_admitted = 0
-        self._retry_attached = False
-        self.service = _RecordingProxyService(
-            cast(Any, SimpleNamespace()),
-            clock=scheduler.clock,
-            scheduler=scheduler,
-        )
+        self._settled = asyncio.Event()
         # A single response-create permit: this turn holds it, so an admission
         # wait can only be admitted once the terminal path hands it back.
         self.admission = WorkAdmissionController(
@@ -141,8 +167,15 @@ class _ProductionBridgeTurn:
             admission_wait_timeout_seconds=_ADMISSION_TIMEOUT_SECONDS,
             scheduler=scheduler,
         )
+        self.service = _RecordingProxyService(
+            cast(Any, SimpleNamespace()),
+            clock=scheduler.clock,
+            scheduler=scheduler,
+            work_admission=self.admission,
+        )
         self.response_create_gate = asyncio.Semaphore(0)
         self.admission_lease: _CountingAdmissionLease | None = None
+        self.retry_sends = 0
         self.request_state = proxy_service._WebSocketRequestState(
             request_id="req-property",
             model="gpt-5.5",
@@ -159,6 +192,25 @@ class _ProductionBridgeTurn:
             event_queue=asyncio.Queue(),
             transport="http",
             skip_request_log=True,
+            request_text='{"type":"response.create","model":"gpt-5.5","input":[]}',
+            bridge_request_deadline=1_000_000_000_000.0,
+        )
+        # Terminal bookkeeping owns a request by removing it from the pending
+        # deque under this lock. The production pre-created retry path checks
+        # the same ownership before it can reconnect or reacquire admission.
+        self.session = SimpleNamespace(
+            key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "property-retry", None),
+            pending_requests=deque([self.request_state]),
+            pending_lock=asyncio.Lock(),
+            account=SimpleNamespace(id="account-property-retry"),
+            headers={},
+            request_model="gpt-5.5",
+            upstream_turn_state=None,
+            downstream_turn_state=None,
+            last_upstream_close_code=None,
+            last_upstream_close_generation=0,
+            upstream_reader_wakeup=asyncio.Event(),
+            upstream=SimpleNamespace(send_text=self._record_retry_send),
         )
 
     async def start(self) -> None:
@@ -183,6 +235,9 @@ class _ProductionBridgeTurn:
         assert lease == "account-create-lease"
         self.account_releases += 1
 
+    async def _record_retry_send(self, _text: str) -> None:
+        self.retry_sends += 1
+
     async def dispatch(self, event: ScheduleEvent, delay: float) -> None:
         await self.scheduler.sleep(delay)
         await self.handle(event)
@@ -192,9 +247,26 @@ class _ProductionBridgeTurn:
             await self._wait_for_admission()
             return
         if event == "retry_request":
-            self._retry_attached = True
+            await self._retry_after_settlement()
             return
         await self._settle(event)
+
+    async def _retry_after_settlement(self) -> None:
+        """Drive the real retry owner check after terminal cleanup.
+
+        A retry may be requested before or during terminal bookkeeping, so it
+        waits for that bookkeeping to finish. The production retry operation
+        must then reject the request because terminal ownership removed it from
+        ``pending_requests``; reaching reconnect or admission reacquisition
+        would return ``True`` and violate the property.
+        """
+
+        await self._settled.wait()
+        retried = await self.service._retry_http_bridge_precreated_request(
+            cast(Any, self.session),
+            request_state=self.request_state,
+        )
+        self.retry_results.append(retried)
 
     async def _wait_for_admission(self) -> None:
         """A queued request contending for the permit this turn still holds.
@@ -210,36 +282,41 @@ class _ProductionBridgeTurn:
         lease.release()
 
     async def _settle(self, terminal: Terminal) -> None:
-        if not self._claim_terminal(terminal):
+        if not await self._claim_terminal(terminal):
             return
-        await _release_websocket_response_create_ownership_for_cleanup(
-            self.request_state,
-            self.response_create_gate,
-        )
-        await self.service._release_websocket_request_state_reservation(self.request_state)
+        try:
+            await _release_websocket_response_create_ownership_for_cleanup(
+                self.request_state,
+                self.response_create_gate,
+            )
+            await self.service._release_websocket_request_state_reservation(self.request_state)
+        finally:
+            self._settled.set()
 
-    def _claim_terminal(self, terminal: Terminal) -> bool:
-        if self.request_state.terminal_settlement_phase is not None or self.terminal_outcomes:
-            return False
-        self.request_state.terminal_settlement_phase = "claimed"
-        self._record_settled(terminal)
-        return True
-
-    def _record_settled(self, terminal: Terminal) -> None:
-        if self.terminal_outcomes and self._retry_attached:
-            # A retry attached and a later terminal still settled the request a
-            # second time - the exact shape the invariant forbids.
-            self.retry_terminal_events.append(terminal)
-        self.terminal_outcomes.append(terminal)
+    async def _claim_terminal(self, terminal: Terminal) -> bool:
+        # Record attempts before the claim guard so losing terminal tasks stay
+        # visible to the schedule oracle instead of disappearing as no-ops.
+        self.terminal_attempts.append(terminal)
+        async with self.session.pending_lock:
+            if (
+                self.request_state.terminal_settlement_phase is not None
+                or self.request_state not in self.session.pending_requests
+            ):
+                return False
+            self.session.pending_requests.remove(self.request_state)
+            self.request_state.terminal_settlement_phase = "claimed"
+            self.terminal_outcomes.append(terminal)
+            return True
 
     def snapshot(self) -> _TurnSnapshot:
         lease = self.admission_lease
         return _TurnSnapshot(
             terminal_outcomes=tuple(self.terminal_outcomes),
+            terminal_attempts=tuple(self.terminal_attempts),
             response_create_releases=0 if lease is None else lease.release_count,
             api_key_releases=self.service.api_key_releases,
             account_releases=self.account_releases,
-            retry_terminal_events=tuple(self.retry_terminal_events),
+            retry_results=tuple(self.retry_results),
             admission_waiters=self.admission_waiters,
             admission_waiters_admitted=self.admission_waiters_admitted,
         )
@@ -267,6 +344,41 @@ class _DoubleReleaseOnCancelBridgeTurn(_ProductionBridgeTurn):
         await super()._settle(terminal)
 
 
+class _RetryReacquiresAfterSettlementBridgeTurn(_ProductionBridgeTurn):
+    """Toy turn carrying a post-settlement retry ownership bug.
+
+    It plants stale pending ownership after terminal cleanup, then drives the
+    production retry operation through reconnect, admission reacquisition,
+    upstream send and cleanup. The old checker missed this exact behavior
+    because ``retry_request`` only toggled a flag.
+    """
+
+    def __init__(self, scheduler: VirtualScheduler) -> None:
+        super().__init__(scheduler)
+        self._retry_canary_lock = asyncio.Lock()
+
+    async def _retry_after_settlement(self) -> None:
+        async with self._retry_canary_lock:
+            await self._settled.wait()
+            if any(self.retry_results):
+                self.retry_results.append(False)
+                return
+            self.session.pending_requests.append(self.request_state)
+            self.request_state.awaiting_response_created = True
+            self.request_state.event_queue = asyncio.Queue()
+            self.request_state.replay_count = 0
+            self.request_state.response_create_admission_reacquire_required = True
+            self.request_state.account_response_create_lease = cast(Any, "retry-account-create-lease")
+            self.request_state.account_response_create_release = self.service._release_retry_account_lease
+            await super()._retry_after_settlement()
+            if self.retry_results[-1]:
+                assert self.retry_sends > 0
+                await _release_websocket_response_create_ownership_for_cleanup(
+                    self.request_state,
+                    self.response_create_gate,
+                )
+
+
 def _schedule_for_seed(seed: int) -> Schedule:
     """Build one deterministic schedule.
 
@@ -286,11 +398,15 @@ def _schedule_for_seed(seed: int) -> Schedule:
 def _assert_bridge_turn_invariants(turn: _BridgeTurn, *, seed: int, schedule: Schedule) -> None:
     snapshot = turn.snapshot()
     context = f"seed={seed} schedule={schedule} snapshot={snapshot}"
+    expected_terminal_attempts = sum(event in {"upstream_terminal", "downstream_cancel"} for event, _delay in schedule)
+    expected_retry_attempts = sum(event == "retry_request" for event, _delay in schedule)
     assert len(snapshot.terminal_outcomes) == 1, context
+    assert len(snapshot.terminal_attempts) == expected_terminal_attempts, context
     assert snapshot.response_create_releases == 1, context
     assert snapshot.api_key_releases == 1, context
     assert snapshot.account_releases == 1, context
-    assert not snapshot.retry_terminal_events, context
+    assert len(snapshot.retry_results) == expected_retry_attempts, context
+    assert not any(snapshot.retry_results), context
     # Liveness: the permit really went back to the real admission gate, so the
     # release counters above cannot be satisfied by never releasing at all.
     assert snapshot.admission_waiters_admitted == snapshot.admission_waiters, context
@@ -349,3 +465,9 @@ async def test_bridge_turn_lifecycle_schedule_set_is_large_and_varied() -> None:
 async def test_bridge_turn_lifecycle_checker_catches_double_release_canary() -> None:
     with pytest.raises(AssertionError, match="response_create_releases"):
         await _check_schedules(_DoubleReleaseOnCancelBridgeTurn)
+
+
+@pytest.mark.asyncio
+async def test_bridge_turn_lifecycle_checker_catches_retry_reacquisition_canary() -> None:
+    with pytest.raises(AssertionError, match="retry_results"):
+        await _check_schedules(_RetryReacquiresAfterSettlementBridgeTurn)
