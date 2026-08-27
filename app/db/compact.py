@@ -68,6 +68,12 @@ class _FileMetadata(Protocol):
     @property
     def st_gid(self) -> int: ...
 
+    @property
+    def st_dev(self) -> int: ...
+
+    @property
+    def st_ino(self) -> int: ...
+
 
 def _resolve_source(database_url: str) -> Path:
     source = sqlite_db_path_from_url(database_url)
@@ -154,7 +160,9 @@ def _next_sibling(source: Path, *, label: str, timestamp: str) -> Path:
     suffix = source.suffix or ".db"
     candidate = source.with_name(f"{source.stem}.{label}-{timestamp}{suffix}")
     sequence = 1
-    while os.path.lexists(candidate):
+    while any(
+        os.path.lexists(Path(f"{candidate}{sidecar_suffix}")) for sidecar_suffix in ("", "-wal", "-shm", "-journal")
+    ):
         candidate = source.with_name(f"{source.stem}.{label}-{timestamp}-{sequence}{suffix}")
         sequence += 1
     return candidate
@@ -242,7 +250,7 @@ def _backup_sidecars(source: Path, backup: Path) -> list[tuple[Path, Path]]:
             target = Path(f"{backup}{suffix}")
             _replace_path(sidecar, target)
             moved.append((sidecar, target))
-    except Exception:
+    except BaseException:
         _restore_sidecars(moved)
         raise
     return moved
@@ -298,6 +306,7 @@ def execute_sqlite_compaction(
         shutil.rmtree(temporary_directory)
         raise
     original_source_stat = source.stat()
+    original_source_identity = (original_source_stat.st_dev, original_source_stat.st_ino)
     backup_created = False
     replacement_installed = False
     completed = False
@@ -347,6 +356,8 @@ def execute_sqlite_compaction(
             if _data_version(source_connection) != data_version:
                 raise RuntimeError("source database changed during compaction; keep the application stopped")
             source_stat = source.stat()
+            if (source_stat.st_dev, source_stat.st_ino) != original_source_identity:
+                raise RuntimeError("source path changed during compaction")
             source_signature = (
                 source_stat.st_dev,
                 source_stat.st_ino,
@@ -374,13 +385,16 @@ def execute_sqlite_compaction(
             _fsync_directory(source.parent)
             try:
                 moved_sidecars = _backup_sidecars(source, backup)
-                _replace_path(temporary, source)
-                replacement_installed = True
-            except Exception:
-                _restore_sidecars(moved_sidecars)
-                if backup_created:
-                    backup.unlink(missing_ok=True)
-                    backup_created = False
+                try:
+                    _replace_path(temporary, source)
+                finally:
+                    replacement_installed = not temporary.exists()
+            except BaseException:
+                if not replacement_installed:
+                    _restore_sidecars(moved_sidecars)
+                    if backup_created:
+                        backup.unlink(missing_ok=True)
+                        backup_created = False
                 raise
             _fsync_file(source)
             _fsync_directory(source.parent)

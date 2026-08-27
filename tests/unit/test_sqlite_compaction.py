@@ -146,6 +146,17 @@ def test_compaction_backup_name_skips_dangling_symlink(tmp_path: Path) -> None:
     assert candidate.name == "store.pre-compact-20260827T000000Z-1.db"
 
 
+def test_compaction_backup_name_skips_existing_sidecars(tmp_path: Path) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    sidecar = tmp_path / "store.pre-compact-20260827T000000Z.db-wal"
+    sidecar.write_bytes(b"retained-wal")
+
+    candidate = compact._next_sibling(source, label="pre-compact", timestamp="20260827T000000Z")
+
+    assert candidate.name == "store.pre-compact-20260827T000000Z-1.db"
+
+
 def test_compaction_dry_run_rejects_nonempty_wal_without_touching_it(tmp_path: Path) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)
@@ -324,6 +335,28 @@ def test_compaction_rejects_external_write_and_corrupt_output(tmp_path: Path, mo
     assert list(tmp_path.glob("*.pre-compact-*")) == []
 
 
+def test_compaction_rejects_source_path_replacement_during_compaction(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    replacement = tmp_path / "replacement.db"
+    _create_fragmented_database(source)
+    _create_fragmented_database(replacement)
+    real_integrity_check = compact.check_sqlite_integrity
+
+    def replace_source_before_final_validation(path: Path, *, mode: SqliteIntegrityCheckMode):
+        result = real_integrity_check(path, mode=mode)
+        if ".compact-" in str(path):
+            replacement.replace(source)
+        return result
+
+    monkeypatch.setattr(compact, "check_sqlite_integrity", replace_source_before_final_validation)
+
+    with pytest.raises(RuntimeError, match="source path changed during compaction"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.exists()
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+
+
 def test_compaction_blocks_concurrent_writer_before_replacement(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "store.db"
     _create_fragmented_database(source)
@@ -368,6 +401,56 @@ def test_compaction_restores_source_when_install_rename_fails(tmp_path: Path, mo
 
     assert source.exists()
     assert _remaining_rows(source) == 100
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_restores_sidecars_when_installation_is_interrupted(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    journal = Path(f"{source}-journal")
+    real_replace = compact._replace_path
+
+    def move_sidecar_before_install(_source: Path, backup: Path) -> list[tuple[Path, Path]]:
+        journal.write_bytes(b"persistent-journal")
+        backup_journal = Path(f"{backup}-journal")
+        real_replace(journal, backup_journal)
+        return [(journal, backup_journal)]
+
+    def interrupt_compacted_install(candidate: Path, target: Path) -> None:
+        if ".compact-" in str(candidate) and target == source:
+            raise KeyboardInterrupt
+        real_replace(candidate, target)
+
+    monkeypatch.setattr(compact, "_replace_path", interrupt_compacted_install)
+    monkeypatch.setattr(compact, "_backup_sidecars", move_sidecar_before_install)
+
+    with pytest.raises(KeyboardInterrupt):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.exists()
+    assert journal.read_bytes() == b"persistent-journal"
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_restores_source_when_interrupted_after_installation(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    before = source.read_bytes()
+    real_replace = compact._replace_path
+
+    def interrupt_after_compacted_install(candidate: Path, target: Path) -> None:
+        real_replace(candidate, target)
+        if ".compact-" in str(candidate) and target == source:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(compact, "_replace_path", interrupt_after_compacted_install)
+
+    with pytest.raises(KeyboardInterrupt):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.read_bytes() == before
     assert list(tmp_path.glob("*.pre-compact-*")) == []
     assert not Path(f"{source}.compact.lock").exists()
 

@@ -42,9 +42,12 @@ Close every SQLite connection before filesystem replacement. Hard-link the
 source to a unique `pre-compact` backup, fsync the directory, then atomically
 replace the source path with the verified temporary file. Preserve source
 mode/uid/gid and fsync the file and directory. If installation or its durability
-checks fail, restore the original. Preserve any stopped-instance sidecar files
-under backup names rather than deleting them. Reject execution on platforms
-where directory-entry durability cannot be enforced.
+checks fail, or is interrupted, restore the original. Preserve any
+stopped-instance sidecar files under backup names rather than deleting them;
+choose the backup name only when its base and sidecar paths are all unused.
+Record the source inode before compaction and reject a path replacement before
+installing the output. Reject execution on platforms where directory-entry
+durability cannot be enforced.
 
 ## Risks / Trade-offs
 

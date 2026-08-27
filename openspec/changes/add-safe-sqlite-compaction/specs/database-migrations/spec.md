@@ -35,6 +35,10 @@ uid, and gid immediately after creation before longer verification begins.
 Before the final source validation, it MUST acquire an exclusive SQLite write
 lock and hold it through sidecar handling and replacement, so a concurrent
 writer cannot commit into the validation-and-replacement window.
+It MUST reject replacement of the source path with a different inode while
+compaction is running, reserve a backup name only when its main and sidecar
+paths are unused, and restore the original database and sidecars if
+installation is interrupted.
 The original MUST be durably linked at the backup path before the verified
 temporary database atomically replaces the live source path, so the live path
 is never absent between two rename operations. The temporary database MUST be
@@ -63,6 +67,12 @@ cannot be enforced.
 - **GIVEN** a verified temporary database and preserved original backup
 - **WHEN** moving the temporary database into the source path fails
 - **THEN** the tool restores the original source before returning failure
+
+#### Scenario: Interrupted replacement restores sidecars
+
+- **GIVEN** one or more stopped-instance sidecars were moved beside the backup
+- **WHEN** replacement is interrupted
+- **THEN** the original source and sidecars are restored before the interruption propagates
 
 ### Requirement: Compaction preserves stopped-instance sidecars
 
