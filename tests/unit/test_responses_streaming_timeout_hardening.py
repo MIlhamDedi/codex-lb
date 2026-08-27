@@ -226,7 +226,6 @@ async def test_capacity_recovery_ready_preserves_first_item_probe() -> None:
 
     async def mark_capacity_ready() -> None:
         await scheduler.sleep(0.02)
-        capacity_wait_event.clear()
         capacity_ready_event.set()
 
     scheduler.create_task(mark_capacity_ready())
@@ -246,9 +245,45 @@ async def test_capacity_recovery_ready_preserves_first_item_probe() -> None:
     assert probe_task.done() is False
     await scheduler.advance(0.01)
     assert capacity_ready_event.set_at == clock.monotonic()
+    assert capacity_wait_event.is_set() is False
     await scheduler.advance(0.01)
 
     assert await probe_task is True
+    await scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+async def test_capacity_recovery_ready_starts_post_ready_timeout() -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    first_task = scheduler.create_task(scheduler.sleep(3.0, result="response.created"))
+    capacity_wait_event = asyncio.Event()
+    capacity_wait_event.set()
+    capacity_ready_event = proxy_api._CapacityStartupReadyEvent(clock=clock)
+
+    async def mark_capacity_ready() -> None:
+        await scheduler.sleep(0.02)
+        capacity_ready_event.set()
+
+    scheduler.create_task(mark_capacity_ready())
+    probe_task = scheduler.create_task(
+        proxy_api._wait_for_first_stream_probe(
+            first_task,
+            timeout_seconds=0.01,
+            capacity_wait_event=capacity_wait_event,
+            capacity_ready_event=capacity_ready_event,
+            scheduler=scheduler,
+            clock=clock,
+        )
+    )
+
+    await scheduler.drain()
+    await scheduler.advance(0.01)
+    await scheduler.advance(0.01)
+    assert capacity_wait_event.is_set() is False
+    await scheduler.advance(0.01)
+
+    assert await probe_task is False
     await scheduler.cancel_owned_tasks()
 
 

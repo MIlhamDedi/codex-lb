@@ -6980,6 +6980,8 @@ async def _wait_for_first_stream_probe(
                         )
                         if first_task not in recovery_done and signal_timeout_task in recovery_done:
                             return False
+                        if recovery_ready_task is not None and recovery_ready_task in recovery_done:
+                            capacity_wait_event.clear()
                     finally:
                         if recovery_ready_task is not None and not recovery_ready_task.done():
                             recovery_ready_task.cancel()
