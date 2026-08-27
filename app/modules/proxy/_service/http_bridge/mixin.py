@@ -1527,9 +1527,6 @@ class _HTTPBridgeMixin(
                     "deferred_account_backoff_lifecycle": deferred_account_backoff_lifecycle,
                     "defer_account_health_writes": defer_account_health_writes,
                 }
-                durable_owner = getattr(durable_lookup, "owner_instance_id", None)
-                if existing is None and durable_owner == settings.http_responses_session_bridge_instance_id:
-                    force_durable_takeover = True  # Fence late writes from the prior local owner.
                 try:
                     create_signature = inspect.signature(create_session)
                 except (TypeError, ValueError):
