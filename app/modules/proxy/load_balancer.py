@@ -1673,6 +1673,7 @@ class LoadBalancer:
         allow_usage_exhaustion_error: bool = True,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
+        now: float | None = None,
     ) -> _StickySelectionOutcome:
         return await _run_select_with_stickiness(
             states=states,
@@ -1698,7 +1699,7 @@ class LoadBalancer:
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
             usage_exhaustion_states=usage_exhaustion_states,
             sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
-            now=self._clock.time(),
+            now=self._clock.time() if now is None else now,
         )
 
     _persist_sticky_mutation = staticmethod(_persist_sticky_mutation)

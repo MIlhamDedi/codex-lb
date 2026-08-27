@@ -1530,6 +1530,7 @@ def test_bypass_routing_strategies_do_not_require_probe_reservations(routing_str
         states[1],
         routing_strategy=routing_strategy,
         traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        now=0.0,
     )
 
 
@@ -1556,6 +1557,7 @@ def test_blocked_healthy_tier_peer_does_not_suppress_recovery_probe() -> None:
         load_balancer_module._filter_recovery_probe_candidates(
             states,
             traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+            now=float(now_epoch),
         )
         == states
     )
@@ -1564,7 +1566,31 @@ def test_blocked_healthy_tier_peer_does_not_suppress_recovery_probe() -> None:
         due_probe,
         routing_strategy="usage_weighted",
         traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        now=float(now_epoch),
     )
+
+
+def test_recovery_probe_filter_uses_injected_selection_time() -> None:
+    clock = VirtualClock(epoch_value=2_000_000_000.0)
+    recovered_healthy = AccountState(
+        "recovered-healthy",
+        AccountStatus.RATE_LIMITED,
+        used_percent=100.0,
+        reset_at=clock.time() - 1.0,
+        health_tier=HEALTH_TIER_HEALTHY,
+    )
+    due_probe = AccountState(
+        "due-probe",
+        AccountStatus.ACTIVE,
+        used_percent=10.0,
+        health_tier=HEALTH_TIER_PROBING,
+    )
+
+    assert load_balancer_module._filter_recovery_probe_candidates(
+        [recovered_healthy, due_probe],
+        traffic_class=load_balancer_module.TRAFFIC_CLASS_FOREGROUND,
+        now=clock.time(),
+    ) == [recovered_healthy]
 
 
 @pytest.mark.asyncio

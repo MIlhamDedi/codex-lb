@@ -63,7 +63,7 @@ from app.core.clients.proxy_websocket import (
     filter_inbound_websocket_headers,
     is_account_neutral_websocket_error_code,
 )
-from app.core.clock import scheduler_for
+from app.core.clock import Scheduler, scheduler_for
 from app.core.errors import (
     OpenAIErrorEnvelope,
     openai_error,
@@ -882,6 +882,7 @@ async def _await_owned_websocket_task_after_reader_cancellation(
     task: asyncio.Task[Any],
     *,
     failure_message: str,
+    scheduler: Scheduler,
 ) -> None:
     """Observe owned child completion without replacing reader cancellation."""
 
@@ -889,10 +890,12 @@ async def _await_owned_websocket_task_after_reader_cancellation(
     timeout_seconds = _facade()._TASK_CANCEL_TIMEOUT_SECONDS if remaining is None else max(float(remaining), 0.0)
 
     try:
-        done, _ = await asyncio.wait(
-            {task},
+        done, _ = await scheduler.wait_for(
+            asyncio.wait({task}),
             timeout=timeout_seconds,
         )
+    except TimeoutError:
+        return
     except asyncio.CancelledError:
         raise
     if not done:
@@ -2961,7 +2964,8 @@ class _WebSocketMixin:
                     )
                 cleanup_phase = "complete"
 
-            cleanup_task = scheduler_for(proxy).create_task(
+            scheduler = scheduler_for(proxy)
+            cleanup_task = scheduler.create_task(
                 finalize_websocket_scope(),
                 name="proxy-websocket-finalization-scope-cleanup",
             )
@@ -2978,10 +2982,13 @@ class _WebSocketMixin:
                     )
 
             cleanup_task.add_done_callback(log_scope_cleanup_failure)
-            done, _ = await asyncio.wait(
-                {cleanup_task},
-                timeout=max(float(cleanup_timeout), 0.0),
-            )
+            try:
+                done, _ = await scheduler.wait_for(
+                    asyncio.wait({cleanup_task}),
+                    timeout=max(float(cleanup_timeout), 0.0),
+                )
+            except TimeoutError:
+                done = set()
             if not done:
                 _facade().logger.warning(
                     "Websocket scope cleanup exceeded its cleanup budget "
@@ -4985,6 +4992,7 @@ class _WebSocketMixin:
                             await _await_owned_websocket_task_after_reader_cancellation(
                                 terminal_task,
                                 failure_message="Websocket terminal task failed during reader cancellation",
+                                scheduler=scheduler_for(proxy),
                             )
                             raise
                     finally:
@@ -5059,6 +5067,7 @@ class _WebSocketMixin:
                         await _await_owned_websocket_task_after_reader_cancellation(
                             terminal_task,
                             failure_message="Websocket transport-end task failed during reader cancellation",
+                            scheduler=scheduler_for(proxy),
                         )
                         raise
                 finally:
@@ -6426,7 +6435,8 @@ class _WebSocketMixin:
             remaining = list(pending_requests)
             pending_requests.clear()
             if remaining:
-                finalization_task = scheduler_for(proxy).create_task(
+                scheduler = scheduler_for(proxy)
+                finalization_task = scheduler.create_task(
                     self._finalize_claimed_websocket_requests(
                         account=account,
                         account_id_value=account_id_value,
@@ -6466,7 +6476,10 @@ class _WebSocketMixin:
             if not finalization_task.done() and timeout_seconds > 0:
                 # Do not cancel the child at the bound: it is the sole owner of
                 # the claimed states and remains visible to lifespan draining.
-                await asyncio.wait({finalization_task}, timeout=timeout_seconds)
+                try:
+                    await scheduler.wait_for(asyncio.wait({finalization_task}), timeout=timeout_seconds)
+                except TimeoutError:
+                    pass
             raise
         return settlement_succeeded
 

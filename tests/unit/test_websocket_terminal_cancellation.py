@@ -1376,6 +1376,8 @@ async def test_terminal_message_cancellation_is_bounded_by_shared_deadline(
 async def test_terminal_message_cancellation_without_drain_leaves_owned_task_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
     child_cancelled = asyncio.Event()
     release_child = asyncio.Event()
 
@@ -1387,12 +1389,19 @@ async def test_terminal_message_cancellation_without_drain_leaves_owned_task_run
             raise
 
     monkeypatch.setattr(proxy_service, "_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
-    child = asyncio.create_task(owned_child())
+    child = scheduler.create_task(owned_child())
 
-    await websocket_mixin._await_owned_websocket_task_after_reader_cancellation(
-        child,
-        failure_message="test child failure",
+    waiter = scheduler.create_task(
+        websocket_mixin._await_owned_websocket_task_after_reader_cancellation(
+            child,
+            failure_message="test child failure",
+            scheduler=scheduler,
+        )
     )
+    await scheduler.drain()
+    assert not waiter.done()
+    await scheduler.advance(0.01)
+    await waiter
 
     assert child_cancelled.is_set() is False
     assert child.done() is False

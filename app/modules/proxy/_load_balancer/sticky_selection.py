@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -198,6 +197,7 @@ class StickySelectionOwner(Protocol):
         allow_usage_exhaustion_error: bool = True,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
+        now: float,
     ) -> _StickySelectionOutcome: ...
 
     async def release_account_lease(self, lease: AccountLease | None) -> None: ...
@@ -417,6 +417,7 @@ async def run_sticky_selection_path(
                 # not the raw legacy owner that now shadows it.
                 sticky_refresh_skip_deadline = None
         async with owner._runtime_lock:
+            selection_now = owner._clock.time()
             states, account_map = owner._prepare_sticky_selection_states(
                 selection_inputs,
                 required_account_id=required_account_id,
@@ -439,7 +440,7 @@ async def run_sticky_selection_path(
                 else build_routing_costs(
                     settings=selection_inputs.quota_planner_settings,
                     states=states,
-                    now=datetime.fromtimestamp(owner._clock.time(), timezone.utc),
+                    now=datetime.fromtimestamp(selection_now, timezone.utc),
                 )
             )
             # Key shape is deliberately irrelevant here. Only typed
@@ -543,6 +544,7 @@ async def run_sticky_selection_path(
                 selection_states = _filter_recovery_probe_candidates(
                     selection_states,
                     traffic_class=traffic_class,
+                    now=selection_now,
                 )
             probe_reservation: ProbeReservation | None = None
         # Raw sticky rows are global, while account-assigned API keys and
@@ -690,6 +692,7 @@ async def run_sticky_selection_path(
                         allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                         usage_exhaustion_states=states,
                         sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
+                        now=selection_now,
                     )
                     result = sticky_outcome.selection
                     if (
@@ -732,6 +735,7 @@ async def run_sticky_selection_path(
                 result.account,
                 routing_strategy=routing_strategy,
                 traffic_class=traffic_class,
+                now=selection_now,
             )
             if should_reserve_probe and probing_result_requires_reservation:
                 # Sticky persistence happens outside the runtime lock.
@@ -1570,20 +1574,22 @@ def _probing_result_requires_recovery_reservation(
     *,
     routing_strategy: str,
     traffic_class: TrafficClass,
+    now: float,
 ) -> bool:
     if routing_strategy in ("sequential_drain", "reset_drain", "single_account"):
         return False
     if result_account is None or result_account.health_tier != HEALTH_TIER_PROBING:
         return False
-    return _pool_has_available_healthy_account_without_backoff(states, traffic_class=traffic_class)
+    return _pool_has_available_healthy_account_without_backoff(states, traffic_class=traffic_class, now=now)
 
 
 def _filter_recovery_probe_candidates(
     states: list[AccountState],
     *,
     traffic_class: TrafficClass,
+    now: float,
 ) -> list[AccountState]:
-    if not _pool_has_available_healthy_account_without_backoff(states, traffic_class=traffic_class):
+    if not _pool_has_available_healthy_account_without_backoff(states, traffic_class=traffic_class, now=now):
         return states
     return [state for state in states if state.health_tier != HEALTH_TIER_PROBING]
 
@@ -1592,10 +1598,12 @@ def _pool_has_available_healthy_account_without_backoff(
     states: Iterable[AccountState],
     *,
     traffic_class: TrafficClass,
+    now: float,
 ) -> bool:
     return _pool_has_available_account_without_backoff(
         (state for state in states if state.health_tier == HEALTH_TIER_HEALTHY),
         traffic_class=traffic_class,
+        now=now,
     )
 
 
@@ -1603,6 +1611,7 @@ def _pool_has_available_account_without_backoff(
     states: Iterable[AccountState],
     *,
     traffic_class: TrafficClass,
+    now: float,
 ) -> bool:
     """Return whether the complete pool passes non-cap routing eligibility."""
     # ``select_account`` normalizes expired quota/cooldown fields in place;
@@ -1611,7 +1620,7 @@ def _pool_has_available_account_without_backoff(
     # opportunistic admission compares candidates with one another.
     result = select_account(
         [replace(state) for state in states],
-        now=time.time(),
+        now=now,
         routing_strategy="single_account",
         allow_backoff_fallback=False,
         traffic_class=traffic_class,
