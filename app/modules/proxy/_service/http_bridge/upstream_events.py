@@ -939,8 +939,8 @@ async def _cancel_http_bridge_reader_child(
     task: asyncio.Task[Any] | None,
     *,
     label: str,
+    scheduler_owner: Any,
     cleanup_tasks: set[asyncio.Task[None]] | None = None,
-    scheduler_owner: Any | None = None,
 ) -> bool:
     if task is None:
         return True
@@ -958,7 +958,7 @@ async def _cancel_http_bridge_reader_child(
                 task,
                 label=label,
                 cleanup_tasks=cleanup_tasks,
-                scheduler=scheduler_for(scheduler_owner) if scheduler_owner is not None else scheduler_for(task),
+                scheduler=scheduler_for(scheduler_owner),
             )
         )
     except Exception:
@@ -1431,6 +1431,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                                     receive_task,
                                     label="HTTP bridge upstream receive after missing response.created",
                                     cleanup_tasks=self._background_cleanup_tasks,
+                                    scheduler_owner=self,
                                 )
                                 if receive_task.done() and not receive_task.cancelled():
                                     # A response (or a typed receive failure)
@@ -1528,6 +1529,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                             receive_task,
                             label="HTTP bridge upstream receive after timeout",
                             cleanup_tasks=self._background_cleanup_tasks,
+                            scheduler_owner=self,
                         )
                         if not receive_cancelled:
                             raise RuntimeError("HTTP bridge upstream receive did not cancel after timeout")
@@ -1699,11 +1701,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                 wakeup_task,
                 label="HTTP bridge reader wakeup wait",
                 cleanup_tasks=self._background_cleanup_tasks,
+                scheduler_owner=self,
             )
             await _cancel_http_bridge_reader_child(
                 receive_task,
                 label="HTTP bridge upstream receive",
                 cleanup_tasks=self._background_cleanup_tasks,
+                scheduler_owner=self,
             )
             if session.upstream is relay_upstream:
                 session.closed = True

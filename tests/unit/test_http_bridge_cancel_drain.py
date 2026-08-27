@@ -166,6 +166,36 @@ async def test_cancelled_task_cleanup_is_scheduler_owned() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_reader_child_uses_owner_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+
+    async def blocked_reader() -> None:
+        await asyncio.Event().wait()
+
+    reader = scheduler.create_task(blocked_reader())
+    await scheduler.drain()
+    captured_schedulers: list[Any] = []
+
+    async def await_cancelled_task(task: asyncio.Task[Any], **kwargs: Any) -> bool:
+        captured_schedulers.append(kwargs["scheduler"])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
+    monkeypatch.setattr(http_bridge_upstream_events, "_await_cancelled_task", await_cancelled_task)
+
+    assert await http_bridge_upstream_events._cancel_http_bridge_reader_child(
+        reader,
+        label="owned-reader",
+        scheduler_owner=SimpleNamespace(_scheduler=scheduler),
+    )
+    assert captured_schedulers == [scheduler]
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_resource_close_uses_service_scheduler_for_reader_drain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
