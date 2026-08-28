@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from app.core.config.settings import get_settings
+from app.db.compact import acquire_sqlite_maintenance_lock, release_sqlite_maintenance_lock
 from app.db.sqlite_utils import IntegrityCheck, check_sqlite_integrity, sqlite_connection, sqlite_db_path_from_url
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,15 @@ def recover_sqlite_db(options: RecoveryOptions) -> RecoveryOutcome:
     _write_dump(options.output, dump)
 
     if options.replace:
-        backup = options.source.with_name(f"{options.source.name}.corrupt-{_timestamp()}")
-        options.source.replace(backup)
-        options.output.replace(options.source)
+        lock_path, lock_descriptor = acquire_sqlite_maintenance_lock(options.source)
+        try:
+            if not options.source.exists():
+                raise FileNotFoundError(f"sqlite database not found: {options.source}")
+            backup = options.source.with_name(f"{options.source.name}.corrupt-{_timestamp()}")
+            options.source.replace(backup)
+            options.output.replace(options.source)
+        finally:
+            release_sqlite_maintenance_lock(lock_path, lock_descriptor)
         return RecoveryOutcome(
             source=backup,
             output=options.source,

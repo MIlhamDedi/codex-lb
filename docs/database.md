@@ -34,6 +34,19 @@ is atomically replaced only after that backup link is durable. Keep the backup u
 codex-lb starts successfully and `codex-lb-db check` passes. The command is
 SQLite-file only; use PostgreSQL-native maintenance for PostgreSQL deployments.
 
+If post-compaction validation fails, stop every replica again, move the current
+database aside, then restore the reported backup and any preserved sidecars:
+
+```bash
+db=/var/lib/codex-lb/store.db
+backup=/var/lib/codex-lb/store.pre-compact-YYYYMMDDTHHMMSSZ.db
+mv "$db" "${db}.failed-$(date -u +%Y%m%dT%H%M%SZ)"
+mv "$backup" "$db"
+for suffix in -wal -shm -journal; do
+  [ -e "${backup}${suffix}" ] && mv "${backup}${suffix}" "${db}${suffix}"
+done
+```
+
 An interrupted process can leave `store.db.compact.lock`. Remove that file only
 after verifying that no compaction process is active and all application
 replicas remain stopped.

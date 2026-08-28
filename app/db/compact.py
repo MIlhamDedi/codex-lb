@@ -100,6 +100,14 @@ def _path_signature(path: Path) -> _PathSignature:
     )
 
 
+def _path_matches_identity(path: Path, expected_identity: tuple[int, int]) -> bool:
+    try:
+        path_stat = path.stat()
+    except FileNotFoundError:
+        return False
+    return (path_stat.st_dev, path_stat.st_ino) == expected_identity
+
+
 def _database_state_signature(source: Path) -> tuple[_PathSignature, ...]:
     return tuple(_path_signature(path) for path in (source, Path(f"{source}-wal"), Path(f"{source}-journal")))
 
@@ -135,6 +143,12 @@ def _read_plan(source: Path) -> SqliteCompactionPlan:
     source_bytes = before_signature[0].size
     free_bytes = shutil.disk_usage(source.parent).free
     required_free_bytes = 2 * source_bytes + _MIN_FREE_SPACE_RESERVE
+    if auto_vacuum != _INCREMENTAL_AUTO_VACUUM:
+        output_bytes = _incremental_auto_vacuum_output_bytes_for_pages(
+            page_size=page_size,
+            page_count=page_count,
+        )
+        required_free_bytes = source_bytes + 2 * output_bytes + _MIN_FREE_SPACE_RESERVE
     return SqliteCompactionPlan(
         source=source,
         source_bytes=source_bytes,
@@ -199,12 +213,17 @@ def _data_version(connection: sqlite3.Connection) -> int:
     return int(connection.execute("PRAGMA data_version").fetchone()[0])
 
 
-def _incremental_auto_vacuum_output_bytes(connection: sqlite3.Connection) -> int:
-    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
-    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+def _incremental_auto_vacuum_output_bytes_for_pages(*, page_size: int, page_count: int) -> int:
     pointer_map_interval = max(1, page_size // 5)
     pointer_map_pages = (page_count + pointer_map_interval - 1) // pointer_map_interval + 1
     return (page_count + pointer_map_pages) * page_size
+
+
+def _incremental_auto_vacuum_output_bytes(connection: sqlite3.Connection) -> int:
+    return _incremental_auto_vacuum_output_bytes_for_pages(
+        page_size=int(connection.execute("PRAGMA page_size").fetchone()[0]),
+        page_count=int(connection.execute("PRAGMA page_count").fetchone()[0]),
+    )
 
 
 def _sqlite_temporary_directory() -> Path:
@@ -251,6 +270,11 @@ def _link_path(source: Path, target: Path) -> None:
     os.link(source, target)
 
 
+def _reserve_path(target: Path) -> None:
+    descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(descriptor)
+
+
 def _preserve_file_metadata(path: Path, source_stat: _FileMetadata) -> None:
     source_mode = stat.S_IMODE(source_stat.st_mode)
     current_stat = path.stat()
@@ -269,16 +293,35 @@ def _preserve_file_metadata(path: Path, source_stat: _FileMetadata) -> None:
         raise RuntimeError("compacted SQLite file metadata does not match the source")
 
 
+def _restore_sidecar(source: Path, backup: Path) -> None:
+    if not backup.exists():
+        return
+    if source.exists():
+        backup.unlink()
+    else:
+        _replace_path(backup, source)
+
+
+def _move_sidecar_to_reserved_target(source: Path, target: Path, moved: list[tuple[Path, Path]]) -> None:
+    reserved = False
+    try:
+        _reserve_path(target)
+        reserved = True
+        _replace_path(source, target)
+        moved.append((source, target))
+    except BaseException:
+        if reserved:
+            _restore_sidecar(source, target)
+        raise
+
+
 def _backup_sidecars(source: Path, backup: Path) -> list[tuple[Path, Path]]:
     moved: list[tuple[Path, Path]] = []
     try:
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(f"{source}{suffix}")
-            if not sidecar.exists():
-                continue
-            target = Path(f"{backup}{suffix}")
-            _replace_path(sidecar, target)
-            moved.append((sidecar, target))
+            if sidecar.exists():
+                _move_sidecar_to_reserved_target(sidecar, Path(f"{backup}{suffix}"), moved)
     except BaseException:
         _restore_sidecars(moved)
         raise
@@ -287,8 +330,7 @@ def _backup_sidecars(source: Path, backup: Path) -> list[tuple[Path, Path]]:
 
 def _restore_sidecars(moved: list[tuple[Path, Path]]) -> None:
     for source, backup in reversed(moved):
-        if backup.exists() and not source.exists():
-            _replace_path(backup, source)
+        _restore_sidecar(source, backup)
 
 
 def _unlink_owned_lock(lock_path: Path, lock_descriptor: int) -> None:
@@ -299,6 +341,35 @@ def _unlink_owned_lock(lock_path: Path, lock_descriptor: int) -> None:
         return
     if (current_stat.st_dev, current_stat.st_ino) == (held_stat.st_dev, held_stat.st_ino):
         lock_path.unlink()
+
+
+def sqlite_maintenance_lock_path(source: Path) -> Path:
+    return source.with_name(f"{source.name}.compact.lock")
+
+
+def acquire_sqlite_maintenance_lock(source: Path) -> tuple[Path, int]:
+    lock_path = sqlite_maintenance_lock_path(source)
+    try:
+        lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise RuntimeError(f"compaction lock already exists: {lock_path}") from exc
+    try:
+        os.write(lock_descriptor, f"pid={os.getpid()}\n".encode())
+        os.fsync(lock_descriptor)
+    except BaseException:
+        try:
+            _unlink_owned_lock(lock_path, lock_descriptor)
+        finally:
+            os.close(lock_descriptor)
+        raise
+    return lock_path, lock_descriptor
+
+
+def release_sqlite_maintenance_lock(lock_path: Path, lock_descriptor: int) -> None:
+    try:
+        _unlink_owned_lock(lock_path, lock_descriptor)
+    finally:
+        os.close(lock_descriptor)
 
 
 def execute_sqlite_compaction(
@@ -322,20 +393,14 @@ def execute_sqlite_compaction(
         raise RuntimeError(f"insufficient free space for compaction: required={required_free_bytes} free={free_bytes}")
 
     timestamp = _timestamp(now)
-    backup = _next_sibling(source, label="pre-compact", timestamp=timestamp)
-    lock_path = Path(f"{source}.compact.lock")
+    backup: Path | None = None
     temporary_directory = Path(tempfile.mkdtemp(prefix=f".{source.name}.compact-", dir=source.parent))
     temporary = temporary_directory / "compacted.db"
     try:
-        lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        shutil.rmtree(temporary_directory)
-        raise RuntimeError(f"compaction lock already exists: {lock_path}") from exc
+        lock_path, lock_descriptor = acquire_sqlite_maintenance_lock(source)
     except BaseException:
         shutil.rmtree(temporary_directory)
         raise
-    original_source_stat = source.stat()
-    original_source_identity = (original_source_stat.st_dev, original_source_stat.st_ino)
     backup_created = False
     replacement_installed = False
     replacement_connection: sqlite3.Connection | None = None
@@ -344,9 +409,9 @@ def execute_sqlite_compaction(
     completed = False
     moved_sidecars: list[tuple[Path, Path]] = []
     try:
+        original_source_stat = source.stat()
+        original_source_identity = (original_source_stat.st_dev, original_source_stat.st_ino)
         source_sync_descriptor = _open_sync_descriptor(source)
-        os.write(lock_descriptor, f"pid={os.getpid()}\n".encode())
-        os.fsync(lock_descriptor)
         source_integrity = check_sqlite_integrity(source, mode=SqliteIntegrityCheckMode.QUICK)
         if not source_integrity.ok:
             raise RuntimeError(f"source SQLite quick_check failed: {source_integrity.details}")
@@ -437,15 +502,22 @@ def execute_sqlite_compaction(
             # Preserve the original inode first, then install the verified
             # output with one atomic replace. The live source path is never
             # absent, and the exclusive SQLite transaction remains held.
+            backup = _next_sibling(source, label="pre-compact", timestamp=timestamp)
             _link_path(source, backup)
             backup_created = True
+            if not _path_matches_identity(backup, original_source_identity):
+                raise RuntimeError("source path changed while creating compaction backup")
             _fsync_directory(source.parent)
             try:
                 moved_sidecars = _backup_sidecars(source, backup)
+                if not _path_matches_identity(source, original_source_identity):
+                    raise RuntimeError("source path changed before compacted replacement")
                 replacement_connection = sqlite3.connect(str(temporary))
                 replacement_connection.execute("PRAGMA busy_timeout=0")
                 replacement_connection.execute("BEGIN EXCLUSIVE")
                 try:
+                    if not _path_matches_identity(source, original_source_identity):
+                        raise RuntimeError("source path changed before compacted replacement")
                     _replace_path(temporary, source)
                 finally:
                     replacement_installed = not temporary.exists()
@@ -460,6 +532,7 @@ def execute_sqlite_compaction(
             _fsync_directory(source.parent)
             after_bytes = source.stat().st_size
         completed = True
+        assert backup is not None
         return SqliteCompactionOutcome(
             source=source,
             backup=backup,
@@ -470,37 +543,37 @@ def execute_sqlite_compaction(
     finally:
         if temporary.exists():
             temporary.unlink()
-        if not completed and replacement_installed and backup.exists():
+        if not completed and replacement_installed and backup is not None and backup.exists():
             _replace_path(backup, source)
             backup_created = False
             _restore_sidecars(moved_sidecars)
             if source_sync_descriptor is not None:
                 _fsync_descriptor(source_sync_descriptor)
             _fsync_directory(source.parent)
-        if not completed and backup_created:
+        if not completed and backup_created and backup is not None:
             backup.unlink(missing_ok=True)
         shutil.rmtree(temporary_directory)
         try:
-            _unlink_owned_lock(lock_path, lock_descriptor)
+            if replacement_connection is not None:
+                replacement_connection.close()
         finally:
             try:
-                if replacement_connection is not None:
-                    replacement_connection.close()
+                if temporary_sync_descriptor is not None:
+                    os.close(temporary_sync_descriptor)
             finally:
                 try:
-                    if temporary_sync_descriptor is not None:
-                        os.close(temporary_sync_descriptor)
+                    if source_sync_descriptor is not None:
+                        os.close(source_sync_descriptor)
                 finally:
-                    try:
-                        if source_sync_descriptor is not None:
-                            os.close(source_sync_descriptor)
-                    finally:
-                        os.close(lock_descriptor)
+                    release_sqlite_maintenance_lock(lock_path, lock_descriptor)
 
 
 __all__ = [
     "SqliteCompactionOutcome",
     "SqliteCompactionPlan",
+    "acquire_sqlite_maintenance_lock",
     "execute_sqlite_compaction",
     "plan_sqlite_compaction",
+    "release_sqlite_maintenance_lock",
+    "sqlite_maintenance_lock_path",
 ]

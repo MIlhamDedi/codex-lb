@@ -56,8 +56,33 @@ def _decode_sqlalchemy_windows_sqlite_path(path: str) -> str:
     return urllib.parse.unquote(path)
 
 
+def sqlite_url_uses_in_memory_database(url: str) -> bool:
+    """Return whether a SQLite URL selects an in-memory database."""
+
+    if not (url.startswith("sqlite+aiosqlite:") or url.startswith("sqlite:")):
+        return False
+
+    marker = ":///"
+    marker_index = url.find(marker)
+    if marker_index < 0:
+        return False
+
+    raw_path = url[marker_index + len(marker) :]
+    path, _, query = raw_path.partition("?")
+    if not path or path == ":memory:":
+        return True
+    query_values = urllib.parse.parse_qs(query, keep_blank_values=True)
+    uri_enabled = any(value.lower() in {"1", "true", "yes"} for value in query_values.get("uri", ()))
+    if not uri_enabled or not path.startswith("file:"):
+        return False
+    return path == "file::memory:" or any(value.lower() == "memory" for value in query_values.get("mode", ()))
+
+
 def sqlite_db_path_from_url(url: str) -> Path | None:
     if not (url.startswith("sqlite+aiosqlite:") or url.startswith("sqlite:")):
+        return None
+
+    if sqlite_url_uses_in_memory_database(url):
         return None
 
     marker = ":///"
@@ -84,7 +109,7 @@ def sqlite_db_path_from_url(url: str) -> Path | None:
     # as `/var/lib/codex%20lb/store.db` must remain literal.
     path = _decode_sqlalchemy_windows_sqlite_path(path)
 
-    if not path or path == ":memory:":
+    if not path:
         return None
 
     return Path(path).expanduser()

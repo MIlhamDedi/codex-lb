@@ -9,6 +9,7 @@ import pytest
 
 import app.db.compact as compact
 import app.db.migrate as migrate
+import app.db.recover as recover
 from app.db.sqlite_utils import IntegrityCheck, SqliteIntegrityCheckMode, check_sqlite_integrity
 
 pytestmark = pytest.mark.unit
@@ -49,7 +50,11 @@ def test_compaction_dry_run_reports_without_mutation(tmp_path: Path) -> None:
     assert plan.page_count > 0
     assert plan.freelist_pages > 0
     assert plan.reclaimable_bytes == plan.page_size * plan.freelist_pages
-    assert plan.required_free_bytes == 2 * plan.source_bytes + compact._MIN_FREE_SPACE_RESERVE
+    expected_output_bytes = compact._incremental_auto_vacuum_output_bytes_for_pages(
+        page_size=plan.page_size,
+        page_count=plan.page_count,
+    )
+    assert plan.required_free_bytes == plan.source_bytes + 2 * expected_output_bytes + compact._MIN_FREE_SPACE_RESERVE
     assert source.stat() == before_stat
     assert {path.name for path in tmp_path.iterdir()} == before_names
 
@@ -119,6 +124,8 @@ def test_compaction_requires_stopped_confirmation(tmp_path: Path) -> None:
     [
         ("postgresql+asyncpg://localhost/codex", "file-backed SQLite"),
         ("sqlite+aiosqlite:///:memory:", "file-backed SQLite"),
+        ("sqlite+aiosqlite:///file:shared?mode=memory&cache=shared&uri=true", "file-backed SQLite"),
+        ("sqlite+aiosqlite:///file::memory:?cache=shared&uri=true", "file-backed SQLite"),
     ],
 )
 def test_compaction_rejects_non_file_backends(database_url: str, error: str) -> None:
@@ -390,6 +397,26 @@ def test_compaction_lock_cleanup_does_not_unlink_replacement(tmp_path: Path) -> 
         compact.os.close(descriptor)
 
 
+def test_compaction_cleans_lock_when_source_stat_fails_after_lock(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    lock_path = Path(f"{source}.compact.lock")
+    real_stat = Path.stat
+
+    def fail_source_stat_after_lock(path: Path, *args, **kwargs):
+        if path == source and lock_path.exists():
+            raise FileNotFoundError("injected source removal")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_source_stat_after_lock)
+
+    with pytest.raises(FileNotFoundError, match="injected source removal"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert not lock_path.exists()
+    assert list(tmp_path.glob(".store.db.compact-*")) == []
+
+
 def test_compaction_sidecar_backup_includes_rollback_journal(tmp_path: Path) -> None:
     source = tmp_path / "store.db"
     backup = tmp_path / "store.pre-compact.db"
@@ -401,6 +428,81 @@ def test_compaction_sidecar_backup_includes_rollback_journal(tmp_path: Path) -> 
     assert moved == [(journal, Path(f"{backup}-journal"))]
     assert not journal.exists()
     assert Path(f"{backup}-journal").read_bytes() == b"persistent-journal"
+
+
+def test_compaction_sidecar_backup_restores_after_interrupted_move(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    backup = tmp_path / "store.pre-compact.db"
+    journal = Path(f"{source}-journal")
+    backup_journal = Path(f"{backup}-journal")
+    journal.write_bytes(b"persistent-journal")
+    real_replace = compact._replace_path
+
+    def move_then_interrupt(candidate: Path, target: Path) -> None:
+        real_replace(candidate, target)
+        if candidate == journal and target == backup_journal:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(compact, "_replace_path", move_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        compact._backup_sidecars(source, backup)
+
+    assert journal.read_bytes() == b"persistent-journal"
+    assert not backup_journal.exists()
+
+
+def test_compaction_sidecar_backup_refuses_late_target_collision(tmp_path: Path) -> None:
+    source = tmp_path / "store.db"
+    backup = tmp_path / "store.pre-compact.db"
+    journal = Path(f"{source}-journal")
+    backup_journal = Path(f"{backup}-journal")
+    journal.write_bytes(b"source-journal")
+    backup_journal.write_bytes(b"existing-backup-journal")
+
+    with pytest.raises(FileExistsError):
+        compact._backup_sidecars(source, backup)
+
+    assert journal.read_bytes() == b"source-journal"
+    assert backup_journal.read_bytes() == b"existing-backup-journal"
+
+
+def test_compaction_rejects_source_path_replacement_before_install(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    original = tmp_path / "original.db"
+    replacement = tmp_path / "replacement.db"
+    _create_fragmented_database(source)
+    _create_fragmented_database(replacement)
+    replacement_bytes = replacement.read_bytes()
+
+    def replace_source_during_sidecar_handling(_source: Path, _backup: Path) -> list[tuple[Path, Path]]:
+        source.replace(original)
+        replacement.replace(source)
+        return []
+
+    monkeypatch.setattr(compact, "_backup_sidecars", replace_source_during_sidecar_handling)
+
+    with pytest.raises(RuntimeError, match="source path changed before compacted replacement"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.read_bytes() == replacement_bytes
+    assert original.exists()
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_recovery_replace_respects_active_compaction_lock(tmp_path: Path) -> None:
+    source = tmp_path / "store.db"
+    output = tmp_path / "recovered.db"
+    _create_fragmented_database(source)
+    lock_path = Path(f"{source}.compact.lock")
+    lock_path.write_text("held", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="compaction lock already exists"):
+        recover.recover_sqlite_db(recover.RecoveryOptions(source=source, output=output, replace=True))
+
+    assert source.exists()
+    assert _remaining_rows(source) == 100
 
 
 def test_compaction_rejects_external_write_and_corrupt_output(tmp_path: Path, monkeypatch) -> None:
