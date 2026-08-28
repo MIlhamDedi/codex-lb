@@ -291,27 +291,11 @@ class HttpBridgeOperationEventBatcher:
         if context is None:
             return TerminalOperationEventAppendResult(persisted=False)
         if dropped:
-            try:
-                await self._durable_bridge.update_operation(
-                    operation_id=operation_id,
-                    session_id=context.session_id,
-                    instance_id=context.instance_id,
-                    owner_epoch=context.owner_epoch,
-                    state=state,
-                    response_id=response_id,
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to settle dropped terminal HTTP bridge operation_id=%s",
-                    operation_id,
-                    exc_info=True,
-                )
-            finally:
-                async with self._lock:
-                    self._closing_operations.discard(operation_id)
-                    self._contexts.pop(operation_id, None)
-                    self._dropped_operations.discard(operation_id)
-            return TerminalOperationEventAppendResult(persisted=False)
+            async with self._lock:
+                self._closing_operations.discard(operation_id)
+                self._contexts.pop(operation_id, None)
+                self._dropped_operations.discard(operation_id)
+            return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
         try:
             if self._spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
                 persisted = await self._durable_bridge.append_terminal_operation_chunk(

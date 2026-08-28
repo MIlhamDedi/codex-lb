@@ -179,7 +179,7 @@ async def test_chunk_mode_routes_batch_and_terminal_without_legacy_writes() -> N
 
 
 @pytest.mark.asyncio
-async def test_dropped_batch_is_never_marked_replayable() -> None:
+async def test_dropped_batch_requires_fenced_terminal_settlement() -> None:
     durable = _FakeDurableBridge(append_result=False)
     batcher = HttpBridgeOperationEventBatcher(
         durable,
@@ -204,9 +204,9 @@ async def test_dropped_batch_is_never_marked_replayable() -> None:
             state="failed",
         )
         assert result.persisted is False
-        assert result.settlement_required is False
+        assert result.settlement_required is True
         assert durable.finalized == []
-        assert durable.updated[0]["state"] == "failed"
+        assert durable.updated == []
         assert batcher._contexts == {}
         assert batcher._dropped_operations == set()
     finally:
