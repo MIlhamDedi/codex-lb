@@ -25851,6 +25851,47 @@ def test_slim_response_create_pairs_same_protocol_reused_call_id_by_occurrence(s
 
 
 @pytest.mark.parametrize(
+    "slimmer",
+    [
+        pytest.param(streaming_helpers_module._slim_response_create_payload_for_upstream, id="service-bridge"),
+        pytest.param(proxy_module._slim_response_create_payload_for_upstream, id="core-websocket"),
+    ],
+)
+def test_slim_response_create_orphan_output_does_not_consume_namespaced_pairing(slimmer):
+    shell_output = "shell-result:" + ("s" * (33 * 1024))
+    agent_wait_output = "agent-wait-result:" + ("a" * (33 * 1024))
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            # Orphan output: its call was trimmed from replay (e.g. session
+            # anchor trimming or a client partial resend), so it must pair
+            # with nothing rather than steal the namespaced call below.
+            {"type": "function_call_output", "call_id": "call_reused", "output": shell_output},
+            {
+                "type": "function_call",
+                "namespace": "multi_agent_v1",
+                "name": "wait_agent",
+                "call_id": "call_reused",
+                "arguments": '{"timeout_ms":120000}',
+            },
+            {"type": "function_call_output", "call_id": "call_reused", "output": agent_wait_output},
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+    }
+
+    slimmed_payload, summary = slimmer(payload, max_bytes=256)
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+
+    assert summary is not None
+    assert summary["historical_tool_outputs_slimmed"] == 1
+    assert cast(dict[str, JsonValue], slimmed_input[0])["output"] == (
+        proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(bytes=len(shell_output.encode("utf-8")))
+    )
+    assert cast(dict[str, JsonValue], slimmed_input[2])["output"] == agent_wait_output
+
+
+@pytest.mark.parametrize(
     "transport",
     [
         pytest.param(proxy_service._REQUEST_TRANSPORT_HTTP, id="http-bridge"),

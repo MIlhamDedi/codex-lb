@@ -30,10 +30,15 @@ did not protect the direct core path and used a broad pending-call type set.
   `ResponsesRequest.input` before outbound payload normalization removes replay
   namespaces, then carry only the IDs into slimming. Recent calls cannot
   protect historical outputs that reuse the same call ID.
-- Pair outputs to calls by per-protocol occurrence, mirroring the compact
-  `_COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE` pairing: the nth output for a
-  `(protocol, call_id)` key is protected only when the nth matching call is
-  namespaced, so same-protocol call-ID reuse cannot exempt unrelated outputs.
+- Pair outputs to calls with the same nearest-preceding-unmatched matcher as
+  compact's `_compact_matching_tool_call_index`: each output pairs with the
+  closest earlier unmatched call for its `(protocol, call_id)` key and is
+  protected only when that paired call is namespaced, so same-protocol
+  call-ID reuse cannot exempt unrelated outputs. This deliberately differs
+  from a purely positional nth-output/nth-call rule: an orphan output with no
+  preceding unmatched call (for example after session-anchor trimming removed
+  its call from replay) pairs with nothing, consumes no call, and stays
+  slimmable.
 - Skip slimming only for matching `function_call_output` and
   `custom_tool_call_output` items. Other output types keep their current
   treatment.

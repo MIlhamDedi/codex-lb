@@ -2822,31 +2822,39 @@ def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
 
 
 def _agent_control_tool_output_occurrences(input_items: list[JsonValue]) -> dict[tuple[str, str], tuple[bool, ...]]:
-    """Map ``(output_type, call_id)`` to per-occurrence namespaced-call flags.
+    """Map ``(output_type, call_id)`` to per-output-occurrence namespaced flags.
 
     A ``call_id`` can be reused across protocols and within one protocol, so
-    outputs pair with calls by per-protocol occurrence (mirroring
-    ``_COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE`` pairing): the nth output for a
-    key is protected only when the nth matching call is namespaced.
+    each output pairs with its nearest preceding unmatched call for the same
+    ``(protocol, call_id)`` key — the same matcher as compact's
+    ``_compact_matching_tool_call_index`` — and the nth flag records whether
+    the nth output's paired call is namespaced. An orphan output with no
+    preceding unmatched call (for example after session-anchor trimming
+    removed its call from replay) pairs with nothing, consumes no call, and
+    stays eligible for normal slimming.
     """
-    occurrence_flags: dict[tuple[str, str], list[bool]] = {}
+    unmatched_call_flags: dict[tuple[str, str], list[bool]] = {}
+    output_flags: dict[tuple[str, str], list[bool]] = {}
     for item in input_items:
         if not is_json_mapping(item):
             continue
         item_type = item.get("type")
         if not isinstance(item_type, str):
             continue
-        output_type = _AGENT_CONTROL_OUTPUT_TYPE_BY_CALL_TYPE.get(item_type)
-        if output_type is None:
-            continue
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
             continue
-        namespace = item.get("namespace")
-        occurrence_flags.setdefault((output_type, call_id), []).append(
-            isinstance(namespace, str) and namespace in _AGENT_CONTROL_TOOL_NAMESPACES
-        )
-    return {key: tuple(flags) for key, flags in occurrence_flags.items() if any(flags)}
+        call_output_type = _AGENT_CONTROL_OUTPUT_TYPE_BY_CALL_TYPE.get(item_type)
+        if call_output_type is not None:
+            namespace = item.get("namespace")
+            unmatched_call_flags.setdefault((call_output_type, call_id), []).append(
+                isinstance(namespace, str) and namespace in _AGENT_CONTROL_TOOL_NAMESPACES
+            )
+        elif item_type in _AGENT_CONTROL_OUTPUT_ITEM_TYPES:
+            key = (item_type, call_id)
+            unmatched = unmatched_call_flags.get(key)
+            output_flags.setdefault(key, []).append(unmatched.pop() if unmatched else False)
+    return {key: tuple(flags) for key, flags in output_flags.items() if any(flags)}
 
 
 def _historical_agent_control_output_occurrences(

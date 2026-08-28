@@ -12,9 +12,10 @@ the original request input before outbound payload normalization removes replay
 namespaces, and use namespace and call ID rather than the tool name alone. A
 recent namespaced call MUST NOT protect a historical output that reuses its
 call ID. When historical calls of the same protocol reuse one call ID, the
-service MUST pair outputs to calls by per-protocol occurrence: the nth
-matching output is preserved only when the nth matching call is namespaced.
-Historical outputs
+service MUST pair each output with its nearest preceding unmatched call of
+the same protocol and call ID, preserving the output only when that paired
+call is namespaced; a historical output with no such preceding call MUST
+remain eligible for the normal omission policy. Historical outputs
 without such a matching call, including an unnamespaced user tool named
 `wait_agent` or `send_input`, MUST remain eligible for the normal omission
 policy.
@@ -58,3 +59,12 @@ policy.
   namespaced pair's output unchanged
 - **AND** both paths replace the ordinary pair's output with the historical
   tool-output omission notice
+
+#### Scenario: Orphan outputs do not consume namespaced pairings
+- **WHEN** a historical `function_call_output` precedes every matching call
+  because its own call was trimmed from replay, and a later namespaced
+  `function_call` reusing the same call ID is followed by its own large
+  matching output
+- **THEN** every live slimming path replaces the orphan output with the
+  historical tool-output omission notice
+- **AND** preserves the namespaced pair's output unchanged

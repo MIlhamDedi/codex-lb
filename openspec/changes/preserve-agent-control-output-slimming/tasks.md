@@ -9,9 +9,10 @@
       strips replay namespaces, while keeping the normalized wire payload.
 - [x] 1.4 Restrict pre-normalization classification to the historical prefix so
       recent calls cannot protect historical outputs with reused IDs.
-- [x] 1.5 Pair outputs to calls by per-protocol occurrence so a namespaced
-      call cannot protect an ordinary same-protocol output that reuses its
-      call ID.
+- [x] 1.5 Pair each output with its nearest preceding unmatched same-protocol
+      call so a namespaced call cannot protect an ordinary same-protocol
+      output that reuses its call ID, and an orphan output cannot consume a
+      later namespaced call's pairing.
 
 ## 2. Regression coverage
 
@@ -26,6 +27,9 @@
 - [x] 2.4 Prove a historical namespaced call and an ordinary same-protocol
       call sharing one call ID preserve only the namespaced pair's output in
       both live slim paths and through bridge forwarding.
+- [x] 2.5 Prove an orphan historical output whose call was trimmed from
+      replay is still slimmed while a later namespaced pair reusing the same
+      call ID keeps its output, in both live slim paths.
 
 ## 3. Validation
 
