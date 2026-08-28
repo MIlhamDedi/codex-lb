@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from sqlalchemy import util as sqlalchemy_util
+
 
 @dataclass(slots=True)
 class IntegrityCheck:
@@ -56,6 +58,27 @@ def _decode_sqlalchemy_windows_sqlite_path(path: str) -> str:
     return urllib.parse.unquote(path)
 
 
+def _sqlite_uri_mode_active(query: str) -> bool:
+    values = urllib.parse.parse_qs(query.partition("#")[0], keep_blank_values=True).get("uri", ())
+    for value in values:
+        try:
+            if sqlalchemy_util.asbool(value):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _sqlite_uri_file_path(path: str) -> str | None:
+    parsed = urllib.parse.urlsplit(path)
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return None
+    resolved = urllib.parse.unquote(parsed.path)
+    if len(resolved) >= 3 and resolved[0] == "/" and resolved[1].isalpha() and resolved[2] == ":":
+        return resolved[1:]
+    return resolved
+
+
 def sqlite_url_uses_in_memory_database(url: str) -> bool:
     """Return whether a SQLite URL selects an in-memory database."""
 
@@ -71,10 +94,9 @@ def sqlite_url_uses_in_memory_database(url: str) -> bool:
     path, _, query = raw_path.partition("?")
     if not path or path == ":memory:":
         return True
-    query_values = urllib.parse.parse_qs(query, keep_blank_values=True)
-    uri_enabled = any(value.lower() in {"1", "true", "yes"} for value in query_values.get("uri", ()))
-    if not uri_enabled or not path.startswith("file:"):
+    if not _sqlite_uri_mode_active(query) or not path.startswith("file:"):
         return False
+    query_values = urllib.parse.parse_qs(query.partition("#")[0], keep_blank_values=True)
     return path == "file::memory:" or any(value.lower() == "memory" for value in query_values.get("mode", ()))
 
 
@@ -90,15 +112,15 @@ def sqlite_db_path_from_url(url: str) -> Path | None:
     if marker_index < 0:
         return None
 
-    path = url[marker_index + len(marker) :]
+    raw_path = url[marker_index + len(marker) :]
+    path, _, query = raw_path.partition("?")
     if _sqlite_path_is_raw_windows_drive(path) or _sqlite_path_is_raw_windows_unc(path):
         # Raw Windows drive and UNC paths are filesystem paths, not URL-encoded
         # forms: a `#` is a legal path character there (e.g. the decoded output
         # of `normalize_sqlite_url()`), so it must not be stripped as a URL
         # fragment separator.
-        path = path.partition("?")[0]
+        pass
     else:
-        path = path.partition("?")[0]
         path = path.partition("#")[0]
 
     # SQLAlchemy's `URL.render_as_string()` percent-encodes Windows drive and
@@ -108,6 +130,8 @@ def sqlite_db_path_from_url(url: str) -> Path | None:
     # default SQLite URL directly from `data_dir`, so a valid literal path such
     # as `/var/lib/codex%20lb/store.db` must remain literal.
     path = _decode_sqlalchemy_windows_sqlite_path(path)
+    if _sqlite_uri_mode_active(query) and path.startswith("file:"):
+        path = _sqlite_uri_file_path(path)
 
     if not path:
         return None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -136,6 +138,15 @@ def test_compaction_rejects_non_file_backends(database_url: str, error: str) -> 
 def test_compaction_rejects_missing_database(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="not found"):
         compact.plan_sqlite_compaction(_database_url(tmp_path / "missing.db"))
+
+
+def test_compaction_accepts_file_backed_sqlite_uri(tmp_path: Path) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+
+    plan = compact.plan_sqlite_compaction(f"sqlite+aiosqlite:///file:{source}?uri=true")
+
+    assert plan.source == source
 
 
 def test_compaction_rejects_symbolic_link_database_path(tmp_path: Path) -> None:
@@ -430,6 +441,24 @@ def test_compaction_sidecar_backup_includes_rollback_journal(tmp_path: Path) -> 
     assert Path(f"{backup}-journal").read_bytes() == b"persistent-journal"
 
 
+def test_compaction_sidecar_backup_moves_dangling_sidecar_link(tmp_path: Path) -> None:
+    source = tmp_path / "store.db"
+    backup = tmp_path / "store.pre-compact.db"
+    journal = Path(f"{source}-journal")
+    backup_journal = Path(f"{backup}-journal")
+    try:
+        journal.symlink_to(tmp_path / "missing-journal")
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+
+    moved = compact._backup_sidecars(source, backup)
+
+    assert moved == [(journal, backup_journal)]
+    assert not os.path.lexists(journal)
+    assert backup_journal.is_symlink()
+    assert os.readlink(backup_journal) == str(tmp_path / "missing-journal")
+
+
 def test_compaction_sidecar_backup_restores_after_interrupted_move(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "store.db"
     backup = tmp_path / "store.pre-compact.db"
@@ -529,6 +558,161 @@ def test_compaction_rejects_external_write_and_corrupt_output(tmp_path: Path, mo
         compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
     assert _remaining_rows(source) == 100
     assert list(tmp_path.glob("*.pre-compact-*")) == []
+
+
+def test_compaction_does_not_create_database_after_source_disappears(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_integrity_check = compact.check_sqlite_integrity
+
+    def remove_source_after_quick_check(path: Path, *, mode: SqliteIntegrityCheckMode):
+        result = real_integrity_check(path, mode=mode)
+        if path == source:
+            source.unlink()
+        return result
+
+    monkeypatch.setattr(compact, "check_sqlite_integrity", remove_source_after_quick_check)
+
+    with pytest.raises(RuntimeError, match="source path changed before compaction"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert not source.exists()
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_does_not_create_database_when_source_disappears_before_open(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_matches_identity = compact._path_matches_identity
+    checked_source = False
+
+    def remove_source_after_identity_check(path: Path, identity: tuple[int, int]) -> bool:
+        nonlocal checked_source
+        matches = real_matches_identity(path, identity)
+        if path == source and not checked_source:
+            checked_source = True
+            source.unlink()
+        return matches
+
+    monkeypatch.setattr(compact, "_path_matches_identity", remove_source_after_identity_check)
+
+    with pytest.raises(sqlite3.OperationalError):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert not source.exists()
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_rejects_source_swap_during_existing_open(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    original = tmp_path / "original.db"
+    replacement = tmp_path / "replacement.db"
+    displaced_replacement = tmp_path / "displaced-replacement.db"
+    _create_fragmented_database(source)
+    _create_fragmented_database(replacement)
+    real_existing_sqlite_connection = compact._existing_sqlite_connection
+
+    @contextmanager
+    def swap_source_while_opening(path: Path):
+        source.replace(original)
+        replacement.replace(source)
+        with real_existing_sqlite_connection(path) as connection:
+            source.replace(displaced_replacement)
+            original.replace(source)
+            yield connection
+
+    monkeypatch.setattr(compact, "_existing_sqlite_connection", swap_source_while_opening)
+
+    with pytest.raises(RuntimeError, match="source path changed before compaction"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.exists()
+    assert _remaining_rows(source) == 100
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_rejects_live_path_replacement_after_install(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    external = tmp_path / "external.db"
+    displaced = tmp_path / "displaced.db"
+    _create_fragmented_database(source)
+    _create_fragmented_database(external)
+    external_bytes = external.read_bytes()
+    real_fsync_directory = compact._fsync_directory
+    directory_syncs = 0
+
+    def replace_live_path_after_install(path: Path) -> None:
+        nonlocal directory_syncs
+        real_fsync_directory(path)
+        if path == source.parent:
+            directory_syncs += 1
+            if directory_syncs == 2:
+                source.replace(displaced)
+                external.replace(source)
+
+    monkeypatch.setattr(compact, "_fsync_directory", replace_live_path_after_install)
+
+    with pytest.raises(RuntimeError, match="source path changed after compacted replacement"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    backups = list(tmp_path.glob("*.pre-compact-*"))
+    assert source.read_bytes() == external_bytes
+    assert len(backups) == 1
+    assert _remaining_rows(backups[0]) == 100
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_rejects_live_symlink_to_replacement_after_install(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    displaced = tmp_path / "displaced.db"
+    _create_fragmented_database(source)
+    real_fsync_directory = compact._fsync_directory
+    directory_syncs = 0
+
+    def replace_live_path_with_symlink_after_install(path: Path) -> None:
+        nonlocal directory_syncs
+        real_fsync_directory(path)
+        if path == source.parent:
+            directory_syncs += 1
+            if directory_syncs == 2:
+                source.replace(displaced)
+                source.symlink_to(displaced)
+
+    monkeypatch.setattr(compact, "_fsync_directory", replace_live_path_with_symlink_after_install)
+
+    with pytest.raises(RuntimeError, match="source path changed after compacted replacement"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.is_symlink()
+    assert len(list(tmp_path.glob("*.pre-compact-*"))) == 1
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_restores_backup_when_live_path_disappears_after_install(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_fsync_directory = compact._fsync_directory
+    directory_syncs = 0
+
+    def remove_live_path_after_install(path: Path) -> None:
+        nonlocal directory_syncs
+        real_fsync_directory(path)
+        if path == source.parent:
+            directory_syncs += 1
+            if directory_syncs == 2:
+                source.unlink()
+
+    monkeypatch.setattr(compact, "_fsync_directory", remove_live_path_after_install)
+
+    with pytest.raises(RuntimeError, match="source path changed after compacted replacement"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert source.exists()
+    assert _remaining_rows(source) == 100
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
 
 
 def test_compaction_rejects_source_path_replacement_during_compaction(tmp_path: Path, monkeypatch) -> None:

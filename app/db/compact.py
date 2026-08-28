@@ -5,6 +5,9 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import urllib.parse
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,12 +103,23 @@ def _path_signature(path: Path) -> _PathSignature:
     )
 
 
-def _path_matches_identity(path: Path, expected_identity: tuple[int, int]) -> bool:
+def _path_stat_for_identity(path: Path, expected_identity: tuple[int, int]) -> os.stat_result | None:
     try:
-        path_stat = path.stat()
+        path_stat = path.lstat()
     except FileNotFoundError:
-        return False
-    return (path_stat.st_dev, path_stat.st_ino) == expected_identity
+        return None
+    if not stat.S_ISREG(path_stat.st_mode) or (path_stat.st_dev, path_stat.st_ino) != expected_identity:
+        return None
+    return path_stat
+
+
+def _path_matches_identity(path: Path, expected_identity: tuple[int, int]) -> bool:
+    return _path_stat_for_identity(path, expected_identity) is not None
+
+
+def _directory_signature(path: Path) -> tuple[int, int, int, int]:
+    path_stat = path.stat()
+    return (path_stat.st_dev, path_stat.st_ino, path_stat.st_mtime_ns, path_stat.st_ctime_ns)
 
 
 def _database_state_signature(source: Path) -> tuple[_PathSignature, ...]:
@@ -209,6 +223,17 @@ def _checkpoint_wal(connection: sqlite3.Connection) -> None:
         raise RuntimeError("SQLite WAL checkpoint is busy; stop every application replica")
 
 
+@contextmanager
+def _existing_sqlite_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    encoded_path = urllib.parse.quote(str(path), safe="/:")
+    connection = sqlite3.connect(f"file:{encoded_path}?mode=rw&nofollow=1", uri=True)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def _data_version(connection: sqlite3.Connection) -> int:
     return int(connection.execute("PRAGMA data_version").fetchone()[0])
 
@@ -294,9 +319,9 @@ def _preserve_file_metadata(path: Path, source_stat: _FileMetadata) -> None:
 
 
 def _restore_sidecar(source: Path, backup: Path) -> None:
-    if not backup.exists():
+    if not os.path.lexists(backup):
         return
-    if source.exists():
+    if os.path.lexists(source):
         backup.unlink()
     else:
         _replace_path(backup, source)
@@ -320,7 +345,7 @@ def _backup_sidecars(source: Path, backup: Path) -> list[tuple[Path, Path]]:
     try:
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(f"{source}{suffix}")
-            if sidecar.exists():
+            if os.path.lexists(sidecar):
                 _move_sidecar_to_reserved_target(sidecar, Path(f"{backup}{suffix}"), moved)
     except BaseException:
         _restore_sidecars(moved)
@@ -406,6 +431,7 @@ def execute_sqlite_compaction(
     replacement_connection: sqlite3.Connection | None = None
     source_sync_descriptor: int | None = None
     temporary_sync_descriptor: int | None = None
+    replacement_identity: tuple[int, int] | None = None
     completed = False
     moved_sidecars: list[tuple[Path, Path]] = []
     try:
@@ -415,11 +441,19 @@ def execute_sqlite_compaction(
         source_integrity = check_sqlite_integrity(source, mode=SqliteIntegrityCheckMode.QUICK)
         if not source_integrity.ok:
             raise RuntimeError(f"source SQLite quick_check failed: {source_integrity.details}")
+        if not _path_matches_identity(source, original_source_identity):
+            raise RuntimeError("source path changed before compaction")
+        source_parent_signature = _directory_signature(source.parent)
 
-        with sqlite_connection(source) as source_connection:
+        with _existing_sqlite_connection(source) as source_connection:
+            if (
+                not _path_matches_identity(source, original_source_identity)
+                or _directory_signature(source.parent) != source_parent_signature
+            ):
+                raise RuntimeError("source path changed before compaction")
             source_connection.execute("PRAGMA busy_timeout=0")
             _checkpoint_wal(source_connection)
-            source_bytes = source.stat().st_size
+            source_bytes = os.fstat(source_sync_descriptor).st_size
             free_bytes = shutil.disk_usage(source.parent).free
             required_free_bytes = 2 * source_bytes + _MIN_FREE_SPACE_RESERVE
             if free_bytes < required_free_bytes:
@@ -471,14 +505,16 @@ def execute_sqlite_compaction(
             if not compacted_integrity.ok:
                 raise RuntimeError(f"compacted SQLite quick_check failed: {compacted_integrity.details}")
             temporary_sync_descriptor = _open_sync_descriptor(temporary)
+            replacement_stat = os.fstat(temporary_sync_descriptor)
+            replacement_identity = (replacement_stat.st_dev, replacement_stat.st_ino)
             # Block SQLite writers until the verified replacement is durable. A
             # file lock alone cannot prevent a process with an open SQLite
             # connection from committing between the final checks and rename.
             source_connection.execute("BEGIN EXCLUSIVE")
             if _data_version(source_connection) != data_version:
                 raise RuntimeError("source database changed during compaction; keep the application stopped")
-            source_stat = source.stat()
-            if (source_stat.st_dev, source_stat.st_ino) != original_source_identity:
+            source_stat = _path_stat_for_identity(source, original_source_identity)
+            if source_stat is None:
                 raise RuntimeError("source path changed during compaction")
             source_signature = (
                 source_stat.st_dev,
@@ -488,7 +524,7 @@ def execute_sqlite_compaction(
             )
             _fsync_descriptor(source_sync_descriptor)
             _fsync_descriptor(temporary_sync_descriptor)
-            current_source_stat = source.stat()
+            current_source_stat = source.lstat()
             if (
                 current_source_stat.st_dev,
                 current_source_stat.st_ino,
@@ -530,7 +566,10 @@ def execute_sqlite_compaction(
                 raise
             _fsync_descriptor(temporary_sync_descriptor)
             _fsync_directory(source.parent)
-            after_bytes = source.stat().st_size
+            installed_stat = _path_stat_for_identity(source, replacement_identity)
+            if installed_stat is None:
+                raise RuntimeError("source path changed after compacted replacement")
+            after_bytes = installed_stat.st_size
         completed = True
         assert backup is not None
         return SqliteCompactionOutcome(
@@ -543,14 +582,34 @@ def execute_sqlite_compaction(
     finally:
         if temporary.exists():
             temporary.unlink()
-        if not completed and replacement_installed and backup is not None and backup.exists():
+        if (
+            not completed
+            and replacement_installed
+            and backup is not None
+            and backup.exists()
+            and replacement_identity is not None
+            and _path_matches_identity(source, replacement_identity)
+        ):
             _replace_path(backup, source)
             backup_created = False
             _restore_sidecars(moved_sidecars)
             if source_sync_descriptor is not None:
                 _fsync_descriptor(source_sync_descriptor)
             _fsync_directory(source.parent)
-        if not completed and backup_created and backup is not None:
+        elif (
+            not completed
+            and replacement_installed
+            and backup is not None
+            and backup.exists()
+            and not os.path.lexists(source)
+        ):
+            _replace_path(backup, source)
+            backup_created = False
+            _restore_sidecars(moved_sidecars)
+            if source_sync_descriptor is not None:
+                _fsync_descriptor(source_sync_descriptor)
+            _fsync_directory(source.parent)
+        if not completed and backup_created and not replacement_installed and backup is not None:
             backup.unlink(missing_ok=True)
         shutil.rmtree(temporary_directory)
         try:
