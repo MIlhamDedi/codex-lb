@@ -347,15 +347,25 @@ async def _purge_operation_spool_on_startup(*, retention_seconds: float) -> int:
         raise RuntimeError("HTTP bridge operation transcript startup retention failed") from None
 
     backlog_likely = operation_purge_result.selected_operations >= DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
-    _record_operation_retention_cleanup(
-        OperationRetentionCleanupResult(
-            deleted_operations=operation_purge_result.deleted_operations,
-            batches=1,
-            backlog_likely=backlog_likely,
-            outcome="batch_budget_exhausted" if backlog_likely else "completed",
-            duration_seconds=max(time.monotonic() - started_at, 0.0),
-        )
+    result = OperationRetentionCleanupResult(
+        deleted_operations=operation_purge_result.deleted_operations,
+        batches=1,
+        backlog_likely=backlog_likely,
+        outcome="batch_budget_exhausted" if backlog_likely else "completed",
+        duration_seconds=max(time.monotonic() - started_at, 0.0),
     )
+    _record_operation_retention_cleanup(result)
+    if not PROMETHEUS_AVAILABLE:
+        logger.info(
+            "HTTP bridge operation transcript startup retention "
+            "deleted_operations=%s batches=%s outcome=%s "
+            "backlog_likely=%s duration_seconds=%.3f",
+            result.deleted_operations,
+            result.batches,
+            result.outcome,
+            result.backlog_likely,
+            result.duration_seconds,
+        )
     return operation_purge_result.deleted_operations
 
 
