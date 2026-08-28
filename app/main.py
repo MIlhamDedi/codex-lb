@@ -320,6 +320,45 @@ def _log_non_multiproc_metrics_bind_conflict(port: int) -> None:
     )
 
 
+async def _purge_operation_spool_on_startup(*, retention_seconds: float) -> int:
+    """Run one bounded transcript purge and record a sanitized aggregate result."""
+
+    started_at = time.monotonic()
+    try:
+        operation_purge_result = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool_batch(
+            cutoff=utcnow() - timedelta(seconds=retention_seconds),
+        )
+    except Exception as exc:
+        result = OperationRetentionCleanupResult(
+            deleted_operations=0,
+            batches=0,
+            backlog_likely=True,
+            outcome="failed",
+            duration_seconds=max(time.monotonic() - started_at, 0.0),
+        )
+        _record_operation_retention_cleanup(result)
+        logger.warning(
+            "HTTP bridge operation transcript startup retention failed "
+            "deleted_operations=0 batches=0 outcome=failed backlog_likely=true "
+            "duration_seconds=%.3f error_type=%s",
+            result.duration_seconds,
+            type(exc).__name__,
+        )
+        raise RuntimeError("HTTP bridge operation transcript startup retention failed") from None
+
+    backlog_likely = operation_purge_result.selected_operations >= DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
+    _record_operation_retention_cleanup(
+        OperationRetentionCleanupResult(
+            deleted_operations=operation_purge_result.deleted_operations,
+            batches=1,
+            backlog_likely=backlog_likely,
+            outcome="batch_budget_exhausted" if backlog_likely else "completed",
+            duration_seconds=max(time.monotonic() - started_at, 0.0),
+        )
+    )
+    return operation_purge_result.deleted_operations
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import app.core.startup as startup_module
@@ -372,24 +411,9 @@ async def lifespan(app: FastAPI):
                     "deleted": deleted_bridge_rows,
                 },
             )
-        operation_retention_started_at = time.monotonic()
-        operation_purge_result = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool_batch(
-            cutoff=utcnow()
-            - timedelta(seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds),
+        purged_operation_rows = await _purge_operation_spool_on_startup(
+            retention_seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds,
         )
-        operation_backlog_likely = (
-            operation_purge_result.selected_operations >= DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE
-        )
-        _record_operation_retention_cleanup(
-            OperationRetentionCleanupResult(
-                deleted_operations=operation_purge_result.deleted_operations,
-                batches=1,
-                backlog_likely=operation_backlog_likely,
-                outcome="batch_budget_exhausted" if operation_backlog_likely else "completed",
-                duration_seconds=max(time.monotonic() - operation_retention_started_at, 0.0),
-            )
-        )
-        purged_operation_rows = operation_purge_result.deleted_operations
         if purged_operation_rows > 0:
             logger.info(
                 "Purged expired durable HTTP bridge operation transcript rows",
