@@ -23,7 +23,7 @@ from app.core.clients.proxy import (  # noqa: F401
     UpstreamProxyRouteTrace,
     _as_image_fetch_session,
     _finalize_responses_lite_reasoning_context,
-    _historical_agent_control_output_keys,
+    _historical_agent_control_output_occurrences,
     _inline_content_images,
     _inline_input_image_urls,
     _payload_has_responses_lite_websocket_marker,
@@ -633,10 +633,10 @@ class _HTTPBridgeRequestSubmitMixin:
                 deduped_replayed_input_count = len(replayed_input_items)
                 deduped_replayed_input_fingerprint = _fingerprint_input_items(replayed_input_items)
                 payload = payload.model_copy(update={"input": deduped_input_items})
-        protected_agent_control_output_keys = (
-            _historical_agent_control_output_keys(cast(list[JsonValue], payload.input))
+        protected_agent_control_output_occurrences = (
+            _historical_agent_control_output_occurrences(cast(list[JsonValue], payload.input))
             if isinstance(payload.input, list)
-            else set()
+            else {}
         )
         upstream_payload = dict(payload.to_payload())
         upstream_payload.pop("stream", None)
@@ -717,7 +717,7 @@ class _HTTPBridgeRequestSubmitMixin:
             slimmed_payload, slim_summary = _slim_response_create_payload_for_upstream(
                 upstream_payload,
                 max_bytes=max_bytes,
-                protected_agent_control_output_keys=protected_agent_control_output_keys,
+                protected_agent_control_output_occurrences=protected_agent_control_output_occurrences,
             )
             if slim_summary is not None:
                 upstream_payload = slimmed_payload

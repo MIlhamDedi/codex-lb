@@ -25797,6 +25797,118 @@ def test_slim_response_create_keeps_agent_control_protocols_separate_for_reused_
 
 
 @pytest.mark.parametrize(
+    "slimmer",
+    [
+        pytest.param(streaming_helpers_module._slim_response_create_payload_for_upstream, id="service-bridge"),
+        pytest.param(proxy_module._slim_response_create_payload_for_upstream, id="core-websocket"),
+    ],
+)
+@pytest.mark.parametrize("namespaced_occurrence", [0, 1], ids=["namespaced-first", "namespaced-second"])
+def test_slim_response_create_pairs_same_protocol_reused_call_id_by_occurrence(slimmer, namespaced_occurrence):
+    agent_wait_output = "agent-wait-result:" + ("a" * (33 * 1024))
+    shell_output = "shell-result:" + ("s" * (33 * 1024))
+    namespaced_pair: list[JsonValue] = [
+        {
+            "type": "function_call",
+            "namespace": "multi_agent_v1",
+            "name": "wait_agent",
+            "call_id": "call_reused",
+            "arguments": '{"timeout_ms":120000}',
+        },
+        {"type": "function_call_output", "call_id": "call_reused", "output": agent_wait_output},
+    ]
+    ordinary_pair: list[JsonValue] = [
+        {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call_reused",
+            "arguments": '{"cmd":"cat large-log"}',
+        },
+        {"type": "function_call_output", "call_id": "call_reused", "output": shell_output},
+    ]
+    pairs = [namespaced_pair, ordinary_pair] if namespaced_occurrence == 0 else [ordinary_pair, namespaced_pair]
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            *pairs[0],
+            *pairs[1],
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+    }
+
+    slimmed_payload, summary = slimmer(payload, max_bytes=256)
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+
+    preserved_index = 1 if namespaced_occurrence == 0 else 3
+    slimmed_index = 3 if namespaced_occurrence == 0 else 1
+    assert summary is not None
+    assert summary["historical_tool_outputs_slimmed"] == 1
+    assert cast(dict[str, JsonValue], slimmed_input[preserved_index])["output"] == agent_wait_output
+    assert cast(dict[str, JsonValue], slimmed_input[slimmed_index])["output"] == (
+        proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(bytes=len(shell_output.encode("utf-8")))
+    )
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        pytest.param(proxy_service._REQUEST_TRANSPORT_HTTP, id="http-bridge"),
+        pytest.param(proxy_service._REQUEST_TRANSPORT_WEBSOCKET, id="websocket-bridge"),
+    ],
+)
+def test_prepare_response_bridge_pairs_same_protocol_reused_call_id_by_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+):
+    agent_wait_output = "agent-wait-result:" + ("a" * (33 * 1024))
+    shell_output = "shell-result:" + ("s" * (33 * 1024))
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "input": [
+                {
+                    "type": "function_call",
+                    "namespace": "multi_agent_v1",
+                    "name": "wait_agent",
+                    "call_id": "call_reused",
+                    "arguments": '{"timeout_ms":120000}',
+                },
+                {"type": "function_call_output", "call_id": "call_reused", "output": agent_wait_output},
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_reused",
+                    "arguments": '{"cmd":"cat large-log"}',
+                },
+                {"type": "function_call_output", "call_id": "call_reused", "output": shell_output},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+    monkeypatch.setattr(proxy_http_bridge_request_submit, "_upstream_response_create_max_bytes", lambda: 256)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+
+    _, text_data = service._prepare_response_bridge_request_state(
+        payload,
+        api_key=None,
+        api_key_reservation=None,
+        include_type_field=True,
+        attach_event_queue=False,
+        transport=transport,
+        client_metadata=None,
+    )
+
+    upstream_input = json.loads(text_data)["input"]
+    assert all("namespace" not in item for item in upstream_input if isinstance(item, dict))
+    assert upstream_input[1]["output"] == agent_wait_output
+    assert upstream_input[3]["output"] == proxy_service._RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
+        bytes=len(shell_output.encode("utf-8"))
+    )
+
+
+@pytest.mark.parametrize(
     "transport",
     [
         pytest.param(proxy_service._REQUEST_TRANSPORT_HTTP, id="http-bridge"),
