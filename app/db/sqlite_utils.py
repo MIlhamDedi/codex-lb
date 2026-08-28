@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import urllib.parse
 from collections.abc import Iterator
@@ -23,8 +24,12 @@ class SqliteIntegrityCheckMode(str, Enum):
 
 
 @contextmanager
-def sqlite_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(str(path))
+def sqlite_connection(path: str | Path, *, require_existing: bool = False) -> Iterator[sqlite3.Connection]:
+    if require_existing:
+        encoded_path = urllib.parse.quote(str(path), safe="/:")
+        connection = sqlite3.connect(f"file:{encoded_path}?mode=rw&nofollow=1", uri=True)
+    else:
+        connection = sqlite3.connect(str(path))
     try:
         with connection:
             yield connection
@@ -74,7 +79,7 @@ def _sqlite_uri_file_path(path: str) -> str | None:
     if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
         return None
     resolved = urllib.parse.unquote(parsed.path)
-    if len(resolved) >= 3 and resolved[0] == "/" and resolved[1].isalpha() and resolved[2] == ":":
+    if os.name == "nt" and len(resolved) >= 3 and resolved[0] == "/" and resolved[1].isalpha() and resolved[2] == ":":
         return resolved[1:]
     return resolved
 
@@ -173,12 +178,13 @@ def check_sqlite_integrity(
     path: Path,
     *,
     mode: SqliteIntegrityCheckMode = SqliteIntegrityCheckMode.FULL,
+    require_existing: bool = False,
 ) -> IntegrityCheck:
     if not path.exists():
         return IntegrityCheck(ok=True, details=None)
 
     try:
-        with sqlite_connection(path) as conn:
+        with sqlite_connection(path, require_existing=require_existing) as conn:
             cursor = conn.execute(_integrity_check_pragma(mode))
             rows = [row[0] for row in cursor.fetchall()]
     except sqlite3.DatabaseError as exc:

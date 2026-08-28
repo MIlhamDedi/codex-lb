@@ -438,7 +438,11 @@ def execute_sqlite_compaction(
         original_source_stat = source.stat()
         original_source_identity = (original_source_stat.st_dev, original_source_stat.st_ino)
         source_sync_descriptor = _open_sync_descriptor(source)
-        source_integrity = check_sqlite_integrity(source, mode=SqliteIntegrityCheckMode.QUICK)
+        source_integrity = check_sqlite_integrity(
+            source,
+            mode=SqliteIntegrityCheckMode.QUICK,
+            require_existing=True,
+        )
         if not source_integrity.ok:
             raise RuntimeError(f"source SQLite quick_check failed: {source_integrity.details}")
         if not _path_matches_identity(source, original_source_identity):

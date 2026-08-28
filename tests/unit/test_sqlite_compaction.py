@@ -69,12 +69,17 @@ def test_compaction_reclaims_space_and_preserves_backup(tmp_path: Path, monkeypa
     before_bytes = source.stat().st_size
     real_integrity_check = compact.check_sqlite_integrity
 
-    def assert_compacted_permissions(path: Path, *, mode: SqliteIntegrityCheckMode):
+    def assert_compacted_permissions(
+        path: Path,
+        *,
+        mode: SqliteIntegrityCheckMode,
+        require_existing: bool = False,
+    ):
         if ".compact-" in str(path):
             assert path.stat().st_mode & 0o777 == 0o600
             assert (path.stat().st_uid, path.stat().st_gid) == (source_stat.st_uid, source_stat.st_gid)
             assert path.parent.stat().st_mode & 0o777 == 0o700
-        return real_integrity_check(path, mode=mode)
+        return real_integrity_check(path, mode=mode, require_existing=require_existing)
 
     monkeypatch.setattr(compact, "check_sqlite_integrity", assert_compacted_permissions)
 
@@ -548,10 +553,10 @@ def test_compaction_rejects_external_write_and_corrupt_output(tmp_path: Path, mo
     monkeypatch.setattr(compact, "_data_version", lambda _connection: 1)
     real_integrity_check = compact.check_sqlite_integrity
 
-    def reject_compacted(path: Path, *, mode: SqliteIntegrityCheckMode):
+    def reject_compacted(path: Path, *, mode: SqliteIntegrityCheckMode, require_existing: bool = False):
         if ".compact-" in str(path):
             return IntegrityCheck(ok=False, details="injected corruption")
-        return real_integrity_check(path, mode=mode)
+        return real_integrity_check(path, mode=mode, require_existing=require_existing)
 
     monkeypatch.setattr(compact, "check_sqlite_integrity", reject_compacted)
     with pytest.raises(RuntimeError, match="compacted SQLite quick_check failed"):
@@ -565,8 +570,8 @@ def test_compaction_does_not_create_database_after_source_disappears(tmp_path: P
     _create_fragmented_database(source)
     real_integrity_check = compact.check_sqlite_integrity
 
-    def remove_source_after_quick_check(path: Path, *, mode: SqliteIntegrityCheckMode):
-        result = real_integrity_check(path, mode=mode)
+    def remove_source_after_quick_check(path: Path, *, mode: SqliteIntegrityCheckMode, require_existing: bool = False):
+        result = real_integrity_check(path, mode=mode, require_existing=require_existing)
         if path == source:
             source.unlink()
         return result
@@ -576,6 +581,31 @@ def test_compaction_does_not_create_database_after_source_disappears(tmp_path: P
     with pytest.raises(RuntimeError, match="source path changed before compaction"):
         compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
 
+    assert not source.exists()
+    assert list(tmp_path.glob("*.pre-compact-*")) == []
+    assert not Path(f"{source}.compact.lock").exists()
+
+
+def test_compaction_does_not_recreate_source_disappearing_during_integrity_check(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "store.db"
+    _create_fragmented_database(source)
+    real_exists = Path.exists
+    removed_source = False
+
+    def remove_source_after_existence_check(path: Path) -> bool:
+        nonlocal removed_source
+        exists = real_exists(path)
+        if path == source and exists and not removed_source:
+            removed_source = True
+            source.unlink()
+        return exists
+
+    monkeypatch.setattr(Path, "exists", remove_source_after_existence_check)
+
+    with pytest.raises(RuntimeError, match="source SQLite quick_check failed"):
+        compact.execute_sqlite_compaction(_database_url(source), confirm_stopped=True)
+
+    assert removed_source
     assert not source.exists()
     assert list(tmp_path.glob("*.pre-compact-*")) == []
     assert not Path(f"{source}.compact.lock").exists()
@@ -722,8 +752,13 @@ def test_compaction_rejects_source_path_replacement_during_compaction(tmp_path: 
     _create_fragmented_database(replacement)
     real_integrity_check = compact.check_sqlite_integrity
 
-    def replace_source_before_final_validation(path: Path, *, mode: SqliteIntegrityCheckMode):
-        result = real_integrity_check(path, mode=mode)
+    def replace_source_before_final_validation(
+        path: Path,
+        *,
+        mode: SqliteIntegrityCheckMode,
+        require_existing: bool = False,
+    ):
+        result = real_integrity_check(path, mode=mode, require_existing=require_existing)
         if ".compact-" in str(path):
             replacement.replace(source)
         return result

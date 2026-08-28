@@ -12,6 +12,7 @@ import pytest
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.db.sqlite_utils as sqlite_utils
 from app.db.migrate import _build_alembic_config
 from app.db.migration_url import to_sync_database_url
 from app.db.sqlite_utils import normalize_sqlite_url, sqlite_db_path_from_url
@@ -78,9 +79,18 @@ class TestSqlitePathFromUrlWindows:
     def test_uri_mode_remote_file_authority_is_not_treated_as_a_local_path(self) -> None:
         assert sqlite_db_path_from_url("sqlite+aiosqlite:///file://server/share/store.db?uri=true") is None
 
-    def test_uri_mode_windows_drive_file_path_drops_uri_leading_slash(self) -> None:
+    def test_uri_mode_windows_drive_file_path_preserves_leading_slash_on_posix(self) -> None:
         url = "sqlite+aiosqlite:///file:///C:/data/store.db?uri=true"
 
+        if os.name == "nt":
+            pytest.skip("POSIX URI semantics only")
+
+        assert sqlite_db_path_from_url(url) == Path("/C:/data/store.db")
+
+    def test_uri_mode_windows_drive_file_path_drops_uri_leading_slash_on_windows(self, monkeypatch) -> None:
+        url = "sqlite+aiosqlite:///file:///C:/data/store.db?uri=true"
+
+        monkeypatch.setattr(sqlite_utils.os, "name", "nt")
         assert sqlite_db_path_from_url(url) == Path("C:/data/store.db")
 
     def test_normalize_decodes_percent_encoded_file_path(self) -> None:

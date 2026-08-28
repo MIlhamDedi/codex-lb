@@ -43,7 +43,7 @@ backup=/var/lib/codex-lb/store.pre-compact-YYYYMMDDTHHMMSSZ.db
 mv "$db" "${db}.failed-$(date -u +%Y%m%dT%H%M%SZ)"
 mv "$backup" "$db"
 for suffix in -wal -shm -journal; do
-  [ -e "${backup}${suffix}" ] && mv "${backup}${suffix}" "${db}${suffix}"
+  { [ -e "${backup}${suffix}" ] || [ -L "${backup}${suffix}" ]; } && mv "${backup}${suffix}" "${db}${suffix}"
 done
 ```
 
