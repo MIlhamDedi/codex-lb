@@ -561,6 +561,7 @@ _WEBSOCKET_TOOL_CALL_ITEM_TYPES_BY_OUTPUT_TYPE = {
     "function_call_output": "function_call",
     "custom_tool_call_output": "custom_tool_call",
     "apply_patch_call_output": "apply_patch_call",
+    "tool_search_output": "tool_search_call",
 }
 _WEBSOCKET_TOOL_CALL_ITEM_TYPES = frozenset(_WEBSOCKET_TOOL_CALL_ITEM_TYPES_BY_OUTPUT_TYPE.values())
 
@@ -1977,7 +1978,7 @@ def _trim_websocket_previous_response_input_items(input_items: list[JsonValue]) 
             index
             for index, item in enumerate(input_items)
             if _websocket_input_item_type(item)
-            in {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
+            in {"function_call_output", "custom_tool_call_output", "apply_patch_call_output", "tool_search_output"}
         ),
         None,
     )
@@ -1993,7 +1994,7 @@ def _is_websocket_previous_response_output_item(item: JsonValue) -> bool:
     if isinstance(item, dict) and _websocket_input_item_type(item) is None and item.get("role") == "assistant":
         return True
     item_type = _websocket_input_item_type(item)
-    if item_type in {"reasoning", "function_call", "custom_tool_call", "apply_patch_call"}:
+    if item_type in {"reasoning", "function_call", "custom_tool_call", "apply_patch_call", "tool_search_call"}:
         return True
     if item_type != "message" or not isinstance(item, dict):
         return False
