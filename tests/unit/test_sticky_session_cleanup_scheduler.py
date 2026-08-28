@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -316,6 +316,47 @@ async def test_operation_retention_failure_log_omits_exception_detail(monkeypatc
     assert "error_type=RuntimeError" in caplog.text
     assert "operation_id=secret" not in caplog.text
     assert "DELETE FROM" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_operation_retention_noop_logs_aggregate_without_prometheus(monkeypatch, caplog) -> None:
+    bridge_repo = AsyncMock()
+    bridge_repo.purge_operation_spool_batch = AsyncMock(return_value=_purge_batch(0))
+    monkeypatch.setattr(
+        cleanup_scheduler,
+        "get_settings",
+        lambda: SimpleNamespace(http_responses_session_bridge_operation_spool_retention_seconds=604800.0),
+    )
+    monkeypatch.setattr(cleanup_scheduler, "PROMETHEUS_AVAILABLE", False)
+    scheduler = cleanup_scheduler.StickySessionCleanupScheduler(interval_seconds=60, enabled=False)
+
+    with caplog.at_level("INFO", logger=cleanup_scheduler.__name__):
+        backlog_likely = await scheduler._run_operation_retention(bridge_repo)
+
+    assert backlog_likely is False
+    assert "deleted_operations=0 batches=1 outcome=completed" in caplog.text
+    assert "backlog_likely=False" in caplog.text
+    assert "error_type=none" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_operation_retention_noop_avoids_duplicate_log_with_prometheus(monkeypatch, caplog) -> None:
+    bridge_repo = AsyncMock()
+    bridge_repo.purge_operation_spool_batch = AsyncMock(return_value=_purge_batch(0))
+    monkeypatch.setattr(
+        cleanup_scheduler,
+        "get_settings",
+        lambda: SimpleNamespace(http_responses_session_bridge_operation_spool_retention_seconds=604800.0),
+    )
+    monkeypatch.setattr(cleanup_scheduler, "PROMETHEUS_AVAILABLE", True)
+    monkeypatch.setattr(cleanup_scheduler, "_record_operation_retention_cleanup", Mock())
+    scheduler = cleanup_scheduler.StickySessionCleanupScheduler(interval_seconds=60, enabled=False)
+
+    with caplog.at_level("INFO", logger=cleanup_scheduler.__name__):
+        backlog_likely = await scheduler._run_operation_retention(bridge_repo)
+
+    assert backlog_likely is False
+    assert "HTTP bridge operation transcript retention" not in caplog.text
 
 
 @pytest.mark.asyncio

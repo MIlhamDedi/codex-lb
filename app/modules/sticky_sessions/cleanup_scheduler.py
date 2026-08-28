@@ -282,7 +282,7 @@ class StickySessionCleanupScheduler:
             )
             error_type = type(exc).__name__
         _record_operation_retention_cleanup(result)
-        if result.deleted_operations > 0 or result.backlog_likely:
+        if not PROMETHEUS_AVAILABLE or result.deleted_operations > 0 or result.backlog_likely:
             logger.info(
                 "HTTP bridge operation transcript retention "
                 "deleted_operations=%s batches=%s outcome=%s "
