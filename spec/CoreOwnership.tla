@@ -65,7 +65,9 @@ WeakSingleTimeout == Weakening = "single_shared_timeout"
 WeakSkipReleaseOnCancel == Weakening = "skip_release_on_cancel"
 WeakNonAtomicClaim == Weakening = "non_atomic_claim"
 WeakStaleCache == Weakening = "stale_cache"
+WeakStaleRouteAcquire == Weakening = "stale_route_acquire"
 WeakLostWaiter == Weakening = "lost_waiter"
+WeakMisrouteProducer == Weakening = "misroute_producer"
 WeakShutdownAdmit == Weakening = "shutdown_admit"
 WeakDoubleSettle == Weakening = "double_settle"
 WeakLeakOwnerOnTerminal == Weakening = "leak_owner_on_terminal"
@@ -187,7 +189,7 @@ Init ==
   /\ snapshotVersion = [r \in Replicas |-> [a \in Accounts |-> 0]]
   /\ routedWithStaleSnapshot = [t \in Turns |-> FALSE]
   /\ snapshotRoute = [t \in Turns |->
-      [attempted |-> FALSE, replica |-> NoReplica, account |-> NoAccount]]
+      [attempted |-> FALSE, replica |-> NoReplica, account |-> NoAccount, version |-> 0]]
   /\ producerTarget = [t \in Turns |-> t]
   /\ terminalReason = [t \in Turns |-> "none"]
   /\ shutdownPhase = "running"
@@ -327,13 +329,17 @@ AcquireTurn(t, r, a, inj) ==
   /\ (owner[a] = NoReplica \/ WeakNonAtomicClaim)
   /\ (WeakNonAtomicClaim \/ LiveOnAccount(a) = {})
   \* A dispatch is only reachable through the routing action that checked
-  \* snapshot freshness, and only onto the replica/account pair it checked.
+  \* snapshot freshness, only onto the replica/account pair it checked, and
+  \* only while the durable version still matches that routed decision.
   /\ snapshotRoute[t].attempted
   /\ snapshotRoute[t].replica = r
   /\ snapshotRoute[t].account = a
-  /\ (inj = NoAccount \/ inj = SameAccount \/ inj = MismatchedLineage
-        \/ WeakCrossAccountAnchor)
+  /\ (snapshotRoute[t].version = durableVersion[a] \/ WeakStaleRouteAcquire)
+  /\ (inj = NoAccount \/ inj = SameAccount
+        \/ (inj = MismatchedLineage /\ WeakIgnoreAnchorLineage)
+        \/ (inj = ForeignAccount /\ WeakCrossAccountAnchor))
   /\ crossAccountDispatch' = (crossAccountDispatch \/ inj = ForeignAccount)
+  /\ badAnchorUse' = (badAnchorUse \/ inj = MismatchedLineage)
   /\ anchor' = [anchor EXCEPT ![t] =
       CASE inj = NoAccount -> @
         [] inj = SameAccount -> [kind |-> "client_anchor", account |-> a,
@@ -359,9 +365,11 @@ AcquireTurn(t, r, a, inj) ==
   /\ phaseElapsed' = [phaseElapsed EXCEPT ![t] = 0]
   /\ clientRetry' = IF clientRetry = "torn" THEN "torn" ELSE "attached"
   /\ anchorUsed' = [anchorUsed EXCEPT ![t] = FALSE]
+  /\ routedWithStaleSnapshot' = [routedWithStaleSnapshot EXCEPT ![t] =
+      @ \/ snapshotRoute[t].version < durableVersion[a]]
   /\ UNCHANGED << clock, settlementCount, mislabeledKill,
-    badAnchorUse, durableVersion, snapshotVersion, routedWithStaleSnapshot,
-    snapshotRoute, producerTarget, terminalReason, shutdownPhase, registered,
+    durableVersion, snapshotVersion, snapshotRoute, producerTarget,
+    terminalReason, shutdownPhase, registered,
     ownerReleased, poppedFromPending, completedDeliveryClaimed, producerDelivered,
     finalizerOwner, finalizerAborted, admittedDuringDrain, retryBackoff >>
 
@@ -434,10 +442,18 @@ StreamProgress(t) ==
   /\ turnState[t] = "streaming"
   /\ attemptPhase[t] = "streaming"
   /\ phaseElapsed[t] > 0
-  /\ phaseElapsed' = [phaseElapsed EXCEPT ![t] = 0]
+  \* Upstream activity resets only the idle clock.  Elapsed streaming time
+  \* still consumes the carried total request budget, so periodic events
+  \* cannot keep the request alive past that budget.
+  /\ LET remainingRequest == SubtractFloor(requestDeadline[t], phaseElapsed[t])
+     IN /\ requestDeadline' = [requestDeadline EXCEPT ![t] = remainingRequest]
+        /\ gateDeadline' = [gateDeadline EXCEPT ![t] = Min2(gateDeadline[t], remainingRequest)]
+        /\ connectDeadline' = [connectDeadline EXCEPT ![t] = Min2(connectDeadline[t], remainingRequest)]
+        /\ firstByteDeadline' = [firstByteDeadline EXCEPT ![t] = Min2(firstByteDeadline[t], remainingRequest)]
+        /\ preResponseDeadline' = [preResponseDeadline EXCEPT ![t] = Min2(preResponseDeadline[t], remainingRequest)]
+        /\ phaseElapsed' = [phaseElapsed EXCEPT ![t] = 0]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount, turnEpoch,
-    acquisitionCount, settlementCount, reservation, gate, gateDeadline,
-    requestDeadline, connectDeadline, firstByteDeadline, preResponseDeadline, gateRetireDeadline,
+    acquisitionCount, settlementCount, reservation, gate, gateRetireDeadline,
     mislabeledKill, anchor, anchorUsed, badAnchorUse, crossAccountDispatch, durableVersion,
     snapshotVersion, routedWithStaleSnapshot, snapshotRoute, producerTarget,
     terminalReason, shutdownPhase, registered, ownerReleased, attemptPhase, poppedFromPending,
@@ -744,7 +760,8 @@ RouteFromSnapshot(t, r, a) ==
   /\ ~snapshotRoute[t].attempted
   /\ (snapshotVersion[r][a] >= durableVersion[a] \/ WeakStaleCache)
   /\ snapshotRoute' = [snapshotRoute EXCEPT ![t] =
-      [attempted |-> TRUE, replica |-> r, account |-> a]]
+      [attempted |-> TRUE, replica |-> r, account |-> a,
+       version |-> snapshotVersion[r][a]]]
   /\ routedWithStaleSnapshot' = [routedWithStaleSnapshot EXCEPT ![t] =
       snapshotVersion[r][a] < durableVersion[a]]
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
@@ -762,7 +779,7 @@ DeliverProducer(t, u) ==
   /\ turnState[t] \in TerminalStates
   /\ terminalReason[t] = "completed"
   /\ producerDelivered[t] = FALSE
-  /\ IF WeakLostWaiter
+  /\ IF WeakMisrouteProducer
      THEN /\ t # u
           /\ turnState[u] \in {"queued", "active", "streaming"}
      ELSE u = t
@@ -792,6 +809,11 @@ StartDrain ==
 CompleteShutdown ==
   /\ shutdownPhase = "draining"
   /\ \A t \in Turns : registered[t] = FALSE
+  \* A terminal response may have left the pending queue while its registered
+  \* producer still owns downstream delivery.  Do not publish completed
+  \* shutdown until every successful response has actually been delivered.
+  /\ \A t \in Turns :
+       terminalReason[t] = "completed" => producerDelivered[t]
   /\ shutdownPhase' = "complete"
   /\ UNCHANGED << clock, owner, ownerEpoch, turnState, turnReplica, turnAccount,
     turnEpoch, acquisitionCount, settlementCount, reservation, gate, gateDeadline,
@@ -878,7 +900,8 @@ TypeInvariant ==
   /\ routedWithStaleSnapshot \in [Turns -> BOOLEAN]
   /\ snapshotRoute \in [Turns -> [attempted : BOOLEAN,
                                   replica : Replicas \cup {NoReplica},
-                                  account : Accounts \cup {NoAccount}]]
+                                  account : Accounts \cup {NoAccount},
+                                  version : Nat]]
   /\ producerTarget \in [Turns -> Turns]
   /\ terminalReason \in [Turns -> Reasons]
   /\ shutdownPhase \in {"running", "draining", "complete"}
@@ -947,7 +970,9 @@ Inv7GateAccounting ==
 Inv8ShutdownDrain ==
   /\ admittedDuringDrain = FALSE
   /\ shutdownPhase = "complete" =>
-       \A t \in Turns : registered[t] = FALSE
+       /\ \A t \in Turns : registered[t] = FALSE
+       /\ \A t \in Turns :
+            terminalReason[t] = "completed" => producerDelivered[t]
 
 Inv9TerminalOwnerReleased ==
   \A t \in Turns :

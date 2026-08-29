@@ -27,7 +27,8 @@ kills them under three different budgets:
   This is the **pre-response eventless phase** (`preResponseDeadline`), and its
   phase resets still consume the same request budget.
 - `streaming` - response started, incremental events flowing
-  (`requestDeadline`, i.e. the stream-idle/request budget).
+  (`phaseElapsed` is the resettable idle clock; `requestDeadline` carries the
+  remaining total request budget across every reset).
 
 ## Files
 
@@ -51,14 +52,14 @@ kills them under three different budgets:
 
 | Invariant | Requirement | Demonstrating action / weakening |
 | --- | --- | --- |
-| `Inv1AnchorCurrent` | Anchor use requires current owner epoch, compatible lineage, and safe provenance. | `UseAnchor` records `badAnchorUse` and fires at most once per anchor value; `AcquireTurn` can inject a mismatched-lineage anchor that is current and same-account in every other respect, so the lineage conjunct has a distinguishing input. `weak-ignore-owner-epoch.cfg` demonstrates stale anchor reuse and `weak-ignore-anchor-lineage.cfg` demonstrates incompatible-lineage reuse. |
-| `Inv2DeadlineOrdering` | Connect, first-byte, gate, and request deadlines remain ordered under the original request deadline, with later active-phase deadlines clamped to the remaining request budget before each phase reset. | `QueueTurn` assigns phase deadlines and the active-phase transitions clamp them after elapsed wait; `weak-single-shared-timeout.cfg` demonstrates a shared timeout can violate ordering. |
+| `Inv1AnchorCurrent` | Anchor dispatch/use requires current owner epoch, compatible lineage, and safe provenance. | `AcquireTurn` rejects mismatched lineage before dispatch; `UseAnchor` records unsafe reuse and fires at most once per anchor value. `weak-ignore-owner-epoch.cfg` demonstrates stale anchor reuse, while `weak-ignore-anchor-lineage.cfg` admits an otherwise current same-account anchor with incompatible lineage and records the rejected dispatch. |
+| `Inv2DeadlineOrdering` | Connect, first-byte, gate, and request deadlines remain ordered under the original request deadline, with later active-phase deadlines clamped to the remaining request budget before each phase reset. | `QueueTurn` assigns phase deadlines; active-phase transitions and `StreamProgress` subtract elapsed time before resetting the idle clock, so activity cannot extend the total budget. `weak-single-shared-timeout.cfg` demonstrates a shared timeout can violate ordering. |
 | `Inv3ReservationSettledExactlyOnce` | Every acquired terminal turn has exactly one settlement event and a settled reservation state. | `CompleteTurn`, `CancelTurn`, `ExpireDeadline`, and `FinalizeCompletedDelivery` increment `settlementCount`; `weak-skip-release-on-cancel.cfg`, `weak-double-settle.cfg`, and `weak-popped-not-finalized.cfg` demonstrate zero, double, and lost-finalizer failures. |
-| `Inv4FreshSnapshots` | Routing cannot use a local snapshot behind durable freshness evidence. | Normal `RouteFromSnapshot` consumes a fresh snapshot and records the routed replica/account; `AcquireTurn` is only enabled for that recorded pair, so every dispatch is freshness-gated rather than optionally so. `weak-stale-cache.cfg` removes the freshness guard. |
+| `Inv4FreshSnapshots` | Routing cannot use a local snapshot behind durable freshness evidence. | Normal `RouteFromSnapshot` records the routed replica, account, and durable version; `AcquireTurn` rechecks that version before dispatch. `weak-stale-cache.cfg` removes the route-time guard, while `weak-stale-route-acquire.cfg` invalidates an initially fresh route before acquisition and removes the consumption-time guard. |
 | `Inv5SingleOwnerCAS` | Singleton/account work mutates under a single durable owner epoch, and the live turn is the replica/epoch that durable row names. | `AcquireTurn` enforces empty durable ownership and no live turn on the same account; the invariant also pins each live turn's replica and epoch to `owner`/`ownerEpoch`, so reassigning the durable owner under a live turn is a violation rather than an unchecked state. `weak-non-atomic-claim.cfg` demonstrates duplicate live owners. |
-| `Inv6TerminalIsolation` | Terminal or cancelled producers cannot enqueue into later turns, and terminal reason is present. | `MisrouteProducer` is disabled in the full model; `weak-lost-waiter.cfg` demonstrates terminal producer contamination. |
+| `Inv6TerminalIsolation` | Terminal or cancelled producers cannot enqueue into later turns, and terminal reason is present. | Producer misrouting is disabled in the full model; `weak-misroute-producer.cfg` demonstrates terminal producer contamination independently of gate accounting. |
 | `Inv7GateAccounting` | Every gate waiter is exactly queued, holding, or terminal and keeps the inherited deadline. | `QueueTurn`, `AcquireTurn`, and terminal actions preserve the gate lattice; `weak-lost-waiter.cfg` demonstrates a dropped queued waiter. |
-| `Inv8ShutdownDrain` | Draining forbids admission of new externally visible work and shutdown completion requires no registered work. | `QueueTurn` is gated by `CanAdmit`; `weak-shutdown-admit.cfg` demonstrates post-drain admission. |
+| `Inv8ShutdownDrain` | Draining forbids admission of new externally visible work; shutdown completion requires no registered work and no successful response awaiting downstream producer delivery. | `QueueTurn` is gated by `CanAdmit`; `CompleteShutdown` blocks on both registered work and `producerDelivered`; `weak-shutdown-admit.cfg` demonstrates post-drain admission. |
 | `Inv9TerminalOwnerReleased` | Every acquired terminal turn releases the durable owner slot and finalizer owner. | Terminal actions call epoch-fenced release; `weak-leak-owner-on-terminal.cfg` demonstrates a leaked owner lease. |
 | `Inv10AnchorAccountOwnership` | A request never dispatches with a continuity anchor owned by a different account, and no turn past admission carries a foreign-owned anchor. | `AcquireTurn` refuses a foreign-owned injected anchor (the injection is weakening-only, like `MisrouteProducer`) and records `crossAccountDispatch`; same-account anchors still come from `StartStream` and are shown usable by `UseAnchor`, so the guard is not vacuous. `UpstreamRespondsTo` makes `response.created`/`response.completed` unreachable for a foreign anchor, so the weakened turn wedges in the pre-response phase. `weak-cross-account-anchor.cfg` demonstrates it. |
 | `Inv11PreResponseBudget` | The pre-response eventless bound is derived from the named budgets - it is the minimum of the owner-side gate-retire and stream-idle budgets, stays at or above the keepalive cadence floor until earlier active waits have consumed part of the request budget, and no kill is ever reported under the post-start stream-idle budget while the response had not started. | `QueueTurn` assigns `preResponseDeadline`/`gateRetireDeadline` from named budgets; the active-phase transitions clamp carried budget after every elapsed wait before resetting phase time; `ExpireDeadline` picks its bound and its budget label per phase and records `mislabeledKill`; `weak-conflated-timers.cfg` demonstrates a single shared timer name killing a healthy pre-start wait under the wrong budget. |
@@ -69,12 +70,13 @@ The full configuration also checks natural liveness properties:
   This is derived from bounded `Tick`, `ExpireDeadline`, and
   `FinalizeCompletedDelivery` fairness, not from fairness on cancellation.
 - `ShutdownEventuallyComplete`: committed shutdown drain eventually completes
-  once registered work has left.
+  once registered work has left and successful responses have reached terminal
+  downstream delivery.
 - `TearEventuallyRecovers`: a recoverable tear (a turn killed in the
   pre-response eventless phase) is eventually recovered by the client. This
   holds only under the bounded-delay assumption on `retryBackoff`: while the
   backoff stays inside `MaxRetryBackoff` a retry is always eventually due, so
-  `WF_vars(ClientRetryAttempt)` can discharge it.
+  `WF_vars(ClientRetrySucceeds)` can discharge it.
 
 ## Negative Controls
 
@@ -91,9 +93,11 @@ or if its config does not declare exactly the mapped temporal property.
 | `weak-single-shared-timeout.cfg` | Collapses phase-specific deadlines into a single mismatched timeout. | `Inv2DeadlineOrdering` | Timeout budget mismatch and stuck streams | `aa65e97d`, `de2c5fc0`, `af5051f8` |
 | `weak-skip-release-on-cancel.cfg` | Lets cancellation bypass reservation release/finalization. | `Inv3ReservationSettledExactlyOnce` | Lease and reservation leaks | `592d47b3`, `015f669e`, `783665b9` |
 | `weak-double-settle.cfg` | Allows a terminal acquired turn to settle twice. | `Inv3ReservationSettledExactlyOnce` | Duplicate finalization and replayed settlement | `592d47b3`, `015f669e`, `783665b9` |
-| `weak-stale-cache.cfg` | Lets a replica route from a local snapshot behind durable invalidation. | `Inv4FreshSnapshots` | Cache and quota freshness races | `04d8fab8`, `7347745b`, `b7bf87cf` |
+| `weak-stale-cache.cfg` | Lets a replica route from a local snapshot already behind durable invalidation. | `Inv4FreshSnapshots` | Cache and quota freshness races | `04d8fab8`, `7347745b`, `b7bf87cf` |
+| `weak-stale-route-acquire.cfg` | Lets durable invalidation race between a fresh route decision and acquisition, bypassing the version recheck. | `Inv4FreshSnapshots` | Cache and quota freshness TOCTOU | `04d8fab8`, `7347745b`, `b7bf87cf` |
 | `weak-non-atomic-claim.cfg` | Lets a second turn claim an account without durable compare-and-set exclusion. | `Inv5SingleOwnerCAS` | Cross-replica single-owner coordination | `0a7f354d`, `b5f0541a`, `53f7b463`, `a8e12f8` |
-| `weak-lost-waiter.cfg` | Lets cancellation drop a queued waiter slot or misroute a terminal producer. | `Inv6TerminalIsolation` or `Inv7GateAccounting` | Admission gate and lock contention; cancellation contamination | `87fae430`, `03b77781`, `c9da4974` |
+| `weak-misroute-producer.cfg` | Lets a completed producer enqueue into a different live turn. | `Inv6TerminalIsolation` | Terminal producer contamination | `87fae430`, `03b77781`, `c9da4974` |
+| `weak-lost-waiter.cfg` | Lets cancellation drop a queued waiter slot. | `Inv7GateAccounting` | Admission gate and lock contention | `87fae430`, `03b77781`, `c9da4974` |
 | `weak-shutdown-admit.cfg` | Allows new externally visible turns after drain starts. | `Inv8ShutdownDrain` | Shutdown drain and background task lifecycle | `66b9196d`, `ec36ef60`, `3bdc9dea` |
 | `weak-leak-owner-on-terminal.cfg` | Lets terminal completion/cancel/timeout leave the durable owner slot assigned. | `Inv9TerminalOwnerReleased` | Lease and reservation leaks | `592d47b3`, `015f669e`, `783665b9` |
 | `weak-popped-not-finalized.cfg` | Models `response.completed` being popped from pending before the finalizer owns cleanup, then aborting. | `Inv3ReservationSettledExactlyOnce` | HTTP bridge completed-event cleanup ownership loss | `1594`, `778c533f`, `592d47b3` |

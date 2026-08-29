@@ -26,20 +26,27 @@ def test_core_ownership_guards_snapshot_refresh_and_retry_outcomes() -> None:
     assert "/\\ snapshotRoute[t].attempted" in spec
     assert "/\\ snapshotRoute[t].replica = r" in spec
     assert "/\\ snapshotRoute[t].account = a" in spec
+    assert "/\\ (snapshotRoute[t].version = durableVersion[a] \\/ WeakStaleRouteAcquire)" in spec
+    assert "version |-> snapshotVersion[r][a]" in spec
+    assert (ROOT / "spec" / "weak-stale-route-acquire.cfg").exists()
     assert "ClientRetryFails ==" in spec
     assert "ClientRetrySucceeds ==" in spec
     assert "CompletedProducerEventuallyDelivered ==" in spec
     assert "DeliverProducer(t, u) ==" in spec
+    assert "IF WeakMisrouteProducer" in spec
+    assert (ROOT / "spec" / "weak-misroute-producer.cfg").exists()
 
 
 def test_core_ownership_anchor_checks_are_not_vacuous() -> None:
     spec = CORE_OWNERSHIP.read_text()
 
-    # A mismatched-lineage anchor is a reachable input, so the lineage
-    # conjunct of AnchorSafe has something to reject.
+    # A mismatched-lineage anchor is reachable only under its weakening, so the
+    # full model rejects it before dispatch and the control remains non-vacuous.
     assert "MismatchedLineageAnchor(a) ==" in spec
     assert "lineageOk |-> FALSE" in spec
     assert "MismatchedLineage == " in spec
+    assert "(inj = MismatchedLineage /\\ WeakIgnoreAnchorLineage)" in spec
+    assert "/\\ badAnchorUse' = (badAnchorUse \\/ inj = MismatchedLineage)" in spec
     # One replay per anchor value: without this UseAnchor is an unconditional
     # self-loop that hides deadlocks from TLC.
     assert "/\\ ~anchorUsed[t]" in spec
@@ -74,6 +81,24 @@ def test_core_ownership_only_completes_after_response_phase() -> None:
 def test_core_ownership_clamps_request_budget_before_each_phase_reset() -> None:
     spec = CORE_OWNERSHIP.read_text()
 
-    assert spec.count("LET remainingRequest == SubtractFloor(requestDeadline[t], phaseElapsed[t])") == 3
-    assert spec.count("/\\ requestDeadline' = [requestDeadline EXCEPT ![t] = remainingRequest]") == 3
+    assert spec.count("LET remainingRequest == SubtractFloor(requestDeadline[t], phaseElapsed[t])") == 4
+    assert spec.count("/\\ requestDeadline' = [requestDeadline EXCEPT ![t] = remainingRequest]") == 4
     assert "StartStream(t, k) ==" in spec
+    assert "StreamProgress(t) ==" in spec
+
+
+def test_core_ownership_shutdown_waits_for_terminal_delivery() -> None:
+    spec = CORE_OWNERSHIP.read_text()
+
+    delivery_guard = 'terminalReason[t] = "completed" => producerDelivered[t]'
+    assert spec.count(delivery_guard) >= 2
+    assert "CompleteShutdown ==" in spec
+    assert "Inv8ShutdownDrain ==" in spec
+
+
+def test_tlc_metadata_stays_under_ignored_spec_state() -> None:
+    checker = (ROOT / "spec" / "check.sh").read_text()
+
+    assert 'ACTIVE_TLC_METADIR="$(mktemp -d "$SPEC_DIR/states/run.XXXXXX")"' in checker
+    assert '-metadir "$ACTIVE_TLC_METADIR"' in checker
+    assert "trap cleanup_tlc_metadir EXIT" in checker

@@ -7,6 +7,16 @@ JAR="$SPEC_DIR/tla2tools.jar"
 TLA_VERSION="v1.7.4"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/${TLA_VERSION}/tla2tools.jar"
 TLA2TOOLS_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+ACTIVE_TLC_METADIR=""
+
+cleanup_tlc_metadir() {
+  if [[ -n "$ACTIVE_TLC_METADIR" && "$ACTIVE_TLC_METADIR" == "$SPEC_DIR/states/"* ]]; then
+    rm -rf -- "$ACTIVE_TLC_METADIR"
+  fi
+  ACTIVE_TLC_METADIR=""
+}
+
+trap cleanup_tlc_metadir EXIT
 
 # Each weakening must fail with the invariant it was built to demonstrate.
 # A "PROPERTY:<Name>" expectation means the weakening must keep every invariant
@@ -19,8 +29,10 @@ declare -A EXPECTED_VIOLATION=(
   ["weak-skip-release-on-cancel.cfg"]="Inv3ReservationSettledExactlyOnce"
   ["weak-double-settle.cfg"]="Inv3ReservationSettledExactlyOnce"
   ["weak-stale-cache.cfg"]="Inv4FreshSnapshots"
+  ["weak-stale-route-acquire.cfg"]="Inv4FreshSnapshots"
   ["weak-non-atomic-claim.cfg"]="Inv5SingleOwnerCAS"
-  ["weak-lost-waiter.cfg"]="Inv6TerminalIsolation|Inv7GateAccounting"
+  ["weak-misroute-producer.cfg"]="Inv6TerminalIsolation"
+  ["weak-lost-waiter.cfg"]="Inv7GateAccounting"
   ["weak-shutdown-admit.cfg"]="Inv8ShutdownDrain"
   ["weak-leak-owner-on-terminal.cfg"]="Inv9TerminalOwnerReleased"
   ["weak-popped-not-finalized.cfg"]="Inv3ReservationSettledExactlyOnce"
@@ -68,20 +80,26 @@ run_tlc() {
   local cfg="$1"
   local out="$2"
   local budget="${3:-0}"
+  local status=0
   local -a launcher=()
   if [[ "$budget" != "0" ]]; then
     # SIGINT rather than SIGTERM: TLC installs a handler that prints the
     # progress statistics we parse below before exiting.
     launcher=(timeout --signal=INT --kill-after=60 "$budget")
   fi
+  mkdir -p "$SPEC_DIR/states"
+  ACTIVE_TLC_METADIR="$(mktemp -d "$SPEC_DIR/states/run.XXXXXX")"
   # Pin the JVM locale: TLC groups the digits of its state counts with the
   # platform separator, and the parsers below expect one fixed grouping.
   "${launcher[@]}" java -XX:+UseParallelGC \
     -Duser.language=en -Duser.country=US \
     -jar "$JAR" \
     -workers auto \
+    -metadir "$ACTIVE_TLC_METADIR" \
     -config "$cfg" \
-    "$SPEC_DIR/CoreOwnership.tla" >"$out" 2>&1
+    "$SPEC_DIR/CoreOwnership.tla" >"$out" 2>&1 || status=$?
+  cleanup_tlc_metadir
+  return "$status"
 }
 
 search_depth() {
