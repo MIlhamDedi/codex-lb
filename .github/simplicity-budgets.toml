@@ -63,6 +63,7 @@ allowed = [
   "pyproject.toml",
   "renovate.json",
   "scripts",
+  "spec",
   "tests",
   "uv.lock",
 ]
