@@ -1801,8 +1801,8 @@ async def test_quota_warmup_claim_expiry_migration_upgrade_and_downgrade(tmp_pat
     from app.db.migrate import _build_alembic_config
 
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'quota-warmup-claim-expiry.sqlite'}"
-    parent_revision = "20260806_020000_add_usage_history_bulk_covering_indexes"
-    claim_revision = "20260806_030000_add_quota_warmup_claim_expiry"
+    parent_revision = "20260828_000000_add_accounts_chatgpt_identity_index"
+    claim_revision = "20260830_000000_add_quota_warmup_claim_expiry"
 
     await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
     engine = create_async_engine(db_url, future=True)

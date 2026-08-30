@@ -1,12 +1,17 @@
-"""Add expiry metadata for quota warmup execution claims."""
+"""Add expiry metadata for quota warmup execution claims.
+
+Revision ID: 20260830_000000_add_quota_warmup_claim_expiry
+Revises: 20260828_000000_add_accounts_chatgpt_identity_index
+Create Date: 2026-08-30
+"""
 
 from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "20260806_030000_add_quota_warmup_claim_expiry"
-down_revision = "20260820_000000_repair_retired_identity_and_warmup_stamp"
+revision = "20260830_000000_add_quota_warmup_claim_expiry"
+down_revision = "20260828_000000_add_accounts_chatgpt_identity_index"
 branch_labels = None
 depends_on = None
 

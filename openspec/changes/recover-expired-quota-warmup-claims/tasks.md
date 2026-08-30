@@ -17,7 +17,7 @@
 
 - [x] 3.1 Add focused regression coverage for long TTL claims, stale-claim
       scheduler sweeps, request-log-based reconciliation, and the
-      `20260806_030000_add_quota_warmup_claim_expiry` migration.
+      `20260830_000000_add_quota_warmup_claim_expiry` migration.
 - [x] 3.2 Run focused pytest, `uv run ruff check`, `uv run ruff format --check`,
       `openspec validate recover-expired-quota-warmup-claims --strict`, and
       `openspec validate --specs` so the normative specs are checked too.
