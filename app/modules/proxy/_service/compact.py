@@ -10,6 +10,7 @@ from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 import aiohttp
 import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
 from pydantic import ValidationError
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
@@ -1034,7 +1035,7 @@ class _CompactMixin:
                 # promises to re-raise after the flush. Probe without
                 # suspending so a disconnected compact request still cancels.
                 try:
-                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    await checkpoint_if_cancelled()
                 except asyncio.CancelledError:
                     cancellation_pending = True
             try:

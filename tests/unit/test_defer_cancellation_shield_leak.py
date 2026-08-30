@@ -53,6 +53,7 @@ async def test_level_cancelled_scope_does_not_grow_task_callbacks():
         with anyio.CancelScope() as scope:
             scope.cancel()
             return await _await_task_deferring_cancellation(task)
+        raise AssertionError("cancelled scope must not suppress the helper's return")
 
     waiter_task = asyncio.create_task(waiter())
     # Give the old busy-spin ample iterations to manifest: the unshielded

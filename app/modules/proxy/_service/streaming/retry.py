@@ -11,6 +11,7 @@ from typing import Any, AsyncGenerator, AsyncIterator, Mapping, TypeVar, cast
 
 import aiohttp
 import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
 from app.core.balancer import failover_decision
@@ -117,7 +118,7 @@ async def _await_task_deferring_cancellation(
         # to surface. Probe for it without suspending so callers still get
         # their cancellation marker after the owned task finished.
         try:
-            await anyio.lowlevel.checkpoint_if_cancelled()
+            await checkpoint_if_cancelled()
         except asyncio.CancelledError as exc:
             cancellation = exc
     return result, cancellation

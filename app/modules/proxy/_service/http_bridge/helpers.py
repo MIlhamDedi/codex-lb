@@ -13,6 +13,7 @@ from typing import Any, Literal, Mapping, TypeVar, cast
 from urllib.parse import urlparse
 
 import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
 
 from app.core import shutdown as shutdown_state
 from app.core.balancer.rendezvous_hash import select_node
@@ -256,7 +257,7 @@ async def _await_task_deferring_cancellation(
         # to surface. Probe for it without suspending so callers still get
         # their cancellation marker after the owned task finished.
         try:
-            await anyio.lowlevel.checkpoint_if_cancelled()
+            await checkpoint_if_cancelled()
         except asyncio.CancelledError as exc:
             cancellation = exc
     return result, cancellation
