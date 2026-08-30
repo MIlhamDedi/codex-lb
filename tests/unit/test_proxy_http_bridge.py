@@ -28599,6 +28599,67 @@ async def test_http_bridge_retirement_still_closes_eventless_session_after_retry
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_retirement_does_not_revive_detached_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The acquisition loop can detach a retiring_with_visible_requests
+    # generation with mark_closed=False while the retire coroutine is
+    # suspended. The revive branch must not clear that detached generation's
+    # retirement flags: with no close ever scheduled for it, drain-retirement
+    # would become a permanent no-op and the generation would leak its
+    # socket, durable/account leases, and capacity slot.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-detached-generation-revive",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-retire-detached-generation",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.upstream_control.reconnect_requested = True
+    session.upstream_control.retire_after_drain = True
+    service._http_bridge_sessions[session.key] = session
+    successor = _make_bridge_session(key_value="bridge-retire-detached-generation")
+    close = AsyncMock()
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", close)
+
+    async def record_failure_during_await(*_args: Any, **_kwargs: Any) -> None:
+        # The session becomes healthy during the strike await, but the
+        # acquisition loop concurrently detaches it (mark_closed=False) and
+        # registers a successor generation under the same key.
+        await asyncio.sleep(0)
+        async with session.pending_lock:
+            request_state.response_event_count = 1
+            session.last_upstream_event_generation += 1
+        service._http_bridge_sessions[session.key] = successor
+
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure_during_await)
+
+    await service._retire_stale_pending_http_bridge_session(
+        session,
+        detail="stream_incomplete",
+        response_events_seen=0,
+    )
+
+    # The detached generation is not revived: its retirement flags survive
+    # and the bounded close releases its resources.
+    assert session.upstream_control.reconnect_requested is True
+    assert session.upstream_control.retire_after_drain is True
+    assert session.upstream_close_attempted is True
+    close.assert_awaited_once_with(session, reason="retire_stale_pending")
+    # The successor generation keeps canonical ownership of the key.
+    assert service._http_bridge_sessions[session.key] is successor
+    assert successor.closed is False
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_retry_circuit_backoff_is_scoped_to_repeated_hard_keys() -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     hard_session = _make_bridge_session(key_value="bridge-circuit-hard")

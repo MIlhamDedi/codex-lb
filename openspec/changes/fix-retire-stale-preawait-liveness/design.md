@@ -20,6 +20,7 @@
 - Hold `_http_bridge_lock` while acquiring `session.pending_lock` for the final decision. This keeps registry identity and pending liveness from being observed as a mixed snapshot.
 - Compute the final response-event signal from the current pending request states, while retaining the caller's explicit signal as a lower bound for callers that already observed an event. If any current request has a response id or response-created latency, treat it as healthy too.
 - Only then set `session.closed`, unregister the session, and claim the upstream close. If liveness is present, return without mutating retirement state.
+- Gate the revive on registry identity: only clear retirement flags while `self._http_bridge_sessions.get(session.key) is session` under `_http_bridge_lock`. The acquisition loop can detach a `retiring_with_visible_requests` generation with `mark_closed=False` while the retire coroutine is suspended; reviving that detached generation would orphan it (no close scheduled, drain-retirement a permanent no-op) and leak its socket, durable/account leases, and capacity slot. A detached generation falls through to the bounded close instead, preserving main's detached-lifecycle ownership.
 
 ## Risks / Trade-offs
 

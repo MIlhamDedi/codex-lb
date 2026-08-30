@@ -3078,11 +3078,21 @@ class _HTTPBridgeRequestSubmitMixin:
                 session.closed = True
                 self._detach_http_bridge_session_locked(session.key, expected_session=session)
                 return
-            if became_healthy_during_suspend:
+            if became_healthy_during_suspend and self._http_bridge_sessions.get(session.key) is session:
                 # The pending snapshot is only advisory; a terminal response
                 # may already have left the deque. A close owner cannot have
                 # claimed retirement in between: the branch above returns under
                 # this same lock hold without awaiting.
+                #
+                # Revive only while this session is still the registered owner
+                # of its key. The acquisition loop can detach a
+                # ``retiring_with_visible_requests`` generation with
+                # ``mark_closed=False`` while this coroutine is suspended;
+                # clearing the retirement flags on that detached generation
+                # would make its drain-retirement a permanent no-op and leak
+                # the socket, durable/account leases, and capacity slot. A
+                # detached generation falls through to the bounded close
+                # below instead (the detach call is a no-op for it).
                 session.closed = False
                 session.upstream_control.reconnect_requested = False
                 session.upstream_control.retire_after_drain = False

@@ -11,6 +11,13 @@ Before closing and unregistering a stale HTTP bridge session, the service MUST r
 - **THEN** the final decision observes the event under the bridge and pending-state locks
 - **AND** the session remains registered, open, and reusable
 
+#### Scenario: Detached generation is not revived by post-suspension liveness
+
+- **WHEN** stale retirement observes post-suspension liveness for a session
+- **AND** the acquisition loop has already detached that session from the registry during the suspension
+- **THEN** the final decision does not clear the detached generation's retirement flags
+- **AND** the detached generation still receives its bounded close so its socket, leases, and capacity slot are released
+
 #### Scenario: Session remains eventless during retry-circuit suspension
 
 - **WHEN** stale retirement samples zero response events and suspends for retry-circuit bookkeeping
