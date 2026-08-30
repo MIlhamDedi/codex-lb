@@ -1795,6 +1795,8 @@ async def test_stamped_merge_rollup_repair_downgrade_preserves_schema(tmp_path):
 
 @pytest.mark.asyncio
 async def test_quota_warmup_claim_expiry_migration_upgrade_and_downgrade(tmp_path):
+    from datetime import datetime, timezone
+
     from alembic import command
     from sqlalchemy import inspect as sa_inspect
 
@@ -1808,6 +1810,9 @@ async def test_quota_warmup_claim_expiry_migration_upgrade_and_downgrade(tmp_pat
     engine = create_async_engine(db_url, future=True)
     try:
         async with engine.begin() as conn:
+            # A claim that could still be mid-probe when the migration runs
+            # (claim stamp = now) and one whose claim stamp is older than any
+            # probe can run (genuinely stranded by a crash).
             await conn.execute(
                 text(
                     """
@@ -1819,6 +1824,11 @@ async def test_quota_warmup_claim_expiry_migration_upgrade_and_downgrade(tmp_pat
                         'warmup-legacy-executing', 'auto', 'warmup', 'acc-legacy', NULL, NULL,
                         0.0, 'legacy_executing', NULL, NULL,
                         NULL, 'executing', 'legacy-warmup-claim', CURRENT_TIMESTAMP
+                    ), (
+                        'warmup-legacy-stranded', 'auto', 'warmup', 'acc-legacy', NULL,
+                        '2026-01-01 00:00:00.000000',
+                        0.0, 'legacy_executing', NULL, NULL,
+                        NULL, 'executing', 'legacy-warmup-claim-stranded', '2026-01-01 00:00:00.000000'
                     )
                     """
                 )
@@ -1836,13 +1846,26 @@ async def test_quota_warmup_claim_expiry_migration_upgrade_and_downgrade(tmp_pat
                     column["name"] for column in sa_inspect(sync_conn).get_columns("quota_planner_decisions")
                 }
             )
-            lease_value = (
+            live_lease = (
                 await conn.execute(
                     text("SELECT lease_expires_at FROM quota_planner_decisions WHERE id = 'warmup-legacy-executing'")
                 )
             ).scalar_one()
+            stranded_lease = (
+                await conn.execute(
+                    text("SELECT lease_expires_at FROM quota_planner_decisions WHERE id = 'warmup-legacy-stranded'")
+                )
+            ).scalar_one()
         assert "lease_expires_at" in columns
-        assert lease_value is not None
+        # A possibly-live legacy claim keeps a conservative execution window:
+        # its backfilled lease must still be in the future so a concurrent
+        # pre-migration probe is not reclaimed (and duplicated) mid-flight.
+        assert live_lease is not None
+        assert datetime.fromisoformat(str(live_lease)) > datetime.now(timezone.utc).replace(tzinfo=None)
+        # A claim stamped long before the migration is already expired and
+        # recoverable on the next scheduler sweep.
+        assert stranded_lease is not None
+        assert datetime.fromisoformat(str(stranded_lease)) <= datetime.now(timezone.utc).replace(tzinfo=None)
 
         await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
         async with engine.connect() as conn:

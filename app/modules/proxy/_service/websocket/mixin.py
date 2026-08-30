@@ -2822,7 +2822,18 @@ class _WebSocketMixin:
         finally:
 
             def current_scope_cleanup_timeout() -> float:
-                remaining = shutdown_state.remaining_drain_timeout_seconds()
+                # The scope-cleanup wait guards terminal settlement (request
+                # finalization, lease release), which may legitimately outlive
+                # the drain deadline: when the server has published its
+                # post-drain cleanup reserve, draw on the shared
+                # drain-plus-reserve remainder — mirroring the shielded
+                # terminal-settlement wait — so an exhausted drain does not
+                # abandon the cleanup task with a zero budget. Without a
+                # published reserve (reversible operator drain, embedded
+                # lifespans) this stays bounded by the drain remainder.
+                remaining = shutdown_state.remaining_post_drain_cleanup_timeout_seconds()
+                if remaining is None:
+                    remaining = shutdown_state.remaining_drain_timeout_seconds()
                 return _WEBSOCKET_SCOPE_CLEANUP_TIMEOUT_SECONDS if remaining is None else max(float(remaining), 0.0)
 
             def current_cleanup_timeout() -> float:
