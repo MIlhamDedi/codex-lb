@@ -368,17 +368,17 @@ def test_is_model_scoped_upstream_rejection(message: str | None, expected: bool)
 
 
 @pytest.mark.parametrize(
-    "code",
+    ("code", "expected_failure_class"),
     [
         # The live streaming path normalizes this rejection to the
         # ``upstream_error`` fallback because upstream sends neither ``code``
         # nor ``type``; other paths surface ``invalid_request_error``.
-        "upstream_error",
-        "invalid_request_error",
+        ("upstream_error", "retryable_transient"),
+        ("invalid_request_error", "non_retryable"),
     ],
 )
 @pytest.mark.asyncio
-async def test_model_scoped_rejection_does_not_penalize_account(code: str) -> None:
+async def test_model_scoped_rejection_does_not_penalize_account(code: str, expected_failure_class: str) -> None:
     load_balancer = SimpleNamespace(
         record_error=AsyncMock(),
         record_errors=AsyncMock(),
@@ -403,6 +403,7 @@ async def test_model_scoped_rejection_does_not_penalize_account(code: str) -> No
 
     # Failover is untouched: another account may hold a different entitlement.
     assert classified["error_code"] == code
+    assert classified["failure_class"] == expected_failure_class
     load_balancer.record_error.assert_not_awaited()
     load_balancer.record_errors.assert_not_awaited()
     load_balancer.mark_rate_limit.assert_not_awaited()

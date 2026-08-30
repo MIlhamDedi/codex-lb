@@ -727,6 +727,12 @@ async def test_disabled_source_does_not_capture_a_subscription_model_slug(async_
     """
     await _enable_api_key_auth(async_client)
     model = "gpt-5.6-sol"
+    from app.core.openai.model_registry import get_model_registry
+
+    # Precondition: without registry membership the disabled source would win
+    # the lookup and this test would assert model_source_disabled instead of
+    # subscription precedence.
+    assert model in get_model_registry().get_models_with_fallback()
     source_id = await _create_model_source(
         async_client,
         name="disabled-shadow-source",
