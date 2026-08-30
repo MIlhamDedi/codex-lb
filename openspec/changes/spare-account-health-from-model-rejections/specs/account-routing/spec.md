@@ -39,6 +39,12 @@ When upstream rejects a request because of the request payload itself, the proxy
 - **THEN** no serving account enters error backoff because of those rejections
 - **AND** unrelated traffic hard-pinned to those accounts is not denied with a continuity-owner-unavailable or no-available-accounts selection error caused by them
 
+#### Scenario: Model-entitlement rejection still penalizes the account
+
+- **GIVEN** account A is selected for a request
+- **WHEN** upstream fails with a non-400 status whose message matches the model-entitlement rejection
+- **THEN** the proxy records the account-health penalty for account A as before, because only a genuine HTTP 400 qualifies as the model-scoped rejection
+
 #### Scenario: A genuine upstream failure still penalizes the account
 
 - **GIVEN** account A is selected for a request
