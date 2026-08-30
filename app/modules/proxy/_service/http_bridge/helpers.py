@@ -674,7 +674,6 @@ def _http_bridge_denied_anchor_fence_advanced(
     )
 
 
-
 # Silence before ``response.created`` is a different failure class than a
 # stream that started and then went quiet. When no unmatched upstream liveness
 # was observed, nothing exists upstream yet, so the request is safe to retry and
