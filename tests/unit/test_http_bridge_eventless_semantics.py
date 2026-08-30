@@ -211,6 +211,78 @@ async def test_http_bridge_pre_response_silence_is_bridge_eventless_timeout(
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_eventless_timeout_without_liveness_promises_safe_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Zero unmatched liveness keeps the unconditional safe-to-retry contract.
+
+    Companion to the count=2 caution case above: with no unmatched upstream
+    frames the terminal message must state the request is safe to retry, so an
+    unconditional caution string cannot silently replace the safe wording.
+    """
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _eventless_settings())
+    monkeypatch.setattr(proxy_service, "_HTTP_BRIDGE_STARTUP_KEEPALIVE_GRACE_SECONDS", 0.001)
+    monkeypatch.setattr(service, "_detach_http_bridge_request", AsyncMock())
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", AsyncMock(return_value=False))
+    monkeypatch.setattr(service, "_http_bridge_precreated_retry_cooldown_seconds", AsyncMock(return_value=0.0))
+    service._durable_bridge = cast(
+        Any,
+        SimpleNamespace(
+            lookup_retry_circuit=AsyncMock(return_value=None),
+            persist_retry_circuit=AsyncMock(return_value=None),
+        ),
+    )
+
+    session = _make_bridge_session(key_value="sid-eventless-safe-retry")
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-eventless-safe-retry",
+        model="gpt-5.6-luna",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        event_queue=asyncio.Queue(),
+        transport="http",
+        request_text='{"type":"response.create"}',
+    )
+
+    async def submit(target_session: Any, *, request_state: Any, **kwargs: Any) -> None:
+        del kwargs
+        target_session.pending_requests.append(request_state)
+
+    monkeypatch.setattr(service, "_submit_http_bridge_request", submit)
+
+    assert session.unmatched_upstream_liveness_count == 0
+
+    with caplog.at_level(logging.INFO, logger="app.modules.proxy.service"):
+        events = [
+            event
+            async for event in service._stream_http_bridge_session_events(
+                session,
+                request_state=request_state,
+                text_data='{"type":"response.create"}',
+                queue_limit=8,
+                propagate_http_errors=False,
+                downstream_turn_state=None,
+            )
+        ]
+
+    terminal = cast(dict[str, Any], proxy_service.parse_sse_data_json(events[-1]))
+    assert terminal["type"] == "response.failed"
+    error = cast(dict[str, Any], cast(dict[str, Any], terminal["response"])["error"])
+    assert error["code"] == "bridge_eventless_timeout"
+    assert error["message"] == http_bridge_helpers_module._HTTP_BRIDGE_EVENTLESS_TIMEOUT_MESSAGE
+    assert "safe to retry" in cast(str, error["message"])
+    assert "retry may duplicate upstream work" not in cast(str, error["message"])
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("unmatched_upstream_liveness=0" in m for m in messages)
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_post_response_start_still_uses_stream_idle_timeout(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
