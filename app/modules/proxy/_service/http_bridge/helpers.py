@@ -12,6 +12,8 @@ from ipaddress import ip_address
 from typing import Any, Literal, Mapping, TypeVar, cast
 from urllib.parse import urlparse
 
+import anyio
+
 from app.core import shutdown as shutdown_state
 from app.core.balancer.rendezvous_hash import select_node
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
@@ -64,6 +66,7 @@ from app.core.openai.requests import (
 from app.core.resilience.overload import local_overload_error
 from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id
+from app.core.utils.shared_future import wait_on_shared_future
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
@@ -232,13 +235,22 @@ async def _await_task_deferring_cancellation(
     """Finish critical cleanup while preserving the caller's cancellation."""
 
     cancellation: asyncio.CancelledError | None = None
-    while True:
-        try:
-            return await asyncio.shield(task), cancellation
-        except asyncio.CancelledError as exc:
-            if task.cancelled():
-                raise
-            cancellation = cancellation or exc
+    # The anyio shield keeps a level-cancelled Starlette scope from re-raising
+    # into every ``await``, which would otherwise busy-spin this loop until the
+    # owned task completes. ``wait_on_shared_future`` keeps the loop's waits
+    # off the task's done-callback list: Python 3.14's ``asyncio.shield``
+    # leaks a callback per cancelled wait, so re-shielding a task wedged on a
+    # lock grew 100k+ callbacks and O(n^2) remove scans in the 2026-08-30
+    # production event-loop livelock.
+    with anyio.CancelScope(shield=True):
+        while True:
+            try:
+                return await wait_on_shared_future(task), cancellation
+            except asyncio.CancelledError as exc:
+                if task.cancelled():
+                    raise
+                cancellation = cancellation or exc
+    raise RuntimeError("unreachable shielded cancellation-deferral state")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1157,8 +1169,11 @@ async def _close_http_bridge_session_bounded(
         close_task.add_done_callback(close_done)
 
     try:
-        await asyncio.wait_for(
-            asyncio.shield(close_task),
+        # Not ``wait_for(shield(...))``: ``close_task`` is the shared
+        # per-session resource owner, and 3.14's shield leaks a done-callback
+        # onto it for every waiter that times out or is cancelled.
+        await wait_on_shared_future(
+            close_task,
             timeout=_HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS,
         )
     except TimeoutError:
