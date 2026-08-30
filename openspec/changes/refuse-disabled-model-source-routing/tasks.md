@@ -14,6 +14,10 @@
 - [x] Keep the existing source-routing exclusions intact: file-pinned
       Responses requests and terminal compaction triggers skip the refusal and
       continue to subscription routing.
+- [x] Recognize disabled-source ownership in the WebSocket source-ownership
+      guard (`responses_model_is_source_owned`), so both the connect-time and
+      the socket-reuse guard bounce such turns to the HTTP transport where the
+      refusal fires, and cover both guard sites with regression tests.
 - [x] Add the spec delta for `responses-api-compat`.
 - [x] Cover the refusal (disabled source, disabled source model, all three
       routes) and the negative controls (unknown model, subscription slug

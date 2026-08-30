@@ -1815,7 +1815,10 @@ class _WebSocketMixin:
                                     # response.create that switches to a source-owned model
                                     # would otherwise be forwarded to the subscription account
                                     # already attached to the open upstream. Model sources are
-                                    # only reachable from the HTTP request path.
+                                    # only reachable from the HTTP request path. Ownership
+                                    # includes disabled sources, which no subscription account
+                                    # can serve either; over HTTP those meet the 503
+                                    # ``model_source_disabled`` denial.
                                     #
                                     # Gated on an existing upstream on purpose: a first turn has
                                     # no socket yet and must fall through to the connect guard,
@@ -3478,6 +3481,9 @@ class _WebSocketMixin:
         # model is not supported when using Codex with a ChatGPT account."
         # Codex clients fall back to the HTTP transport when a WebSocket
         # connect fails, and that path routes to the source correctly.
+        # Ownership includes disabled sources: no subscription account can
+        # serve those either, and the HTTP fallback answers them with the
+        # informative 503 ``model_source_disabled`` denial.
         #
         # Evaluated once per connect series rather than inside the failover
         # loop below: source ownership is a property of the requested model, so
