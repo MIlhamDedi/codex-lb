@@ -385,7 +385,12 @@ def _http_bridge_pending_count_nowait(
         visible_pending_count = sum(
             1 for request_state in session.pending_requests if request_counts_against_queue(request_state)
         )
-        return max(visible_pending_count, session.queued_request_count)
+        # A registered admission waiter is live work not yet counted into the
+        # queue — it may be suspended on the pre-lock fair-share resolve with
+        # pending_lock free (issue #1971). Counting it keeps capacity LRU
+        # eviction and shutdown drain from treating the session as idle and
+        # closing it under the admitting turn.
+        return max(visible_pending_count, session.queued_request_count, session.admission_waiter_count)
     finally:
         session.pending_lock.release()
 
