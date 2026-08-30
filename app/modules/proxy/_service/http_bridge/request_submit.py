@@ -2622,6 +2622,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.response_event_count,
                     int(request_state.response_id is not None or request_state.latency_response_created_ms is not None),
                 ),
+                # The session was already closed when the last admission
+                # waiter cancelled; its reader is gone, so post-suspension
+                # liveness signals cannot make it serviceable again.
+                allow_liveness_revive=False,
             )
         await self._maybe_release_idle_http_bridge_session_lease(session)
 
@@ -2956,6 +2960,7 @@ class _HTTPBridgeRequestSubmitMixin:
         response_events_seen: int | None = None,
         retired_request_count: int | None = None,
         retry_circuit_attempt_selection: _HTTPBridgeRetryCircuitAttemptSelection | None = None,
+        allow_liveness_revive: bool = True,
     ) -> None:
         async with session.pending_lock:
             retired_request_states = list(session.pending_requests)
@@ -3111,7 +3116,8 @@ class _HTTPBridgeRequestSubmitMixin:
                 session.closed = True
                 self._detach_http_bridge_session_locked(session.key, expected_session=session)
             elif (
-                became_healthy_during_suspend
+                allow_liveness_revive
+                and became_healthy_during_suspend
                 and not fence_raised_during_suspend
                 and self._http_bridge_sessions.get(session.key) is session
             ):
@@ -3131,6 +3137,16 @@ class _HTTPBridgeRequestSubmitMixin:
                 # below instead (the detach call is a no-op for it), as does
                 # a session fenced during the suspension: the bounded close
                 # conservatively satisfies the fence owner's intent.
+                #
+                # ``allow_liveness_revive=False`` callers (the reader-failure
+                # funnel and deferred retirement of an already-closed session)
+                # never reach this branch. Their pending turns were already
+                # terminally failed and their reader is condemned, so there is
+                # no turn left for the revive to save — and the
+                # completed-response signal above can be advanced by durable
+                # anchor rehydration, which copies registry state without any
+                # upstream evidence. Reviving there would leave a condemned,
+                # readerless session registered and reusable.
                 session.closed = False
                 session.upstream_control.reconnect_requested = False
                 session.upstream_control.retire_after_drain = False

@@ -27246,6 +27246,7 @@ async def test_http_bridge_liveness_timeout_is_neutral_not_replayed_and_forces_r
         detail=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
         response_events_seen=0,
         retired_request_count=1,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
     assert session.queued_request_count == 0
@@ -27526,6 +27527,7 @@ async def test_http_bridge_closed_without_liveness_claim_still_settles_pending_s
         detail=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
         response_events_seen=0,
         retired_request_count=2,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
@@ -27662,6 +27664,7 @@ async def test_http_bridge_clean_close_before_response_does_not_penalize_account
         detail="stream_incomplete",
         response_events_seen=0,
         retired_request_count=0,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
@@ -28768,6 +28771,122 @@ async def test_http_bridge_retirement_preserves_fence_raised_during_strike_await
     assert session.upstream_control.reconnect_requested is True
     assert session.upstream_control.retire_after_drain is True
     assert session.upstream_close_attempted is True
+    assert service._http_bridge_sessions.get(session.key) is None
+    close.assert_awaited_once_with(session, reason="retire_stale_pending")
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retirement_ignores_liveness_when_revive_disallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``allow_liveness_revive=False`` callers (the reader-failure funnel and
+    # deferred retirement of an already-closed session) retire sessions whose
+    # pending turns were already terminally failed and whose reader is
+    # condemned. Even genuine post-suspension liveness must not revive them:
+    # there is no turn left to save, and clearing the retirement flags would
+    # leave a readerless session registered and reusable.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-revive-disallowed",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-retire-revive-disallowed",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.closed = True
+    service._http_bridge_sessions[session.key] = session
+    close = AsyncMock()
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", close)
+
+    async def record_failure_during_await(*_args: Any, **_kwargs: Any) -> None:
+        # Every liveness signal fires during the strike await: per-request
+        # events, the generation counter, and the completed-response anchor.
+        await asyncio.sleep(0)
+        async with session.pending_lock:
+            request_state.response_event_count = 1
+            session.last_upstream_event_generation += 1
+            session.last_completed_response_id = "resp-during-suspend"
+
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure_during_await)
+
+    await service._retire_stale_pending_http_bridge_session(
+        session,
+        detail="stream_incomplete",
+        response_events_seen=0,
+        allow_liveness_revive=False,
+    )
+
+    assert session.closed is True
+    assert service._http_bridge_sessions.get(session.key) is None
+    close.assert_awaited_once_with(session, reason="retire_stale_pending")
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_reader_failure_retirement_not_revived_by_anchor_rehydration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A concurrent durable-anchor rehydration copies the durable store's
+    # latest response id into ``session.last_completed_response_id`` without
+    # any upstream evidence. Arriving while the reader-failure funnel's
+    # retirement is suspended for retry-circuit bookkeeping, it must not be
+    # mistaken for post-suspension liveness: the funnel already terminally
+    # failed the pending turns and condemned the reader, so a revive would
+    # leave a readerless session registered and reusable.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-anchor-rehydration-spoof",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-retire-anchor-rehydration",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    service._http_bridge_sessions[session.key] = session
+    close = AsyncMock()
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", close)
+
+    async def fail_pending(*_args: Any, **kwargs: Any) -> bool:
+        # Terminal notification drains the deque before retirement, exactly
+        # like ``_fail_pending_websocket_requests`` does in production.
+        async with session.pending_lock:
+            session.pending_requests.clear()
+        return True
+
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", fail_pending)
+
+    async def record_failure_during_await(*_args: Any, **_kwargs: Any) -> None:
+        # Durable-anchor rehydration lands while the retirement is suspended
+        # at retry-circuit persistence: the completed-response anchor moves
+        # with no upstream event and no pending request.
+        await asyncio.sleep(0)
+        async with session.pending_lock:
+            session.last_completed_response_id = "resp-durable-anchor"
+
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure_during_await)
+
+    retired = await service._fail_http_bridge_reader_and_maybe_retire(
+        session,
+        error_code=UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
+        error_message="Upstream websocket liveness failed",
+        penalize_account=False,
+        force_retire=True,
+    )
+
+    assert retired is True
+    assert session.closed is True
     assert service._http_bridge_sessions.get(session.key) is None
     close.assert_awaited_once_with(session, reason="retire_stale_pending")
 
@@ -30368,6 +30487,7 @@ async def test_http_bridge_repeated_zero_event_idle_timeouts_poison_anchor_with_
         session,
         detail="repeated_zero_event_idle_timeout",
         response_events_seen=0,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
@@ -30419,6 +30539,7 @@ async def test_http_bridge_repeated_zero_event_stream_incompletes_poison_anchor_
         session,
         detail="repeated_zero_event_stream_incomplete",
         response_events_seen=0,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
@@ -30708,6 +30829,7 @@ async def test_http_bridge_eventless_timeout_force_retires_with_admission_waiter
         detail="missing_response_created_timeout",
         response_events_seen=0,
         retired_request_count=0,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
     fail_pending_await_args = fail_pending.await_args
@@ -30738,6 +30860,7 @@ async def test_http_bridge_reader_failure_retires_without_waiters_when_notificat
         detail="stream_incomplete",
         response_events_seen=0,
         retired_request_count=0,
+        allow_liveness_revive=False,
         retry_circuit_attempt_selection=proxy_support_module._HTTPBridgeRetryCircuitAttemptSelection(kind="absent"),
     )
 
