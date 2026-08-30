@@ -274,6 +274,67 @@ async def test_reacquire_with_snapshot_never_touches_settings_cache_under_lock(
 
 
 @pytest.mark.asyncio
+async def test_keyed_submit_with_held_lease_never_reads_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A keyed session already holding its stream lease admits turns without
+    any settings-cache dependency — a stalled or unavailable settings DB must
+    not block or fail requests that need no lease reacquisition."""
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(api_key_id="key-leased")
+    session.account_lease = _make_lease("l-held")
+    monkeypatch.setattr(service._load_balancer, "release_account_lease", AsyncMock())
+
+    settings_get = AsyncMock(side_effect=AssertionError("settings cache must not be read for a leased session"))
+    monkeypatch.setattr(
+        http_bridge_request_submit_module,
+        "_service_get_settings_cache",
+        lambda: SimpleNamespace(get=settings_get),
+    )
+
+    prewarm_reached = asyncio.Event()
+
+    async def hold_in_prewarm(*_args: object, **_kwargs: object) -> None:
+        prewarm_reached.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_maybe_prewarm_http_bridge_session", AsyncMock(side_effect=hold_in_prewarm))
+
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-leased-no-settings",
+        model="gpt-5.2",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        request_text='{"type":"response.create","model":"gpt-5.2","input":"hi"}',
+        transport="http",
+        skip_request_log=True,
+    )
+    submit_task = asyncio.create_task(
+        service._submit_http_bridge_request(
+            session,
+            request_state=request_state,
+            text_data=request_state.request_text or "{}",
+            queue_limit=8,
+        )
+    )
+    # Reaching prewarm proves the first admission section completed without
+    # touching the settings cache (the mock would have raised).
+    await asyncio.wait_for(prewarm_reached.wait(), timeout=1)
+    settings_get.assert_not_awaited()
+
+    submit_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(submit_task, timeout=1)
+    settings_get.assert_not_awaited()
+    assert session.admission_waiter_count == 0
+
+
+@pytest.mark.asyncio
 async def test_keyed_submit_resolves_fair_share_before_pending_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1614,10 +1614,19 @@ class _HTTPBridgeRequestSubmitMixin:
             async with session.pending_lock:
                 session.admission_waiter_count += 1
                 admission_waiter_registered = True
-            # Resolved before the reacquire's pending_lock: the settings-cache
+                # Snapshot under the same lock: with the waiter registered, a
+                # held lease cannot be idle-released, so a session that does
+                # not need reacquisition here will not need it at the
+                # reacquire either.
+                needs_stream_lease = session.account_lease is None and not session.closed
+            # Resolved before the reacquire's pending_lock — the settings-cache
             # refresh behind this can run a DB query and must not suspend the
-            # critical section (issue #1971).
-            fair_share_threshold_pct = await self._http_bridge_fair_share_threshold_pct(session)
+            # critical section (issue #1971) — and only when the reacquire can
+            # actually run: a session already holding its lease never depended
+            # on a settings read to admit a turn.
+            fair_share_threshold_pct = (
+                await self._http_bridge_fair_share_threshold_pct(session) if needs_stream_lease else 0
+            )
             async with session.pending_lock:
                 await self._ensure_http_bridge_session_stream_lease_locked(
                     session,
