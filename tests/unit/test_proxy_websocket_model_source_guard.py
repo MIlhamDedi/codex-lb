@@ -435,7 +435,7 @@ class _AliasSourceCatalog:
                         return SimpleNamespace(id="src_disabled", name="disabled-source", is_enabled=False)
                     return None
                 if candidate in catalog.source_models:
-                    return SimpleNamespace(id="src_alias", name="alias-source", enabled=True)
+                    return SimpleNamespace(id="src_alias", name="alias-source", is_enabled=True)
                 return None
 
         @asynccontextmanager

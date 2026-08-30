@@ -864,11 +864,12 @@ def _is_account_neutral_request_rejection(
     on a self-inconsistent conversation drives its serving accounts into
     ``error_count`` backoff and starves unrelated tenants.
 
-    Keep this set narrow. Not every upstream ``invalid_request_error`` is
-    account neutral -- the model-entitlement rejection matched by
-    ``_is_account_model_unsupported_error`` is genuinely account scoped -- so
-    membership is decided by the specific classified message, never by the
-    ``invalid_request_error`` code alone.
+    Keep this set narrow: membership is decided by the specific classified
+    message, never by the ``invalid_request_error`` code alone. The
+    model-entitlement rejection is deliberately not a member -- it is handled
+    by ``_is_model_scoped_rejection`` below, which likewise keeps the account's
+    health untouched but still lets failover try accounts whose entitlements
+    may differ.
     """
     if code != "invalid_request_error":
         return False
