@@ -1605,8 +1605,16 @@ class _HTTPBridgeRequestSubmitMixin:
         request_enqueued = False
         admission_waiter_registered = False
         try:
+            # Resolved before pending_lock: the settings-cache refresh behind
+            # this can run a DB query and must not suspend the critical
+            # section (issue #1971).
+            fair_share_threshold_pct = await self._http_bridge_fair_share_threshold_pct(session)
             async with session.pending_lock:
-                await self._ensure_http_bridge_session_stream_lease_locked(session, request_state=request_state)
+                await self._ensure_http_bridge_session_stream_lease_locked(
+                    session,
+                    request_state=request_state,
+                    fair_share_threshold_pct=fair_share_threshold_pct,
+                )
                 # Register the submit as an admission waiter atomically with the
                 # reacquire so a previous turn's finalizer unwinding concurrently
                 # cannot see an apparently idle session and release this lease
@@ -1654,6 +1662,10 @@ class _HTTPBridgeRequestSubmitMixin:
             await _await_task_deferring_cancellation(cleanup_task)
             raise
         try:
+            # Re-resolved after the prewarm await; still before pending_lock
+            # so the settings-cache refresh cannot suspend the critical
+            # section (issue #1971).
+            fair_share_threshold_pct = await self._http_bridge_fair_share_threshold_pct(session)
             async with session.pending_lock:
                 if session.queued_request_count >= queue_limit:
                     _log_http_bridge_event(
@@ -1673,7 +1685,11 @@ class _HTTPBridgeRequestSubmitMixin:
                             error_type="rate_limit_error",
                         ),
                     )
-                await self._ensure_http_bridge_session_stream_lease_locked(session, request_state=request_state)
+                await self._ensure_http_bridge_session_stream_lease_locked(
+                    session,
+                    request_state=request_state,
+                    fair_share_threshold_pct=fair_share_threshold_pct,
+                )
                 session.queued_request_count += 1
                 if getattr(session, "unanchored_reservation_id", None) == request_scope_id:
                     session.unanchored_reservation_id = None
@@ -2588,15 +2604,41 @@ class _HTTPBridgeRequestSubmitMixin:
             )
         await self._maybe_release_idle_http_bridge_session_lease(session)
 
+    async def _http_bridge_fair_share_threshold_pct(
+        self: Any,
+        session: "_HTTPBridgeSession",
+    ) -> int:
+        """Resolve the keyed fair-share threshold WITHOUT holding pending_lock.
+
+        The settings-cache refresh runs a DB query behind a process-global
+        lock; awaiting it while holding a session's ``pending_lock`` let one
+        stalled query wedge every keyed submit process-wide (issue #1971).
+        Callers resolve the snapshot first and pass it into
+        ``_ensure_http_bridge_session_stream_lease_locked``.
+        """
+        if session.key.api_key_id is None:
+            return 0
+        return _api_key_fair_share_threshold_pct_from_settings(await _service_get_settings_cache().get())
+
     async def _ensure_http_bridge_session_stream_lease_locked(
         self: Any,
         session: "_HTTPBridgeSession",
         *,
         request_state: _WebSocketRequestState | None = None,
+        fair_share_threshold_pct: int | None = None,
     ) -> None:
         """Reacquire the account stream lease for a session idled between turns.
 
-        Callers hold ``session.pending_lock``. The lease is released when the
+        Callers hold ``session.pending_lock`` and MUST pass
+        ``fair_share_threshold_pct`` (see
+        ``_http_bridge_fair_share_threshold_pct``) computed before acquiring
+        it: resolving the threshold reads the settings cache, whose refresh
+        runs a DB query behind a process-global lock — one stalled refresh
+        under ``pending_lock`` wedged every keyed submit for days
+        (issue #1971). The ``None`` fallback resolves it inline and exists
+        for lock-free callers only.
+
+        The lease is released when the
         session's last in-flight turn detaches, so an idle session does not
         occupy a per-account stream slot; the next turn must pass normal cap
         admission again. Denial raises the standard local-cap envelope so the
@@ -2620,8 +2662,9 @@ class _HTTPBridgeRequestSubmitMixin:
         if load_balancer is None:
             return
         api_key_id = session.key.api_key_id
-        fair_share_threshold_pct = 0
-        if api_key_id is not None:
+        if api_key_id is None:
+            fair_share_threshold_pct = 0
+        elif fair_share_threshold_pct is None:
             fair_share_threshold_pct = _api_key_fair_share_threshold_pct_from_settings(
                 await _service_get_settings_cache().get()
             )
