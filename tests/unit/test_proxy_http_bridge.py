@@ -28713,6 +28713,66 @@ async def test_http_bridge_retirement_detects_prelude_only_event_during_strike_a
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_retirement_preserves_fence_raised_during_strike_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fence owner (durable stale-owner rejection, never-graft replacement
+    # rejection, previous-response-owner unavailability, alias-registration
+    # failure) can set reconnect_requested/retire_after_drain during the
+    # retry-circuit strike await while leaving the session registered and the
+    # upstream close unclaimed. The same event dispatch that raises the fence
+    # also bumps the upstream event generation, so the liveness revive would
+    # otherwise erase the fence and leave the condemned socket registered and
+    # reusable. The revive must be blocked and the fence must survive into
+    # the bounded close.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-fence-during-strike-await",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-retire-fence-during-suspend",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    service._http_bridge_sessions[session.key] = session
+    close = AsyncMock()
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", close)
+
+    async def record_failure_during_await(*_args: Any, **_kwargs: Any) -> None:
+        # One matched upstream event both proves liveness (generation bump)
+        # and raises a drain-retirement fence, without detaching the session
+        # or claiming the upstream close.
+        await asyncio.sleep(0)
+        async with session.pending_lock:
+            request_state.response_event_count = 1
+            session.last_upstream_event_generation += 1
+        session.upstream_control.reconnect_requested = True
+        session.upstream_control.retire_after_drain = True
+
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure_during_await)
+
+    await service._retire_stale_pending_http_bridge_session(
+        session,
+        detail="stream_incomplete",
+        response_events_seen=0,
+    )
+
+    # No revive: the fence survives, the session is unregistered, and the
+    # bounded close conservatively satisfies the fence owner's intent.
+    assert session.upstream_control.reconnect_requested is True
+    assert session.upstream_control.retire_after_drain is True
+    assert session.upstream_close_attempted is True
+    assert service._http_bridge_sessions.get(session.key) is None
+    close.assert_awaited_once_with(session, reason="retire_stale_pending")
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_retry_circuit_backoff_is_scoped_to_repeated_hard_keys() -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     hard_session = _make_bridge_session(key_value="bridge-circuit-hard")
