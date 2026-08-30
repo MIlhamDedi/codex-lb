@@ -770,9 +770,7 @@ async def test_stream_http_502_unknown_code_fails_over_to_second_account(async_c
 # ===========================================================================
 
 
-_MODEL_ENTITLEMENT_REJECTION_MESSAGE = (
-    "The 'gpt-5.1' model is not supported when using Codex with a ChatGPT account."
-)
+_MODEL_ENTITLEMENT_REJECTION_MESSAGE = "The 'gpt-5.1' model is not supported when using Codex with a ChatGPT account."
 
 
 @pytest.mark.asyncio

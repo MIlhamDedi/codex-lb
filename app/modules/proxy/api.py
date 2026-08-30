@@ -4573,6 +4573,17 @@ async def _disabled_model_source_denial(
     Returns ``None`` when no disabled source claims the model, leaving every
     other request on its existing path.
     """
+    if _allowed_source_ids_for_api_key(api_key) is None:
+        registry_models = get_model_registry().get_models_with_fallback()
+        candidates = [candidate for candidate in (raw_model, model) if candidate]
+        if candidates and all(candidate in registry_models for candidate in candidates):
+            # Mirrors the subscription-registry precedence rule inside the
+            # lookups: an unscoped key never source-routes a registry slug, so
+            # every candidate would be skipped and the probe is a guaranteed
+            # miss. Returning early keeps the extra background session off the
+            # ordinary subscription hot path, where this helper runs on every
+            # request whose model no source claims.
+            return None
     selection = (
         await _select_responses_model_source(
             model,
