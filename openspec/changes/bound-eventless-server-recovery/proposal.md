@@ -3,8 +3,9 @@
 `fix(proxy): bound server recovery after eventless bridge failures` changes the
 public recovery contract for anchored HTTP bridge continuations. Instead of
 looping indefinitely while the server owns recovery, the bridge now stops after
-`_HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS` consecutive eligible eventless
-failures and emits one terminal `response.failed`.
+`http_responses_session_bridge_server_recovery_max_attempts` (a setting,
+default 6) consecutive eligible eventless failures and emits one terminal
+`response.failed`.
 
 That is observable behavior for operators and clients, and it was not captured
 in an active OpenSpec change folder on this branch. The same terminal path also
@@ -22,5 +23,7 @@ normalization synthesizes `response.created` from that terminal envelope.
 ## Impact
 
 - Affected capability: `responses-api-compat`.
-- Affected code: `app/modules/proxy/api.py`, focused proxy error tests.
-- No new settings or migrations.
+- Affected code: `app/modules/proxy/api.py`, `app/core/config/settings.py`,
+  focused proxy error tests.
+- New setting: `http_responses_session_bridge_server_recovery_max_attempts`
+  (default 6). No migrations.

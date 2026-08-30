@@ -421,7 +421,6 @@ internal_router = APIRouter(
 )
 
 _TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
-_HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS = 6
 _OPENAPI_VALIDATION_ERROR_RESPONSE: Final[dict[str, Any]] = {
     "description": "Validation Error",
     "content": {
@@ -7701,7 +7700,8 @@ async def _stream_response_error_events(
             # fingerprint; each new upstream attempt is still at-least-once.
             retry_delay = max(1.0, min(30.0, float(exc.retry_after_seconds or 5.0)))
             recovery_attempts = 0
-            while recovery_attempts < _HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS:
+            server_recovery_max_attempts = settings.http_responses_session_bridge_server_recovery_max_attempts
+            while recovery_attempts < server_recovery_max_attempts:
                 yield ": codex-lb recovery in progress\n\n"
                 await asyncio.sleep(retry_delay)
                 recovery_attempts += 1
@@ -7771,7 +7771,7 @@ async def _stream_response_error_events(
             else:
                 logger.warning(
                     "HTTP bridge server recovery exhausted before downstream event after %s attempts",
-                    _HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS,
+                    server_recovery_max_attempts,
                 )
         await release_owned_reservation()
         response_id = None

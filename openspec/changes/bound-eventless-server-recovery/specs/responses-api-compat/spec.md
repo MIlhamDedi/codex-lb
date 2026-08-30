@@ -5,8 +5,9 @@
 ### Requirement: Eventless server-owned bridge recovery is bounded
 
 The proxy MUST retry server-owned HTTP bridge recovery only up to the
-configured `_HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS` budget after
-consecutive eligible eventless failures for an anchored continuation. Once
+configured `http_responses_session_bridge_server_recovery_max_attempts`
+setting (default 6) after consecutive eligible eventless failures for an
+anchored continuation. Once
 that budget is exhausted, the proxy MUST stop recovering and emit a terminal
 `response.failed` event.
 

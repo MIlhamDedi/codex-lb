@@ -53,6 +53,7 @@ def test_http_bridge_indefinite_recovery_defers_predecessor_proof_to_submit_path
         lambda: SimpleNamespace(
             http_responses_session_bridge_operation_ledger_enabled=True,
             http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=6,
         ),
     )
     fresh_turn = ResponsesRequest(model="gpt-5.6", instructions="", input="retry")
@@ -152,7 +153,8 @@ async def test_indefinite_recovery_does_not_retry_after_downstream_event(monkeyp
         proxy_api,
         "get_settings",
         lambda: SimpleNamespace(
-            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=6,
         ),
     )
 
@@ -188,7 +190,8 @@ async def test_indefinite_recovery_converts_retry_reservation_failure_to_sse(mon
         proxy_api,
         "get_settings",
         lambda: SimpleNamespace(
-            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=6,
         ),
     )
     monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
@@ -225,9 +228,9 @@ async def test_indefinite_recovery_exhaustion_emits_terminal_response_failed(mon
         "get_settings",
         lambda: SimpleNamespace(
             http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=2,
         ),
     )
-    monkeypatch.setattr(proxy_api, "_HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS", 2)
     monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
     attempts = 0
 
@@ -282,9 +285,9 @@ async def test_indefinite_recovery_retries_eventless_bridge_timeouts(monkeypatch
         "get_settings",
         lambda: SimpleNamespace(
             http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=2,
         ),
     )
-    monkeypatch.setattr(proxy_api, "_HTTP_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS", 2)
     monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
     attempts = 0
 
@@ -340,7 +343,8 @@ async def test_indefinite_recovery_converts_unexpected_admission_failure_to_sse(
         proxy_api,
         "get_settings",
         lambda: SimpleNamespace(
-            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=6,
         ),
     )
     monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
@@ -378,7 +382,8 @@ async def test_indefinite_recovery_stops_after_retry_output_then_transport_error
         proxy_api,
         "get_settings",
         lambda: SimpleNamespace(
-            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+            http_responses_session_bridge_server_recovery_max_attempts=6,
         ),
     )
     monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
