@@ -2954,6 +2954,15 @@ class _HTTPBridgeRequestSubmitMixin:
             should_reconnect = (
                 not has_visible_pending
                 and session.queued_request_count == 0
+                # A registered admission waiter owns a turn that has not yet
+                # been counted into the queue (it may be suspended on the
+                # pre-lock fair-share resolve, issue #1971); retiring under it
+                # would fail an admitted turn with upstream_unavailable. A
+                # deferred retirement re-runs on the turn's own drain
+                # triggers once it proceeds; if the waiter instead fails
+                # admission, its cleanup releases the idle lease and the
+                # flagged session falls back to idle-TTL close.
+                and session.admission_waiter_count == 0
                 and session.unanchored_reservation_id is None
                 and not session.upstream_close_attempted
             )

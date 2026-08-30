@@ -274,6 +274,34 @@ async def test_reacquire_with_snapshot_never_touches_settings_cache_under_lock(
 
 
 @pytest.mark.asyncio
+async def test_drain_retirement_defers_to_registered_admission_waiter() -> None:
+    """A registered admission waiter owns a turn not yet counted into the
+    queue (it may be suspended on the pre-lock fair-share resolve, issue
+    #1971); drain retirement must not close the bridge under it, and must
+    proceed once the waiter unwinds."""
+
+    mixin = http_bridge_request_submit_module._HTTPBridgeRequestSubmitMixin
+    session = _make_bridge_session()
+    session.upstream_control.reconnect_requested = True
+    session.upstream_control.retire_after_drain = True
+    session.admission_waiter_count = 1
+    close_bounded = AsyncMock()
+    fake_self = SimpleNamespace(_close_http_bridge_session_bounded=close_bounded)
+
+    retired = await mixin._retire_http_bridge_after_drain_if_ready(fake_self, session)
+
+    assert retired is False
+    close_bounded.assert_not_awaited()
+    assert not session.upstream_close_attempted
+
+    session.admission_waiter_count = 0
+    retired = await mixin._retire_http_bridge_after_drain_if_ready(fake_self, session)
+
+    assert retired is True
+    close_bounded.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_keyed_submit_with_held_lease_never_reads_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

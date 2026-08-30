@@ -5,6 +5,8 @@
 - [x] 1.1 Add `_http_bridge_fair_share_threshold_pct` (lock-free snapshot resolve) and a `fair_share_threshold_pct` parameter to `_ensure_http_bridge_session_stream_lease_locked`; keep the inline resolve only as a fallback for lock-free callers.
 - [x] 1.2 Resolve the snapshot before the reacquire's `pending_lock` acquisition in `_submit_http_bridge_request` and pass it through, so no settings/DB await runs under the lock; the post-prewarm reacquire reuses the same snapshot (a fresh TTL-expired refresh there could only stall an otherwise admissible request).
 - [x] 1.3 Register the admission waiter under a brief lock BEFORE the settings resolve so the idle sweeper and close-time retire cannot evict the session while the snapshot resolves; a reacquire failure hands the registered waiter to interruption cleanup to unwind.
+- [x] 1.4 Resolve the snapshot only when the reacquire can actually run (`needs_stream_lease` snapshotted under the registration lock): a session already holding its lease never depended on a settings read to admit a turn.
+- [x] 1.5 Include `admission_waiter_count == 0` in the drain-retirement predicate so retirement cannot close the bridge under a registered waiter suspended on the pre-lock resolve; a deferred retirement re-runs on the turn's own drain triggers, and an admission-failed waiter's cleanup releases the idle lease with idle-TTL close as the backstop.
 
 ## 2. Statement Bound
 
