@@ -106,12 +106,21 @@ async def _await_task_deferring_cancellation(
     with anyio.CancelScope(shield=True):
         while True:
             try:
-                return await wait_on_shared_future(task), cancellation
+                result = await wait_on_shared_future(task)
+                break
             except asyncio.CancelledError as exc:
                 if task.cancelled():
                     raise
                 cancellation = cancellation or exc
-    raise RuntimeError("unreachable shielded cancellation-deferral state")
+    if cancellation is None:
+        # The shield also blocks the level cancellation this helper promises
+        # to surface. Probe for it without suspending so callers still get
+        # their cancellation marker after the owned task finished.
+        try:
+            await anyio.lowlevel.checkpoint_if_cancelled()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    return result, cancellation
 
 
 def _facade() -> Any:

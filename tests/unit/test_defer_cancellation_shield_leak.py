@@ -62,8 +62,11 @@ async def test_level_cancelled_scope_does_not_grow_task_callbacks():
     assert not task.done()
 
     release.set()
-    result, _cancellation = await asyncio.wait_for(waiter_task, timeout=1)
+    result, cancellation = await asyncio.wait_for(waiter_task, timeout=1)
     assert result == "settled"
+    # The level cancellation blocked by the shield must still surface as the
+    # deferred-cancellation marker callers re-raise after cleanup.
+    assert cancellation is not None
 
 
 async def test_repeated_edge_cancellation_keeps_callbacks_bounded_and_defers():

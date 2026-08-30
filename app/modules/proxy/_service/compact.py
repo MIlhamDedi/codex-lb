@@ -1029,6 +1029,14 @@ class _CompactMixin:
                         cancellation_pending = True
                     except Exception:
                         break
+            if not cancellation_pending:
+                # The shield also blocks the level cancellation this block
+                # promises to re-raise after the flush. Probe without
+                # suspending so a disconnected compact request still cancels.
+                try:
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                except asyncio.CancelledError:
+                    cancellation_pending = True
             try:
                 flush_task.result()
             except Exception:
