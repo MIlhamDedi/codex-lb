@@ -56,8 +56,10 @@ The budget MUST be the minimum of
 `http_responses_session_bridge_request_budget_seconds`, so that the downstream
 pre-response watchdog can never outlive the owner-side stuck gate, the
 configured idle budget, or the request budget. The number of pre-response
-keepalive intervals waited MUST cover that budget and MUST NOT drop below
-`_STREAM_KEEPALIVE_MAX_COUNT`.
+keepalive intervals waited MUST cover that budget. It MUST NOT drop below
+`_STREAM_KEEPALIVE_MAX_COUNT` when the budget spans at least that many
+keepalive intervals; when the configured budget is shorter, the count MUST
+follow the budget instead, so the watchdog never outlives it.
 
 #### Scenario: Default settings align the budget with the stuck gate
 

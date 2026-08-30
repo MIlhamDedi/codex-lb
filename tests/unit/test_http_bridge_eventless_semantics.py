@@ -106,8 +106,10 @@ def test_http_bridge_eventless_budget_is_named_and_settings_derived() -> None:
     assert max_count * keepalive_interval >= budget_seconds
     assert max_count > http_bridge_streaming_module._stream_keepalive_max_count()
 
-    # A shorter stream idle timeout or request budget still clamps it down, and
-    # the keepalive floor is never violated.
+    # A shorter stream idle timeout or request budget still clamps it down.
+    # When the budget spans fewer than floor_count intervals, the count follows
+    # the budget (5 x 10s covers 45s) so the watchdog never outlives it — the
+    # floor only applies when the budget is at least floor_count intervals.
     tight = SimpleNamespace(
         sse_keepalive_interval_seconds=10.0,
         stream_idle_timeout_seconds=45.0,
