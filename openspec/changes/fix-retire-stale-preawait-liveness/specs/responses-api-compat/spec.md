@@ -18,6 +18,13 @@ Before closing and unregistering a stale HTTP bridge session, the service MUST r
 - **THEN** the final decision does not clear the detached generation's retirement flags
 - **AND** the detached generation still receives its bounded close so its socket, leases, and capacity slot are released
 
+#### Scenario: Prelude-only upstream event during retry-circuit suspension
+
+- **WHEN** stale retirement samples zero response events and then suspends for retry-circuit bookkeeping
+- **AND** an upstream event that advances only the session event generation arrives during the suspension
+- **THEN** the final decision observes the generation change against the entry-time baseline
+- **AND** the session remains registered, open, and reusable
+
 #### Scenario: Session remains eventless during retry-circuit suspension
 
 - **WHEN** stale retirement samples zero response events and suspends for retry-circuit bookkeeping

@@ -2960,6 +2960,12 @@ class _HTTPBridgeRequestSubmitMixin:
         async with session.pending_lock:
             retired_request_states = list(session.pending_requests)
             baseline_completed_response_id = session.last_completed_response_id
+            # Baseline the upstream event generation at entry, alongside the
+            # completed-response baseline, so a prelude-only upstream event
+            # arriving during the retry-circuit strike await (which bumps the
+            # generation without touching per-request response counters) is
+            # still detected as post-suspension liveness.
+            baseline_event_generation = session.last_upstream_event_generation
             if retired_request_count is None:
                 retired_request_count = sum(
                     1
@@ -3056,7 +3062,6 @@ class _HTTPBridgeRequestSubmitMixin:
                 for request_state in session.pending_requests
             )
             completed_response_id = session.last_completed_response_id
-            current_event_generation = session.last_upstream_event_generation
         # The snapshot above avoids awaiting pending_lock while the global
         # registry lock is held, preserving bounded cleanup for other sessions.
         caller_response_events_seen = response_events_seen or 0
@@ -3068,7 +3073,7 @@ class _HTTPBridgeRequestSubmitMixin:
         )
         should_close = False
         async with self._http_bridge_lock:
-            if session.last_upstream_event_generation != current_event_generation:
+            if session.last_upstream_event_generation != baseline_event_generation:
                 became_healthy_during_suspend = True
             # Bounded close may return while resource finalization is still
             # running. Detachment transfers ownership instead of freeing the

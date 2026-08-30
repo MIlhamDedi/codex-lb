@@ -28660,6 +28660,59 @@ async def test_http_bridge_retirement_does_not_revive_detached_generation(
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_retirement_detects_prelude_only_event_during_strike_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A deferred reasoning prelude bumps the upstream event generation
+    # without touching per-request response counters. Arriving during the
+    # retry-circuit strike await, it must still count as post-suspension
+    # liveness, so the generation baseline is captured at entry rather than
+    # after the await.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-prelude-during-strike-await",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-retire-prelude-only-liveness",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.closed = True
+    session.upstream_control.reconnect_requested = True
+    session.upstream_control.retire_after_drain = True
+    service._http_bridge_sessions[session.key] = session
+    close = AsyncMock()
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", close)
+
+    async def record_failure_during_await(*_args: Any, **_kwargs: Any) -> None:
+        # Prelude-only upstream event: generation advances, response
+        # counters and response ids stay untouched.
+        await asyncio.sleep(0)
+        async with session.pending_lock:
+            session.last_upstream_event_generation += 1
+
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure_during_await)
+
+    await service._retire_stale_pending_http_bridge_session(
+        session,
+        detail="stream_incomplete",
+        response_events_seen=0,
+    )
+
+    assert session.closed is False
+    assert session.upstream_control.reconnect_requested is False
+    assert session.upstream_control.retire_after_drain is False
+    assert service._http_bridge_sessions[session.key] is session
+    close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_retry_circuit_backoff_is_scoped_to_repeated_hard_keys() -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     hard_session = _make_bridge_session(key_value="bridge-circuit-hard")
