@@ -249,9 +249,7 @@ async def test_reacquire_with_snapshot_never_touches_settings_cache_under_lock(
     stalled query wedge every keyed submit process-wide."""
 
     mixin = http_bridge_request_submit_module._HTTPBridgeRequestSubmitMixin
-    settings_get = AsyncMock(
-        side_effect=AssertionError("settings cache must not be read under pending_lock")
-    )
+    settings_get = AsyncMock(side_effect=AssertionError("settings cache must not be read under pending_lock"))
     monkeypatch.setattr(
         http_bridge_request_submit_module,
         "_service_get_settings_cache",
@@ -288,9 +286,7 @@ async def test_keyed_submit_resolves_fair_share_before_pending_lock(
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     session = _make_bridge_session(api_key_id="key-stall")
     lease = _make_lease("l-stall")
-    monkeypatch.setattr(
-        service._load_balancer, "acquire_account_lease", AsyncMock(return_value=lease)
-    )
+    monkeypatch.setattr(service._load_balancer, "acquire_account_lease", AsyncMock(return_value=lease))
     monkeypatch.setattr(service._load_balancer, "release_account_lease", AsyncMock())
     monkeypatch.setattr(service, "_maybe_prewarm_http_bridge_session", AsyncMock())
 

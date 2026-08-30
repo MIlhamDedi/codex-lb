@@ -1605,9 +1605,18 @@ class _HTTPBridgeRequestSubmitMixin:
         request_enqueued = False
         admission_waiter_registered = False
         try:
-            # Resolved before pending_lock: the settings-cache refresh behind
-            # this can run a DB query and must not suspend the critical
-            # section (issue #1971).
+            # Register the submit as an admission waiter BEFORE any suspension
+            # outside the lock: the waiter count keeps the idle sweeper and
+            # close-time retire from evicting the session while the settings
+            # snapshot below resolves, and a previous turn's finalizer
+            # unwinding concurrently cannot see an apparently idle session
+            # and release the lease the reacquire installs.
+            async with session.pending_lock:
+                session.admission_waiter_count += 1
+                admission_waiter_registered = True
+            # Resolved before the reacquire's pending_lock: the settings-cache
+            # refresh behind this can run a DB query and must not suspend the
+            # critical section (issue #1971).
             fair_share_threshold_pct = await self._http_bridge_fair_share_threshold_pct(session)
             async with session.pending_lock:
                 await self._ensure_http_bridge_session_stream_lease_locked(
@@ -1615,12 +1624,6 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state=request_state,
                     fair_share_threshold_pct=fair_share_threshold_pct,
                 )
-                # Register the submit as an admission waiter atomically with the
-                # reacquire so a previous turn's finalizer unwinding concurrently
-                # cannot see an apparently idle session and release this lease
-                # before the turn is counted into the session queue.
-                session.admission_waiter_count += 1
-                admission_waiter_registered = True
         except BaseException:
             # Recovery claims are made before admission. If reacquiring an
             # idle session's stream lease fails, no upstream frame can have
@@ -1662,10 +1665,11 @@ class _HTTPBridgeRequestSubmitMixin:
             await _await_task_deferring_cancellation(cleanup_task)
             raise
         try:
-            # Re-resolved after the prewarm await; still before pending_lock
-            # so the settings-cache refresh cannot suspend the critical
-            # section (issue #1971).
-            fair_share_threshold_pct = await self._http_bridge_fair_share_threshold_pct(session)
+            # Reuses the pre-prewarm snapshot: the registered admission waiter
+            # kept the lease from idle release, so this reacquire is a no-op
+            # unless the session closed mid-prewarm — a fresh refresh here
+            # could only stall an otherwise admissible request on a
+            # TTL-expired settings read (issue #1971).
             async with session.pending_lock:
                 if session.queued_request_count >= queue_limit:
                     _log_http_bridge_event(

@@ -21767,7 +21767,10 @@ async def test_submit_http_bridge_request_restores_recovery_claim_when_stream_le
     assert exc_info.value is lease_failure
     cleanup.assert_awaited_once()
     assert cleanup.await_args is not None
-    assert cleanup.await_args.kwargs["admission_waiter_registered"] is False
+    # The admission waiter is registered BEFORE the reacquire (issue #1971:
+    # it fences idle eviction across the pre-lock settings resolve), so a
+    # reacquire failure hands the registered waiter to cleanup to unwind.
+    assert cleanup.await_args.kwargs["admission_waiter_registered"] is True
     assert cleanup.await_args.kwargs["request_enqueued"] is False
     send_text.assert_not_awaited()
 
