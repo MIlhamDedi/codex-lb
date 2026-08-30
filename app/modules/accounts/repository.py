@@ -97,6 +97,19 @@ _HARD_STICKY_OUTAGE_GRACE_SEEDED_SENTINEL = "hard_sticky_outage_grace_seeded"
 
 
 def _is_missing_hard_sticky_seed_table(exc: OperationalError) -> bool:
+    """Return True when startup grace seeding hit a not-yet-migrated database.
+
+    ``seed_hard_sticky_outage_grace_on_startup`` runs unguarded in the app
+    lifespan. With ``database_migrate_on_startup=false`` (operator-managed
+    migrations) the process can boot against a legacy database that does not
+    have ``runtime_sentinels`` (or, on a brand-new file, ``accounts``) yet;
+    before this guard that boot crashed with an unhandled sqlite
+    ``OperationalError``. The seeding is a best-effort one-time backfill: on a
+    missing table it rolls back and returns 0 without stamping the sentinel,
+    so the first boot after migrations run still performs the backfill. Only
+    the sqlite "no such table" shape is matched — this deployment mode boots
+    sqlite before migration; every other OperationalError still propagates.
+    """
     message = str(exc).lower()
     return "no such table: runtime_sentinels" in message or "no such table: accounts" in message
 
