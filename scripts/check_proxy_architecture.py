@@ -95,7 +95,7 @@ ALLOWED_SERVICE_IMPORT_DOMAINS_BY_DOMAIN = {
     "codex_control": {"support"},
     "compact": {"support"},
     "file_ops": {"support"},
-    "http_bridge": {"api_key_usage", "compact", "http_bridge", "observability", "streaming", "support", "warmup"},
+    "http_bridge": {"api_key_usage", "compact", "http_bridge", "observability", "support", "warmup"},
     "response_create": {"support"},
     "streaming": {
         "api_key_usage",

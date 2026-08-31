@@ -183,9 +183,6 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
-from app.modules.proxy._service.streaming.retry import (
-    _http_bridge_allowed_by_transport_policy as _http_bridge_allowed_by_transport_policy,
-)
 from app.modules.proxy._service.support import (
     _ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
@@ -974,21 +971,8 @@ class _HTTPBridgeStreamingMixin:
         capacity_startup_ready_event: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
         dashboard_settings = await _service_get_settings_cache().get()
-        base_settings = _service_get_settings()
-        runtime_config = _http_bridge_runtime_config(dashboard_settings, base_settings)
+        runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
         request_id = ensure_request_id()
-        if runtime_config.enabled and not _http_bridge_allowed_by_transport_policy(
-            payload,
-            headers,
-            api_key=api_key,
-            dashboard_settings=dashboard_settings,
-            base_settings=base_settings,
-        ):
-            logger.info(
-                "stream_responses bypassing http bridge for downstream transport policy request_id=%s",
-                request_id,
-            )
-            runtime_config = dataclasses.replace(runtime_config, enabled=False)
         self._raise_for_unsupported_input_image_references(payload)
         payload_size_estimate_bytes = len(
             json.dumps(payload.to_payload(), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
