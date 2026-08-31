@@ -2207,6 +2207,26 @@ def _should_fallback_to_http_after_codex_transport_error(transport_mode: str, ex
     )
 
 
+def _collect_lowercase_header_values(headers: Mapping[str, str] | None) -> dict[str, list[str]]:
+    """Collect every value per lowercased header name, tolerating duplicates.
+
+    The direct-connect handshake path hands us ``websockets.datastructures.Headers``,
+    whose ``items()`` raises ``MultipleValuesError`` for any repeated header —
+    and real Cloudflare challenge responses routinely carry multiple
+    ``Set-Cookie`` values. Prefer the duplicate-safe ``raw_items()`` iterator
+    when the mapping provides one; plain dicts and multidicts iterate cleanly.
+    """
+
+    if headers is None:
+        return {}
+    raw_items = getattr(headers, "raw_items", None)
+    items = raw_items() if callable(raw_items) else headers.items()
+    collected: dict[str, list[str]] = {}
+    for key, value in items:
+        collected.setdefault(str(key).lower(), []).append(str(value).lower())
+    return collected
+
+
 def _is_upstream_edge_challenge(
     status: int | None,
     *,
@@ -2224,14 +2244,12 @@ def _is_upstream_edge_challenge(
 
     if status != 403:
         return False
-    normalized_headers = {
-        str(key).lower(): str(value).lower() for key, value in (headers.items() if headers is not None else ())
-    }
-    if normalized_headers.get("cf-mitigated") == "challenge":
+    normalized_headers = _collect_lowercase_header_values(headers)
+    if any(value == "challenge" for value in normalized_headers.get("cf-mitigated", ())):
         return True
-    if "cloudflare" not in normalized_headers.get("server", ""):
+    if not any("cloudflare" in value for value in normalized_headers.get("server", ())):
         return False
-    if "html" not in normalized_headers.get("content-type", ""):
+    if not any("html" in value for value in normalized_headers.get("content-type", ())):
         return False
     if isinstance(body, (bytes, bytearray)):
         body_text = bytes(body[: 16 * 1024]).decode("utf-8", errors="replace")

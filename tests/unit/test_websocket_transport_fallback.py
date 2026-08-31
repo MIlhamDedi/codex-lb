@@ -803,6 +803,67 @@ async def test_direct_unmarked_403_html_handshake_stays_account_evidence(
     assert _classify(exc) is None
 
 
+def _headers_with_duplicate_cookies(pairs: dict[str, str]) -> Headers:
+    headers = Headers()
+    # Real Cloudflare challenge responses set multiple cookies (__cf_bm,
+    # _cfuvid); ``Headers.items()`` raises ``MultipleValuesError`` for any
+    # repeated name, so these fixtures guard the duplicate-safe accessor.
+    headers["Set-Cookie"] = "__cf_bm=fixture; Path=/; HttpOnly"
+    headers["Set-Cookie"] = "_cfuvid=fixture; Path=/; HttpOnly"
+    for key, value in pairs.items():
+        headers[key] = value
+    return headers
+
+
+@pytest.mark.asyncio
+async def test_direct_edge_challenge_with_duplicate_cookies_is_classified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The flagship input: an actual Cloudflare challenge carries repeated
+    # Set-Cookie headers. Classification must not choke on the duplicates.
+    exc = await _direct_connect_failure(
+        monkeypatch,
+        InvalidStatus(
+            Response(
+                403,
+                "Forbidden",
+                _headers_with_duplicate_cookies(
+                    {"Content-Type": "text/html; charset=UTF-8", "cf-mitigated": "challenge"}
+                ),
+                b"<html><title>Just a moment...</title></html>",
+            )
+        ),
+    )
+
+    assert exc.status_code == 403
+    assert exc.failure_detail == UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL
+    assert _classify(exc) is not None
+
+
+@pytest.mark.asyncio
+async def test_direct_unmarked_403_with_duplicate_headers_stays_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An ordinary 403 with a duplicated header must keep raising the
+    # sanitized ProxyResponseError account-evidence path — never escape as an
+    # unhandled MultipleValuesError from the challenge classifier.
+    exc = await _direct_connect_failure(
+        monkeypatch,
+        InvalidStatus(
+            Response(
+                403,
+                "Forbidden",
+                _headers_with_duplicate_cookies({"Content-Type": "text/html", "Server": "nginx"}),
+                b"<html><h1>403 Forbidden</h1></html>",
+            )
+        ),
+    )
+
+    assert exc.status_code == 403
+    assert exc.failure_detail is None
+    assert _classify(exc) is None
+
+
 @pytest.mark.asyncio
 async def test_edge_challenge_connect_failure_surfaces_without_penalty() -> None:
     # Product path for the challenge recovery: the classified 403 rides the
