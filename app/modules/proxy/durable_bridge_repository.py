@@ -2425,6 +2425,13 @@ class DurableBridgeRepository:
                 return False
             operation, append_allowed = locked_operation
             if not append_allowed:
+                if not operation.event_spool_complete and operation.state in {
+                    "completed",
+                    "incomplete",
+                    "failed",
+                }:
+                    await self._session.rollback()
+                    return False
                 operation.event_spool_complete = False
                 operation.state = state
                 if response_id is not None:
