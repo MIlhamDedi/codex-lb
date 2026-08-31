@@ -54,6 +54,34 @@ describe("useSmoothPercent", () => {
     expect(result.current.percent).toBe(64);
   });
 
+  it("applies fresh values without animation when reduced motion is preferred", () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = (query: string) =>
+      ({
+        matches: query === "(prefers-reduced-motion: reduce)",
+        media: query,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      }) as unknown as MediaQueryList;
+
+    try {
+      const { result, rerender } = renderHook(
+        ({ value }) => useSmoothPercent(value),
+        { initialProps: { value: 80 as number | null } },
+      );
+
+      rerender({ value: 20 });
+      expect(result.current.percent).toBe(20);
+      expect(frames.size).toBe(0);
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
   it("eases from the displayed value to the next value", () => {
     const { result, rerender } = renderHook(
       ({ value }) => useSmoothPercent(value),
