@@ -56,6 +56,7 @@ from app.core.clients.proxy import (
     StreamEventTooLargeError,
     _find_sse_separator,
     _is_native_codex_request,
+    _safe_retry_after_header,
 )
 from app.core.clients.proxy_websocket import (
     REALTIME_LIVE_CALL_ID_ROUTE_REGEX,
@@ -1153,7 +1154,7 @@ async def responses(
                 context,
                 api_key,
                 raw_model=raw_source_model,
-                require_streaming=True,
+                require_streaming=not backend_non_streaming_requested,
             )
         )
     except ProxyResponseError as exc:
@@ -4952,6 +4953,7 @@ async def _source_responses_response(
     enforce_openai_sdk_contract: bool = True,
     native_codex_heartbeat: bool = False,
 ) -> Response:
+    preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(request.headers)
     # This is the first point where the request is known to be served by a
     # model source rather than a subscription account, so it is the only place
     # the reasoning-effort workaround can be undone safely.
@@ -5043,6 +5045,7 @@ async def _source_responses_response(
                         response.body_iterator,
                         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                         native_codex_heartbeat=native_codex_heartbeat,
+                        preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
                     ),
                     media_type=response.media_type,
                     status_code=response.status_code,
@@ -5054,6 +5057,7 @@ async def _source_responses_response(
                 stream.body,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 native_codex_heartbeat=native_codex_heartbeat,
+                preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
             ),
             usage_holder=stream.usage_holder,
             request=request,
@@ -5816,6 +5820,7 @@ async def _wrap_source_responses_public_stream(
     *,
     enforce_openai_sdk_contract: bool = True,
     native_codex_heartbeat: bool = False,
+    preserve_native_failure_lifecycle: bool = False,
 ) -> AsyncIterator[str]:
     """Normalize and keep source-routed Responses SSE proxy-timeout friendly.
 
@@ -5838,15 +5843,20 @@ async def _wrap_source_responses_public_stream(
         event_blocks,
         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         forward_unparseable_data=True,
+        preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
     )
-    keepalive_stream = inject_sse_keepalives(
-        normalized,
-        settings.sse_keepalive_interval_seconds,
-        keepalive_frame=keepalive_frame,
-        on_keepalive=lambda: _record_stream_keepalive("responses_source"),
+    keepalive_stream = (
+        normalized
+        if preserve_native_failure_lifecycle
+        else inject_sse_keepalives(
+            normalized,
+            settings.sse_keepalive_interval_seconds,
+            keepalive_frame=keepalive_frame,
+            on_keepalive=lambda: _record_stream_keepalive("responses_source"),
+        )
     )
     outbound: AsyncIterator[str] = keepalive_stream
-    if use_codex_keepalive:
+    if use_codex_keepalive and not preserve_native_failure_lifecycle:
         outbound = _prepend_initial_sse_heartbeat(
             keepalive_stream,
             keepalive_frame,
@@ -8061,8 +8071,11 @@ def _stream_startup_error_response(
             ),
         )
         startup_headers = dict(headers)
-        if error.retry_after_header is not None:
-            startup_headers.setdefault("Retry-After", error.retry_after_header)
+        retry_after_header = _safe_retry_after_header(
+            {"Retry-After": error.retry_after_header} if error.retry_after_header is not None else None
+        )
+        if retry_after_header is not None:
+            startup_headers.setdefault("Retry-After", retry_after_header)
         elif error.retry_after_seconds is not None and error.retry_after_seconds > 0:
             startup_headers.setdefault("Retry-After", str(error.retry_after_seconds))
         return _logged_error_json_response(
@@ -8683,7 +8696,7 @@ async def _collect_responses_payload(
                     continue
             terminal_result = _default_error_envelope()
             continue
-        if event_type in ("response.completed", "response.incomplete"):
+        if event_type in ("response.completed", "response.incomplete", "response.queued", "response.in_progress"):
             response = payload.get("response")
             if is_json_mapping(response):
                 normalized_response, violation_kind = _normalize_public_response_mapping(response, output_items)
@@ -8875,7 +8888,11 @@ async def _normalize_public_responses_stream(
             payload = dict(payload)
             payload.pop(SYNTHETIC_TRANSPORT_FAILURE_MARKER, None)
             if preserve_native_failure_lifecycle:
-                continue
+                raise ProxyResponseError(
+                    502,
+                    openai_error("stream_incomplete", "Native upstream transport ended before a terminal event"),
+                    failure_phase="upstream",
+                )
         raw_event_type = payload.get("type")
         if (
             enforce_openai_sdk_contract
@@ -9010,8 +9027,13 @@ async def _normalize_public_responses_stream(
         return
     if preserve_native_failure_lifecycle:
         # First-party Codex owns transport-failure interpretation. Preserve a
-        # missing terminal instead of manufacturing one on the LB boundary.
-        return
+        # missing terminal by aborting the body instead of manufacturing one
+        # on the LB boundary or completing a successful empty HTTP stream.
+        raise ProxyResponseError(
+            502,
+            openai_error("stream_incomplete", "Native upstream stream ended before a terminal event"),
+            failure_phase="upstream",
+        )
     error_kind = contract_violation_kind or (
         "upstream_stream_truncated" if enforce_openai_sdk_contract else "stream_incomplete"
     )

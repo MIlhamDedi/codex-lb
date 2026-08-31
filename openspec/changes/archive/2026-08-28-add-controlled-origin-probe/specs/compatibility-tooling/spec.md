@@ -6,8 +6,9 @@ The traffic parity toolkit MUST provide an explicitly launched deterministic
 origin fixture that supports Codex model discovery and Responses HTTP JSON,
 HTTP SSE, and WebSocket requests on the canonical public and Codex-native path
 forms. The fixture MUST accept multiple ordered `response.create` turns on one
-WebSocket connection, MUST return a terminal lifecycle for every accepted
-turn, and MUST NOT perform upstream network calls or reflect request content or
+WebSocket connection and MUST return a terminal lifecycle for every successful
+accepted turn; the intentional `websocket_incomplete` failure scenario is
+exempt. It MUST NOT perform upstream network calls or reflect request content or
 credentials in responses. HTTP request bodies and WebSocket frames MUST be
 bounded. The fixture launcher MUST bind to loopback by default and MUST reject
 a non-loopback bind unless the operator supplies an explicit public-bind

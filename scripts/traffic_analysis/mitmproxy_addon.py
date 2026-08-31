@@ -6,6 +6,7 @@ Run with mitmproxy or mitmdump and configure it with::
     --set capture_body_mode=metadata
     --set capture_observer_id=controlled-boundary-name
     --set capture_observer_role=intercept
+    --set capture_source_hmac_key_file=/secure/source-observer.key
     --set capture_asn_mmdb=/secure/GeoLite2-ASN.mmdb
 
 ``capture_body_mode`` is one of ``metadata`` (the safe default), ``full``, or
@@ -17,10 +18,13 @@ enrichment is optional, offline, and requires ``maxminddb`` in that process.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib
 import ipaddress
 import json
 import logging
+import os
+import stat
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -209,7 +213,7 @@ def _peer_host(peername: Any) -> str | None:
     return str(raw_host) if raw_host is not None else None
 
 
-def _peer_source_observation(peername: Any) -> dict[str, str] | None:
+def _peer_source_observation(peername: Any, hmac_key: bytes) -> dict[str, str] | None:
     """Return equality evidence without retaining the source host or port."""
 
     host = _peer_host(peername)
@@ -223,7 +227,8 @@ def _peer_source_observation(peername: Any) -> dict[str, str] | None:
     else:
         normalized = address.compressed
         family = f"ipv{address.version}"
-    return {"family": family, "sha256": _sha256_text(normalized)}
+    digest = hmac.new(hmac_key, normalized.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {"family": family, "hmac_sha256": digest}
 
 
 def _sha256_file(path: Path) -> str:
@@ -297,21 +302,31 @@ def _observer_role() -> str:
     return role
 
 
-def _source_observer(flow: Any, asn_resolver: OfflineAsnResolver | None = None) -> dict[str, Any]:
+def _source_observer(
+    flow: Any,
+    asn_resolver: OfflineAsnResolver | None = None,
+    source_hmac_key: bytes | None = None,
+) -> dict[str, Any]:
     observer_id = str(getattr(ctx.options, "capture_observer_id", "")).strip()
+    if observer_id and source_hmac_key is None:
+        raise ValueError("capture_source_hmac_key_file is required when capture_observer_id is set")
     client_conn = getattr(flow, "client_conn", None)
     peername = getattr(client_conn, "peername", None)
     observation = {
         "observer_id_sha256": _sha256_text(observer_id) if observer_id else None,
         "role": _observer_role() if observer_id else None,
-        "source_host": _peer_source_observation(peername),
+        "source_host": _peer_source_observation(peername, source_hmac_key) if source_hmac_key is not None else None,
     }
     if asn_resolver is not None:
         observation["asn"] = asn_resolver.observe(_peer_host(peername))
     return observation
 
 
-def _wire_observation(flow: Any, asn_resolver: OfflineAsnResolver | None = None) -> dict[str, Any]:
+def _wire_observation(
+    flow: Any,
+    asn_resolver: OfflineAsnResolver | None = None,
+    source_hmac_key: bytes | None = None,
+) -> dict[str, Any]:
     """Capture server-observable negotiated transport facts, when exposed.
 
     mitmproxy terminates the client TLS leg, so these values describe the
@@ -328,7 +343,7 @@ def _wire_observation(flow: Any, asn_resolver: OfflineAsnResolver | None = None)
         cipher = cipher[0] if cipher else None
     return {
         "http_version": getattr(getattr(flow, "request", None), "http_version", None),
-        "source_observer": _source_observer(flow, asn_resolver),
+        "source_observer": _source_observer(flow, asn_resolver, source_hmac_key),
         "tls": {
             "alpn": alpn,
             "version": getattr(client_conn, "tls_version", None),
@@ -596,9 +611,10 @@ class CaptureAddon:
 
     def __init__(self) -> None:
         self._websocket_message_indexes: dict[str, int] = {}
-        self._client_hellos: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._client_hellos: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._captured_http_flows: OrderedDict[str, None] = OrderedDict()
         self._asn_resolver: OfflineAsnResolver | None = None
+        self._source_hmac_key: bytes | None = None
 
     def _mark_http_captured(self, flow_id: str) -> None:
         self._captured_http_flows[flow_id] = None
@@ -609,15 +625,16 @@ class CaptureAddon:
     def tls_clienthello(self, data: Any) -> None:
         """Retain a bounded fingerprint for later HTTP/WebSocket records."""
 
-        client = data.context.client
-        self._client_hellos[id(client)] = _client_hello_observation(data.client_hello)
-        self._client_hellos.move_to_end(id(client))
+        connection_id = str(data.context.client.id)
+        self._client_hellos[connection_id] = _client_hello_observation(data.client_hello)
+        self._client_hellos.move_to_end(connection_id)
         while len(self._client_hellos) > 1024:
             self._client_hellos.popitem(last=False)
 
     def _network_observation(self, flow: Any) -> dict[str, Any]:
-        observation = _wire_observation(flow, self._asn_resolver)
-        client_hello = self._client_hellos.get(id(getattr(flow, "client_conn", None)))
+        observation = _wire_observation(flow, self._asn_resolver, self._source_hmac_key)
+        connection_id = getattr(getattr(flow, "client_conn", None), "id", None)
+        client_hello = self._client_hellos.get(str(connection_id)) if connection_id is not None else None
         if client_hello is not None:
             observation["tls"]["client_hello"] = client_hello
         return observation
@@ -626,7 +643,7 @@ class CaptureAddon:
         loader.add_option(
             name="capture_output",
             typespec=str,
-            default="/tmp/codex-traffic-capture.jsonl",
+            default="",
             help="Path to the append-only Codex Responses capture JSONL file",
         )
         loader.add_option(
@@ -648,6 +665,12 @@ class CaptureAddon:
             help="Observer role: intercept (default) or origin",
         )
         loader.add_option(
+            name="capture_source_hmac_key_file",
+            typespec=str,
+            default="",
+            help="Mode-0600 key file used to HMAC source hosts for one A/C comparison",
+        )
+        loader.add_option(
             name="capture_asn_mmdb",
             typespec=str,
             default="",
@@ -655,14 +678,25 @@ class CaptureAddon:
         )
 
     def configure(self, updated: set[str]) -> None:
-        if "capture_asn_mmdb" not in updated:
-            return
-        configured_path = str(getattr(ctx.options, "capture_asn_mmdb", "")).strip()
-        replacement = OfflineAsnResolver(configured_path) if configured_path else None
-        previous = self._asn_resolver
-        self._asn_resolver = replacement
-        if previous is not None:
-            previous.close()
+        if "capture_source_hmac_key_file" in updated:
+            configured_key_path = str(getattr(ctx.options, "capture_source_hmac_key_file", "")).strip()
+            if configured_key_path:
+                key_path = Path(configured_key_path).expanduser().resolve(strict=True)
+                if not key_path.is_file() or stat.S_IMODE(key_path.stat().st_mode) != 0o600:
+                    raise ValueError("capture_source_hmac_key_file must be a mode-0600 file")
+                key = key_path.read_bytes()
+                if len(key) < 32:
+                    raise ValueError("capture_source_hmac_key_file must contain at least 32 bytes")
+                self._source_hmac_key = key
+            else:
+                self._source_hmac_key = None
+        if "capture_asn_mmdb" in updated:
+            configured_path = str(getattr(ctx.options, "capture_asn_mmdb", "")).strip()
+            replacement = OfflineAsnResolver(configured_path) if configured_path else None
+            previous = self._asn_resolver
+            self._asn_resolver = replacement
+            if previous is not None:
+                previous.close()
 
     def done(self) -> None:
         if self._asn_resolver is not None:
@@ -866,14 +900,26 @@ class CaptureAddon:
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
         self._websocket_message_indexes.pop(str(flow.id), None)
-        self._client_hellos.pop(id(getattr(flow, "client_conn", None)), None)
+        connection_id = getattr(getattr(flow, "client_conn", None), "id", None)
+        if connection_id is not None:
+            self._client_hellos.pop(str(connection_id), None)
 
     @staticmethod
     def _write(record: dict[str, Any]) -> None:
-        output_path = Path(str(ctx.options.capture_output)).expanduser()
+        configured_output = str(ctx.options.capture_output).strip()
+        if not configured_output:
+            raise RuntimeError("capture_output must be configured explicitly")
+        output_path = Path(configured_output).expanduser()
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            with output_path.open("a", encoding="utf-8") as output_file:
+            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(output_path, flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+            except OSError:
+                os.close(descriptor)
+                raise
+            with os.fdopen(descriptor, "a", encoding="utf-8") as output_file:
                 output_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
         except OSError:
             logger.exception("Failed to append traffic capture to %s", output_path)

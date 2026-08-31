@@ -19,27 +19,6 @@ direct-Codex profile.
 - **AND** neither carries an aiohttp-generated User-Agent or standalone
   `version` header
 
-## ADDED Requirements
-
-### Requirement: Raw HTTP/2 parity gates wire-profile changes
-
-Changes to native HTTP/2 startup settings or native Codex header serialization
-MUST be verified with controlled A′, A, and C captures. A′ and A MUST establish
-direct repeatability, and A/C ordered SETTINGS, connection-control shape,
-decoded header-name order/casing, and stream/reuse pattern MUST all match before
-the wire-profile change is considered verified. HPACK fragments MUST remain
-informational.
-
-#### Scenario: Native wire-profile fix is verified
-
-- **GIVEN** focused unit tests pass and independent A′/A direct profiles match
-- **WHEN** the fixed native helper is captured as Path C
-- **THEN** every stable A/C HTTP/2 profile dimension matches
-- **AND** credential values, request bodies, HPACK bytes, and TLS keys are not
-  retained as evidence
-
-## MODIFIED Requirements
-
 ### Requirement: HTTP/2 profile comparison separates gates from observations
 
 The toolkit MUST compare Path A and Path C ordered initial SETTINGS,
@@ -74,3 +53,22 @@ treated as proof of decoded-value or dynamic-table equality.
 - **WHEN** their stable connection-control shapes are compared
 - **THEN** the reactive ACK position does not create a direct-variance mismatch
 - **AND** non-ACK SETTINGS and WINDOW_UPDATE frames remain exact evidence
+
+## ADDED Requirements
+
+### Requirement: Raw HTTP/2 parity gates wire-profile changes
+
+Changes to native HTTP/2 startup settings or native Codex header serialization
+MUST be verified with controlled A′, A, and C captures. A′ and A MUST establish
+direct repeatability, and A/C ordered SETTINGS, connection-control shape,
+decoded header-name order/casing, and stream/reuse pattern MUST all match before
+the wire-profile change is considered verified. HPACK fragments MUST remain
+informational.
+
+#### Scenario: Native wire-profile fix is verified
+
+- **GIVEN** focused unit tests pass and independent A′/A direct profiles match
+- **WHEN** the fixed native helper is captured as Path C
+- **THEN** every stable A/C HTTP/2 profile dimension matches
+- **AND** credential values, request bodies, HPACK bytes, and TLS keys are not
+  retained as evidence

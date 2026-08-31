@@ -31,7 +31,7 @@ NOT be able to select or alter the active scenario.
 - **THEN** it accepts one `response.create`, emits `response.created`, and
   closes without a terminal event
 
-### Requirement: Traffic failure evidence is explicit and privacy safe
+### Requirement: Traffic failure evidence is explicit and privacy-safe
 
 The capture addon MUST write a record for a targeted HTTP flow that ends in a
 transport error before the ordinary response hook completes. It MUST retain

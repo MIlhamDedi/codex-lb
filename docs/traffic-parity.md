@@ -61,6 +61,8 @@ Raw captures can grow quickly. Keep them outside the repository, for example:
 ```bash
 RUN_DIR=/mnt/scratch/bench/codex-traffic-parity/$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$RUN_DIR"
+umask 077
+openssl rand 32 > "$RUN_DIR/source-observer.key"
 ```
 
 `/mnt/scratch` is not backed up; move only a sanitized, curated result that is
@@ -78,12 +80,15 @@ uvx --from mitmproxy mitmdump \
   --set capture_body_mode=metadata \
   --set capture_observer_id="$RUN_DIR" \
   --set capture_observer_role=intercept \
+  --set capture_source_hmac_key_file="$RUN_DIR/source-observer.key" \
   -p 18081
 ```
 
 Use the same `capture_observer_id` for Path A and Path C only when those
-captures represent the same observation boundary. The id is stored only as a
-SHA-256 digest. The default `intercept` role proves which digested source host
+captures represent the same observation boundary. Use the same HMAC key for the
+A/C pair, never retain it with the evidence, and rotate it after the comparison.
+The observer id is stored only as a SHA-256 digest. The default `intercept` role
+proves which HMAC-digested source host
 the capture proxy saw; it does not prove which public source IP OpenAI saw.
 Use `capture_observer_role=origin` only when this addon is running at an actual
 controlled origin boundary. The raw source host and source port are never
@@ -124,6 +129,7 @@ updates a database:
 PROBE_HOST=probe.example
 PROBE_CERT=/secure/probe.example.pem
 OBSERVER_ID=codex-origin-probe-2026-08-28
+SOURCE_HMAC_KEY=/secure/codex-source-observer.key
 ASN_DB=/secure/GeoLite2-ASN.mmdb
 
 uvx --with maxminddb --from mitmproxy mitmdump \
@@ -136,6 +142,7 @@ uvx --with maxminddb --from mitmproxy mitmdump \
   --set capture_body_mode=metadata \
   --set capture_observer_id="$OBSERVER_ID" \
   --set capture_observer_role=origin \
+  --set capture_source_hmac_key_file="$SOURCE_HMAC_KEY" \
   --set capture_asn_mmdb="$ASN_DB"
 ```
 

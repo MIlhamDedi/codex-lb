@@ -5,7 +5,7 @@ use base64::Engine as _;
 use codex_lb_protocol::{CAPABILITIES, NativeCommand, NativeEvent, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::http::{ClientKey, ClientPool, classify_error, execute_request};
@@ -19,7 +19,10 @@ pub type RequestError = Box<dyn std::error::Error + Send + Sync>;
 
 enum ActiveRequest {
     Http(oneshot::Sender<()>),
-    WebSocket(mpsc::Sender<WebSocketCommand>),
+    WebSocket {
+        commands: mpsc::Sender<WebSocketCommand>,
+        abort: AbortHandle,
+    },
 }
 
 pub async fn run_stdio() -> Result<(), RequestError> {
@@ -165,26 +168,33 @@ pub async fn run_stdio() -> Result<(), RequestError> {
                         }
                         let request_id = request.request_id.clone();
                         let (command_tx, command_rx) = mpsc::channel(32);
-                        active.lock().await.insert(
-                            request_id.clone(),
-                            ActiveRequest::WebSocket(command_tx),
-                        );
+                        let (start_tx, start_rx) = oneshot::channel();
                         let task_output = output.clone();
                         let task_active = active.clone();
-                        tasks.spawn(async move {
+                        let task_request_id = request_id.clone();
+                        let abort = tasks.spawn(async move {
+                            let _ = start_rx.await;
                             if let Err(error) =
                                 execute_websocket(request, command_rx, &task_output).await
                             {
                                 let _ = emit_websocket_error(
                                     &task_output,
-                                    &request_id,
+                                    &task_request_id,
                                     None,
                                     &error,
                                 )
                                 .await;
                             }
-                            task_active.lock().await.remove(&request_id);
+                            task_active.lock().await.remove(&task_request_id);
                         });
+                        active.lock().await.insert(
+                            request_id.clone(),
+                            ActiveRequest::WebSocket {
+                                commands: command_tx,
+                                abort,
+                            },
+                        );
+                        let _ = start_tx.send(());
                     }
                     NativeCommand::WebsocketSendText {
                         request_id,
@@ -258,8 +268,11 @@ pub async fn run_stdio() -> Result<(), RequestError> {
                             Some(ActiveRequest::Http(cancellation)) => {
                                 let _ = cancellation.send(());
                             }
-                            Some(ActiveRequest::WebSocket(commands)) => {
-                                let _ = commands.send(WebSocketCommand::Cancel).await;
+                            Some(ActiveRequest::WebSocket { commands, abort }) => {
+                                if commands.try_send(WebSocketCommand::Cancel).is_err() {
+                                    abort.abort();
+                                    emit(&output, &NativeEvent::Cancelled { request_id }).await?;
+                                }
                             }
                             None => {
                                 emit(&output, &NativeEvent::Cancelled { request_id }).await?;
@@ -284,8 +297,10 @@ pub async fn run_stdio() -> Result<(), RequestError> {
             ActiveRequest::Http(cancellation) => {
                 let _ = cancellation.send(());
             }
-            ActiveRequest::WebSocket(commands) => {
-                let _ = commands.send(WebSocketCommand::Cancel).await;
+            ActiveRequest::WebSocket { commands, abort } => {
+                if commands.try_send(WebSocketCommand::Cancel).is_err() {
+                    abort.abort();
+                }
             }
         }
     }
@@ -304,7 +319,7 @@ async fn dispatch_websocket_command(
     let sender = {
         let active = active.lock().await;
         match active.get(&request_id) {
-            Some(ActiveRequest::WebSocket(sender)) => Some(sender.clone()),
+            Some(ActiveRequest::WebSocket { commands, .. }) => Some(commands.clone()),
             _ => None,
         }
     };
@@ -317,14 +332,12 @@ async fn dispatch_websocket_command(
         )
         .await;
     };
-    if sender.send(command).await.is_err() {
-        emit_websocket_setup_error(
-            output,
-            &request_id,
-            Some(command_id),
-            "native websocket command channel closed",
-        )
-        .await?;
+    if let Err(error) = sender.try_send(command) {
+        let message = match error {
+            mpsc::error::TrySendError::Full(_) => "native websocket command channel is full",
+            mpsc::error::TrySendError::Closed(_) => "native websocket command channel closed",
+        };
+        emit_websocket_setup_error(output, &request_id, Some(command_id), message).await?;
     }
     Ok(())
 }

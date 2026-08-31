@@ -40,8 +40,11 @@ from app.core.clients.proxy_websocket import (
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    SYNTHETIC_TRANSPORT_FAILURE_CODES,
     OpenAIErrorParam,
+    openai_error,
     response_failed_event,
+    synthetic_stream_failure_event,
     synthetic_transport_failure_event,
 )
 from app.core.errors import (
@@ -721,13 +724,29 @@ def _build_rewritten_stream_response_failed_event(
         error_type="server_error",
         response_id=response_id,
     )
-    if error_code in {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}:
+    if error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES:
         rewritten_event_payload = synthetic_transport_failure_event(rewritten_event_payload)
     rewritten_event_block = format_sse_event(rewritten_event_payload)
     rewritten_payload = parse_sse_data_json(rewritten_event_block)
     rewritten_event = parse_sse_event(rewritten_event_block)
     rewritten_event_type = _event_type_from_payload(rewritten_event, rewritten_payload)
     return rewritten_event_block, rewritten_event, rewritten_payload, rewritten_event_type
+
+
+def _stream_transport_failure_event_or_raise(
+    error_code: str,
+    error_message: str,
+    *,
+    response_id: str,
+    preserve_native_failure_lifecycle: bool,
+) -> str:
+    if preserve_native_failure_lifecycle:
+        raise ProxyResponseError(
+            502,
+            openai_error(error_code, error_message),
+            failure_phase="upstream",
+        )
+    return format_sse_event(synthetic_stream_failure_event(error_code, error_message, response_id=response_id))
 
 
 def _build_stream_incomplete_terminal_event_for_request(
@@ -744,16 +763,10 @@ def _build_stream_incomplete_terminal_event_for_request(
         error_code=error_code,
         error_message=error_message,
     )
+    if payload is None:  # pragma: no cover - formatter/parser contract
+        raise RuntimeError("rewritten stream failure event did not contain a JSON payload")
     downstream_text = json.dumps(
-        cast(
-            dict[str, JsonValue],
-            response_failed_event(
-                error_code,
-                error_message,
-                error_type="server_error",
-                response_id=_websocket_downstream_response_id(request_state),
-            ),
-        ),
+        payload,
         ensure_ascii=True,
         separators=(",", ":"),
     )

@@ -9249,16 +9249,18 @@ async def test_native_codex_stream_preserves_missing_terminal_without_synthesis(
     async def truncated_stream() -> AsyncIterator[str]:
         yield 'data: {"type":"response.created","response":{"id":"resp_native_truncated"}}\n\n'
 
-    events = [
-        parse_sse_data_json(event_block)
-        async for event_block in proxy_api._normalize_public_responses_stream(
-            truncated_stream(),
-            enforce_openai_sdk_contract=False,
-            preserve_native_failure_lifecycle=True,
-        )
-    ]
+    iterator = proxy_api._normalize_public_responses_stream(
+        truncated_stream(),
+        enforce_openai_sdk_contract=False,
+        preserve_native_failure_lifecycle=True,
+    )
 
-    assert events == [{"type": "response.created", "response": {"id": "resp_native_truncated"}}]
+    assert parse_sse_data_json(await iterator.__anext__()) == {
+        "type": "response.created",
+        "response": {"id": "resp_native_truncated"},
+    }
+    with pytest.raises(proxy_module.ProxyResponseError):
+        await iterator.__anext__()
 
 
 @pytest.mark.asyncio
@@ -9271,16 +9273,15 @@ async def test_native_codex_stream_suppresses_marked_synthetic_transport_termina
         )
         yield "data: [DONE]\n\n"
 
-    native_events = [
-        event_block
-        async for event_block in proxy_api._normalize_public_responses_stream(
-            synthetic_failure_stream(),
-            enforce_openai_sdk_contract=False,
-            preserve_native_failure_lifecycle=True,
-        )
-    ]
-
-    assert native_events == []
+    with pytest.raises(proxy_module.ProxyResponseError):
+        _ = [
+            event_block
+            async for event_block in proxy_api._normalize_public_responses_stream(
+                synthetic_failure_stream(),
+                enforce_openai_sdk_contract=False,
+                preserve_native_failure_lifecycle=True,
+            )
+        ]
 
 
 @pytest.mark.asyncio
@@ -9293,16 +9294,15 @@ async def test_native_codex_stream_suppresses_marked_incomplete_terminal_as_eof(
         )
         yield "data: [DONE]\n\n"
 
-    native_events = [
-        event_block
-        async for event_block in proxy_api._normalize_public_responses_stream(
-            synthetic_failure_stream(),
-            enforce_openai_sdk_contract=False,
-            preserve_native_failure_lifecycle=True,
-        )
-    ]
-
-    assert native_events == []
+    with pytest.raises(proxy_module.ProxyResponseError):
+        _ = [
+            event_block
+            async for event_block in proxy_api._normalize_public_responses_stream(
+                synthetic_failure_stream(),
+                enforce_openai_sdk_contract=False,
+                preserve_native_failure_lifecycle=True,
+            )
+        ]
 
 
 @pytest.mark.asyncio
@@ -9363,6 +9363,37 @@ def test_stream_startup_error_response_preserves_exact_retry_after_header() -> N
 
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "Wed, 21 Oct 2026 07:28:00 GMT"
+
+
+def test_stream_startup_error_response_rejects_malformed_retry_after_header() -> None:
+    request = Request({"type": "http", "method": "POST", "path": "/backend-api/codex/responses", "headers": []})
+    error = proxy_module.ProxyResponseError(
+        429,
+        openai_error("rate_limit_exceeded", "slow down", error_type="rate_limit_error"),
+        retry_after_seconds=3,
+        retry_after_header="not a valid HTTP date",
+    )
+
+    response = proxy_api._stream_startup_error_response(request, error, headers={})
+
+    assert response.headers["Retry-After"] == "3"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+async def test_non_streaming_response_preserves_unfinished_status(status: str) -> None:
+    event_block, event_type = proxy_module._non_streaming_response_event(
+        {"id": "resp_background", "status": status, "output": []}
+    )
+
+    async def stream() -> AsyncIterator[str]:
+        yield event_block
+
+    result = await proxy_api._collect_responses_payload(stream())
+
+    assert event_type == f"response.{status}"
+    assert isinstance(result, OpenAIResponsePayload)
+    assert result.status == status
 
 
 @pytest.mark.parametrize(

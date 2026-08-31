@@ -2,7 +2,7 @@
 
 - [x] 1.1 Add model-discovery tests for Codex identity, wildcard accept, account header, and absence of aiohttp identity leakage.
 - [x] 1.2 Add bridge-admission tests covering `always_http`, smart sticky/non-sticky behavior, `always_websocket`, explicit transport precedence, and per-key overrides.
-- [x] 1.3 Add traffic-report fixtures that keep HTTP, SSE, WebSocket, TLS, and identity mismatch dimensions distinct.
+- [x] 1.3 Add traffic-report fixtures that keep HTTP, SSE, WebSocket, TLS, and identity-mismatch dimensions distinct.
 
 ## 2. Implementation
 

@@ -425,24 +425,41 @@ async def test_client_close_does_not_hang_when_stream_queue_is_full(tmp_path: Pa
 import base64
 import json
 import sys
-command = json.loads(sys.stdin.readline())
-request_id = command["request_id"]
-print(json.dumps({
-    "type": "head", "request_id": request_id, "status": 200,
-    "http_version": "HTTP/2.0", "headers": [],
-}), flush=True)
-for _ in range(256):
+for line in sys.stdin:
+    command = json.loads(line)
+    request_id = command["request_id"]
+    if command["type"] == "cancel":
+        print(json.dumps({"type": "cancelled", "request_id": request_id}), flush=True)
+        continue
     print(json.dumps({
-        "type": "chunk", "request_id": request_id,
-        "data": base64.b64encode(b"x").decode(),
+        "type": "head", "request_id": request_id, "status": 200,
+        "http_version": "HTTP/2.0", "headers": [],
     }), flush=True)
-print(json.dumps({"type": "end", "request_id": request_id}), flush=True)
-sys.stdin.read()
+    if command["url"].endswith("/slow-consumer"):
+        for _ in range(256):
+            print(json.dumps({
+                "type": "chunk", "request_id": request_id,
+                "data": base64.b64encode(b"x").decode(),
+            }), flush=True)
+    else:
+        print(json.dumps({
+            "type": "chunk", "request_id": request_id,
+            "data": base64.b64encode(b"ok").decode(),
+        }), flush=True)
+    print(json.dumps({"type": "end", "request_id": request_id}), flush=True)
 """,
     )
     client = SubprocessNativeEgressClient(helper)
-    await client.request(NativeEgressRequest(method="GET", url="https://example.test/slow-consumer", headers={}))
+    stalled = await client.request(
+        NativeEgressRequest(method="GET", url="https://example.test/slow-consumer", headers={})
+    )
     await asyncio.sleep(0.05)
+
+    healthy = await client.request(NativeEgressRequest(method="GET", url="https://example.test/healthy", headers={}))
+
+    assert await asyncio.wait_for(healthy.read(), timeout=2.0) == b"ok"
+    with pytest.raises(NativeEgressTransportError, match="bounded event queue"):
+        await stalled.read()
 
     await asyncio.wait_for(client.aclose(), timeout=2.0)
 
@@ -565,6 +582,9 @@ async def test_native_websocket_routes_frames_and_send_acknowledgements(tmp_path
 
     process = client._process
     await websocket.close(code=1000, reason="done")
+    assert await websocket.receive() == NativeWebSocketMessage(kind="close", close_code=1000, close_reason="done")
+    with pytest.raises(NativeEgressTransportError, match="closed"):
+        await asyncio.wait_for(websocket.receive(), timeout=0.1)
     assert client._process is process
     assert process is not None and process.returncode is None
     await client.aclose()

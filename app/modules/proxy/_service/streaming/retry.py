@@ -22,12 +22,12 @@ from app.core.clients.proxy import (
     pop_stream_timeout_overrides,
 )
 from app.core.errors import (
-    ResponseFailedEvent,
+    SYNTHETIC_TRANSPORT_FAILURE_CODES,
     openai_error,
     synthetic_transport_failure_event,
 )
 from app.core.errors import (
-    response_failed_event as _base_response_failed_event,
+    synthetic_stream_failure_event as response_failed_event,
 )
 from app.core.openai.requests import ResponsesRequest, extract_input_file_ids
 from app.core.resilience.network_recovery import (
@@ -94,23 +94,7 @@ _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
 _HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT = "smart"
 _HTTP_DOWNSTREAM_TRANSPORT_POLICIES = frozenset({"smart", "always_http", "always_websocket", "pinned"})
-_NATIVE_CODEX_TRANSPORT_FAILURE_CODES = frozenset(
-    {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}
-)
-
 logger = logging.getLogger(__name__)
-
-
-def response_failed_event(code: str, message: str, *args: Any, **kwargs: Any) -> ResponseFailedEvent:
-    """Tag transport terminals synthesized inside the retry layer.
-
-    Raw upstream SSE events never pass through this constructor, so the marker
-    distinguishes LB translation from a terminal the origin actually sent.
-    """
-    event = _base_response_failed_event(code, message, *args, **kwargs)
-    if code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES:
-        return synthetic_transport_failure_event(event)
-    return event
 
 
 def _facade() -> Any:
@@ -2196,7 +2180,7 @@ class _StreamingRetryMixin:
                                 settlement.account_health_error = _facade()._should_penalize_stream_error(error_code)
                                 if not (
                                     preserve_native_failure_lifecycle
-                                    and error_code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES
+                                    and error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES
                                 ):
                                     try:
                                         yield format_sse_event(event)
@@ -3133,6 +3117,8 @@ class _StreamingRetryMixin:
                 except RefreshError as exc:
                     if exc.is_permanent:
                         await proxy._load_balancer.mark_permanent_failure(account, exc.code)
+                        await _release_tracked_stream_lease(current_account_lease)
+                        current_account_lease = None
                         excluded_account_ids.add(account.id)
                     continue
                 except Exception:
@@ -3176,11 +3162,11 @@ class _StreamingRetryMixin:
                     retries_exhausted_msg,
                     response_id=request_id,
                 )
-                if last_retryable_stream_error.code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES:
+                if last_retryable_stream_error.code in SYNTHETIC_TRANSPORT_FAILURE_CODES:
                     event = synthetic_transport_failure_event(event)
                 if not (
                     preserve_native_failure_lifecycle
-                    and last_retryable_stream_error.code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES
+                    and last_retryable_stream_error.code in SYNTHETIC_TRANSPORT_FAILURE_CODES
                 ):
                     yield format_sse_event(event)
                 if not any_attempt_logged:

@@ -51,6 +51,7 @@ pub(crate) enum WebSocketCommand {
 
 #[derive(Debug)]
 pub(crate) enum NativeWebSocketFailure {
+    Connect(WebSocketError),
     WebSocket(WebSocketError),
     Timeout,
     LivenessTimeout,
@@ -60,6 +61,7 @@ pub(crate) enum NativeWebSocketFailure {
 impl std::fmt::Display for NativeWebSocketFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Connect(error) => write!(formatter, "{error}"),
             Self::WebSocket(error) => write!(formatter, "{error}"),
             Self::Timeout => formatter.write_str("websocket connect timed out"),
             Self::LivenessTimeout => formatter.write_str("websocket pong timed out"),
@@ -91,7 +93,8 @@ pub(crate) async fn execute_websocket(
     let connect_timeout = Duration::from_millis(request.connect_timeout_ms);
     let connected = tokio::time::timeout(connect_timeout, connect_native_websocket(&request))
         .await
-        .map_err(|_| NativeWebSocketFailure::Timeout)??;
+        .map_err(|_| NativeWebSocketFailure::Timeout)?
+        .map_err(NativeWebSocketFailure::Connect)?;
     let (mut websocket, response) = connected;
     let response_headers = websocket_headers(response.headers());
     emit(
@@ -447,7 +450,7 @@ pub(crate) async fn emit_websocket_error(
             Vec::new(),
             None,
         ),
-        NativeWebSocketFailure::WebSocket(WebSocketError::Http(response)) => (
+        NativeWebSocketFailure::Connect(WebSocketError::Http(response)) => (
             "native websocket handshake failed",
             "connect",
             false,
@@ -459,6 +462,30 @@ pub(crate) async fn emit_websocket_error(
                 .as_ref()
                 .map(|body| base64::engine::general_purpose::STANDARD.encode(body)),
         ),
+        NativeWebSocketFailure::Connect(WebSocketError::Io(_)) => {
+            let tls_verification = websocket_tls_verification_failure(failure);
+            (
+                "native websocket transport failed",
+                "connect",
+                !tls_verification,
+                tls_verification,
+                None,
+                Vec::new(),
+                None,
+            )
+        }
+        NativeWebSocketFailure::Connect(_) => {
+            let tls_verification = websocket_tls_verification_failure(failure);
+            (
+                "native websocket connection failed",
+                "connect",
+                !tls_verification,
+                tls_verification,
+                None,
+                Vec::new(),
+                None,
+            )
+        }
         NativeWebSocketFailure::WebSocket(WebSocketError::Io(_)) => (
             "native websocket transport failed",
             "transport",
@@ -506,10 +533,13 @@ pub(crate) async fn emit_websocket_error(
 
 fn websocket_tls_verification_failure(failure: &NativeWebSocketFailure) -> bool {
     match failure {
-        NativeWebSocketFailure::WebSocket(WebSocketError::Tls(TlsError::Rustls(error))) => {
+        NativeWebSocketFailure::Connect(WebSocketError::Tls(TlsError::Rustls(error)))
+        | NativeWebSocketFailure::WebSocket(WebSocketError::Tls(TlsError::Rustls(error))) => {
             matches!(error.as_ref(), rustls::Error::InvalidCertificate(_))
         }
-        NativeWebSocketFailure::WebSocket(error) => error_chain_has_invalid_certificate(error),
+        NativeWebSocketFailure::Connect(error) | NativeWebSocketFailure::WebSocket(error) => {
+            error_chain_has_invalid_certificate(error)
+        }
         _ => false,
     }
 }

@@ -29,7 +29,7 @@ _PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
         "oauth_token_field",
         re.compile(
             rb'(?i)"(?:access_token|refresh_token|id_token)"\s*:\s*"'
-            rb'(?!\[(?:redacted|sha256)[^\]]*\])[^"\r\n]{12,}"'
+            rb'(?!\[(?:redacted|sha256)[^\]]*\])[^"\r\n]{12,}'
         ),
     ),
 )
@@ -50,6 +50,8 @@ def _file_findings(path: Path) -> list[str]:
 
 def scan_tree(root: str | Path) -> dict[str, Any]:
     root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise ValueError(f"privacy scan root must be an existing directory: {root_path}")
     findings: list[dict[str, Any]] = []
     files_scanned = 0
     bytes_scanned = 0

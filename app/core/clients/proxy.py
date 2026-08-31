@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import (
     Any,
@@ -65,6 +66,7 @@ from app.core.errors import (
     ResponseFailedEvent,
     openai_error,
     response_failed_event,
+    synthetic_stream_failure_event,
     synthetic_transport_failure_event,
 )
 from app.core.openai.exceptions import ClientPayloadError
@@ -615,6 +617,14 @@ def _safe_retry_after_header(headers: Mapping[str, object] | None) -> str | None
     normalized = value.strip()
     if not normalized or len(normalized) > 128 or "\r" in normalized or "\n" in normalized:
         return None
+    if normalized.isdecimal():
+        return normalized
+    try:
+        parsed_date = parsedate_to_datetime(normalized)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed_date.tzinfo is None:
+        return None
     return normalized
 
 
@@ -878,7 +888,8 @@ def _replace_header_preserving_position(
 ) -> None:
     """Replace one case-insensitive field without moving its first spelling."""
 
-    matches = [key for key in headers if key.lower() == name]
+    normalized = name.lower()
+    matches = [key for key in headers if key.lower() == normalized]
     if not matches:
         headers[fallback_name] = value
         return
@@ -2169,6 +2180,8 @@ def _non_streaming_response_event(payload: JsonValue) -> tuple[str, str]:
         event_type = "response.failed"
     elif status == "incomplete":
         event_type = "response.incomplete"
+    elif status in {"queued", "in_progress"}:
+        event_type = f"response.{status}"
     else:
         event_type = "response.completed"
     return format_sse_event({"type": event_type, "response": response}), event_type
@@ -3604,17 +3617,6 @@ async def _stream_responses_with_session(
     suppress_live_usage: bool = False,
     native_egress_client: NativeEgressClient | None = None,
 ) -> AsyncIterator[str]:
-    def synthetic_stream_failure_event(
-        code: str,
-        message: str,
-        *args: Any,
-        **kwargs: Any,
-    ) -> ResponseFailedEvent:
-        event = response_failed_event(code, message, *args, **kwargs)
-        if code in {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}:
-            return synthetic_transport_failure_event(event)
-        return event
-
     settings = get_settings()
     headers = apply_codex_installation_headers(
         headers,
@@ -4313,7 +4315,9 @@ async def _stream_responses_with_session(
         failure_exception_type = type(exc).__name__
         retryable_same_contract = False
         yield format_sse_event(
-            synthetic_stream_failure_event(native_error_code, native_error_message, response_id=get_request_id()),
+            synthetic_transport_failure_event(
+                response_failed_event(native_error_code, native_error_message, response_id=get_request_id())
+            ),
         )
         return
     except aiohttp.ClientError as exc:

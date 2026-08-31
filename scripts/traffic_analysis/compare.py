@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 try:
     from scripts.traffic_analysis.tls_randomization import (
         DEFAULT_MIN_SAMPLES,
+        TLS_TRANSPORTS,
         analyze_tls_randomization_paths,
         stable_tls_profile,
     )
@@ -33,6 +34,7 @@ except ModuleNotFoundError:  # Allow ``python scripts/traffic_analysis/compare.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.traffic_analysis.tls_randomization import (
         DEFAULT_MIN_SAMPLES,
+        TLS_TRANSPORTS,
         analyze_tls_randomization_paths,
         stable_tls_profile,
     )
@@ -1237,6 +1239,8 @@ def _compare_observed_source(left: Any, right: Any) -> dict[str, Any]:
     source_c = right.get("source_host")
     if not isinstance(source_a, Mapping) or not isinstance(source_c, Mapping):
         return {**base, "matches": None, "status": "unobserved", "reason": "missing_source_address"}
+    if not all(source.get("family") and source.get("hmac_sha256") for source in (source_a, source_c)):
+        return {**base, "matches": None, "status": "unobserved", "reason": "incomplete_source_address"}
 
     matches = source_a == source_c
     return {
@@ -1574,7 +1578,7 @@ def compare_paths(
             "informational_only": True,
             "reason": "path_a_reference_not_supplied" if path_a_reference is None else "path_a_not_supplied",
             "all_observed_transports_match": None,
-            "unobserved_transports": list(TRANSPORTS),
+            "unobserved_transports": list(TLS_TRANSPORTS),
             "transports": {},
         }
     result["diagnostics"] = {

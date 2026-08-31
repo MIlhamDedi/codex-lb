@@ -93,6 +93,24 @@ def test_canary_failure_and_invalid_result_do_not_advance_state(tmp_path: Path) 
     assert not (tmp_path / "state" / "state.json").exists()
 
 
+def test_canary_does_not_trust_success_marker_when_sensitive_artifacts_remain(tmp_path: Path) -> None:
+    command = (
+        SUCCESS_COMMAND
+        + """
+sensitive = root / 'raw-h2' / 'data'
+sensitive.mkdir(parents=True)
+(sensitive / 'encryption.key').write_text('secret')
+"""
+    )
+    config = _config(tmp_path, command=[sys.executable, "-c", command])
+
+    result = canary_runner.run_canary(config, now=1_000_000)
+
+    assert result["status"] == "invalid_result"
+    assert result["state_updated"] is False
+    assert not (tmp_path / "state" / "state.json").exists()
+
+
 def test_canary_dry_run_and_overlap_never_start_command(tmp_path: Path) -> None:
     config = _config(tmp_path)
 

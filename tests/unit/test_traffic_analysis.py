@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib
 import itertools
 import json
@@ -352,7 +353,7 @@ def test_server_observable_source_requires_same_attested_boundary() -> None:
             "source_observer": {
                 "observer_id_sha256": "shared-observer",
                 "role": "intercept",
-                "source_host": {"family": "ipv4", "sha256": "shared-source"},
+                "source_host": {"family": "ipv4", "hmac_sha256": "shared-source"},
             }
         }
 
@@ -379,14 +380,14 @@ def test_controlled_origin_source_mismatch_is_visible() -> None:
         "source_observer": {
             "observer_id_sha256": "controlled-origin",
             "role": "origin",
-            "source_host": {"family": "ipv4", "sha256": "source-a"},
+            "source_host": {"family": "ipv4", "hmac_sha256": "source-a"},
         }
     }
     record_c["network"] = {
         "source_observer": {
             "observer_id_sha256": "controlled-origin",
             "role": "origin",
-            "source_host": {"family": "ipv4", "sha256": "source-c"},
+            "source_host": {"family": "ipv4", "hmac_sha256": "source-c"},
         }
     }
 
@@ -408,7 +409,7 @@ def test_controlled_origin_asn_requires_matching_database_provenance() -> None:
         return {
             "observer_id_sha256": "controlled-origin",
             "role": "origin",
-            "source_host": {"family": "ipv4", "sha256": "same-source"},
+            "source_host": {"family": "ipv4", "hmac_sha256": "same-source"},
             "asn": {
                 "status": "observed",
                 "number": 64500,
@@ -1072,6 +1073,7 @@ def _load_addon(monkeypatch: Any) -> Any:
                 capture_output="/tmp/unused-codex-traffic.jsonl",
                 capture_observer_id="",
                 capture_observer_role="intercept",
+                capture_source_hmac_key_file="",
                 capture_asn_mmdb="",
             )
         ),
@@ -1212,10 +1214,32 @@ def test_client_hello_capture_records_wire_fingerprint_without_raw_bytes(monkeyp
     assert not any(isinstance(value, bytes) for value in captured.values())
 
 
+def test_client_hello_cache_uses_stable_connection_id(monkeypatch: Any) -> None:
+    module = _load_addon(monkeypatch)
+    addon = module.CaptureAddon()
+    hello = SimpleNamespace(
+        cipher_suites=[],
+        sni=None,
+        alpn_protocols=[],
+        extensions=[],
+        raw_bytes=lambda **_kwargs: b"\x03\x03",
+    )
+    addon.tls_clienthello(
+        SimpleNamespace(context=SimpleNamespace(client=SimpleNamespace(id="conn-1")), client_hello=hello)
+    )
+    flow = SimpleNamespace(client_conn=SimpleNamespace(id="conn-1", peername=None))
+
+    observation = addon._network_observation(flow)
+
+    assert "conn-1" in addon._client_hellos
+    assert "client_hello" in observation["tls"]
+
+
 def test_source_observer_hashes_peer_and_observer_id(monkeypatch: Any) -> None:
     addon = _load_addon(monkeypatch)
     addon.ctx.options.capture_observer_id = "same-controlled-observer"
     addon.ctx.options.capture_observer_role = "origin"
+    source_hmac_key = b"source-observer-test-key-32-bytes"
     flow = SimpleNamespace(
         client_conn=SimpleNamespace(peername=("203.0.113.9", 43123)),
         request=SimpleNamespace(
@@ -1226,14 +1250,14 @@ def test_source_observer_hashes_peer_and_observer_id(monkeypatch: Any) -> None:
         ),
     )
 
-    observed = addon._source_observer(flow)
+    observed = addon._source_observer(flow, source_hmac_key=source_hmac_key)
 
     assert observed == {
         "observer_id_sha256": hashlib.sha256(b"same-controlled-observer").hexdigest(),
         "role": "origin",
         "source_host": {
             "family": "ipv4",
-            "sha256": hashlib.sha256(b"203.0.113.9").hexdigest(),
+            "hmac_sha256": hmac.new(source_hmac_key, b"203.0.113.9", hashlib.sha256).hexdigest(),
         },
     }
     assert "203.0.113.9" not in json.dumps(observed)

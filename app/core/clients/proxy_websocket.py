@@ -983,7 +983,13 @@ async def _connect_upstream_websocket(
             raise
         if native_routed:
             if owns_codex_client:
-                await active_codex_client.close()
+                try:
+                    await active_codex_client.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close owned Codex client after native websocket connect",
+                        exc_info=True,
+                    )
             return ArchivingUpstreamWebSocket(
                 NativeUpstreamWebSocket(cast(NativeEgressWebSocket, websocket)),
                 url=url,

@@ -115,8 +115,10 @@ def _run_checked(argv: Sequence[str], cwd: Path, environment: Mapping[str, str] 
         raise FastCanaryError(f"suite command failed: {Path(argv[0]).name} (exit {completed.returncode})")
 
 
-def _sensitive_directories(run_dir: Path) -> list[Path]:
+def _sensitive_directories(run_dir: Path, *, include_captures: bool = False) -> list[Path]:
     targets = [run_dir / "raw-h2" / "data", run_dir / "raw-h2" / "logs"]
+    if include_captures:
+        targets.append(run_dir / "raw-h2" / "captures")
     failure_root = run_dir / "failure-matrix"
     if failure_root.is_dir() and not failure_root.is_symlink():
         for scenario in sorted(failure_root.iterdir()):
@@ -224,6 +226,14 @@ def run_suite(
         if privacy_result.get("passed") is not True:
             raise FastCanaryError("retained canary evidence failed privacy scan")
         return _write_success_result(config)
+    except BaseException:
+        cleanup_sensitive(config.run_dir)
+        for target in _sensitive_directories(config.run_dir, include_captures=True):
+            if target.is_symlink():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+        raise
     finally:
         cleanup_sensitive(config.run_dir)
 

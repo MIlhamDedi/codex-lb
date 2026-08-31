@@ -1,5 +1,7 @@
 # Rust migration architecture
 
+Normative owner: [Proxy architecture OpenSpec](https://github.com/Soju06/codex-lb/blob/main/openspec/specs/proxy-architecture/spec.md).
+
 codex-lb uses one virtual Cargo workspace at the repository root. Rust source
 lives under `crates/`; it is not nested under `rust/` or `native/`. This is the
 intended final layout, not a temporary helper layout: when the Python backend is

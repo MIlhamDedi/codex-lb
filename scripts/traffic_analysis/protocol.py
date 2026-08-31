@@ -114,7 +114,7 @@ def _dispatch_sse(
     raw_data = "\n".join(data_lines)
     if raw_data == "[DONE]":
         return ProtocolEvent(
-            type=explicit_type or "done",
+            type="done" if explicit_type in (None, "", "message") else explicit_type,
             data="[DONE]",
             raw_data=raw_data,
             event_id=event_id,

@@ -739,14 +739,17 @@ def _prepare_native_websocket_request(
     try:
         connect_timeout = float(kwargs.get("timeout", 10.0))
         max_message_bytes = int(kwargs.get("max_msg_size", 4 * 1024 * 1024))
-        ping_timeout = kwargs.get("heartbeat")
-        ping_timeout_seconds = float(ping_timeout) if ping_timeout is not None else None
+        compress = int(kwargs.get("compress", 0))
+        heartbeat = kwargs.get("heartbeat")
+        ping_interval_seconds = float(heartbeat) if heartbeat is not None else None
+        ping_timeout_seconds = ping_interval_seconds / 2 if ping_interval_seconds is not None else None
     except (TypeError, ValueError):
         return None
     if (
-        connect_timeout <= 0
+        compress != 15
+        or connect_timeout <= 0
         or max_message_bytes <= 0
-        or (ping_timeout_seconds is not None and ping_timeout_seconds <= 0)
+        or (ping_interval_seconds is not None and ping_interval_seconds <= 0)
     ):
         return None
     return NativeWebSocketRequest(
@@ -754,7 +757,7 @@ def _prepare_native_websocket_request(
         headers=headers,
         connect_timeout_seconds=connect_timeout,
         max_message_bytes=max_message_bytes,
-        ping_interval_seconds=20.0,
+        ping_interval_seconds=ping_interval_seconds,
         ping_timeout_seconds=ping_timeout_seconds,
         proxy_url=proxy_url,
     )

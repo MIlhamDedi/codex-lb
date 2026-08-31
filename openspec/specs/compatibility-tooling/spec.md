@@ -137,14 +137,15 @@ The traffic parity toolkit MUST compare direct Codex and codex-lb observations s
 
 ### Requirement: Model discovery emits a Codex control identity
 
-Subscription model-discovery requests MUST send the resolved Codex client version in a first-party Codex `User-Agent`, `originator`, and `version` header family, MUST use `Accept: */*`, and MUST apply the same mapping for direct and account-routed egress. They MUST NOT expose the HTTP library's default User-Agent as the request identity.
+Subscription model-discovery requests MUST send the resolved Codex client version in the request query and a first-party Codex `User-Agent`, MUST send `originator` and `Accept: */*`, and MUST apply the same mapping for direct and account-routed egress. They MUST NOT expose the HTTP library's default User-Agent or add a standalone `version` header absent from the maintained direct-Codex profile.
 
 #### Scenario: Routed and direct model discovery share identity
 
 - **GIVEN** the same resolved Codex version, access token, and account
 - **WHEN** model discovery runs once through direct egress and once through an account route
 - **THEN** both requests carry the same Codex identity and accept headers
-- **AND** neither carries an aiohttp-generated User-Agent
+- **AND** neither carries an aiohttp-generated User-Agent or standalone
+  `version` header
 
 ### Requirement: Upstream WebSocket handshake offers Codex-compatible compression
 
@@ -174,10 +175,13 @@ Direct and account-routed upstream WebSockets MUST use the Codex-pinned OpenAI `
 
 The traffic parity capture addon MUST accept an optional operator-supplied
 observer id and observer role for A/C source-address comparison. It MUST retain
-only a deterministic digest of the observer id and the source host observed by
-the capture boundary, together with non-sensitive address-family metadata, and
-MUST NOT persist the raw source host. The analyzer MUST compare source evidence
-only when both paths attest the same observer id and role. Missing or
+only a deterministic digest of the observer id and a keyed HMAC-SHA-256 of the
+source host observed by the capture boundary, together with non-sensitive
+address-family metadata, and MUST NOT persist the raw source host or HMAC key.
+The same per-comparison key MUST cover both A/C captures and MUST be rotated
+after the comparison. The analyzer MUST compare source evidence only when both
+paths attest the same observer id and role and both contain a source-host HMAC
+and address family. Missing, partial, or
 incompatible attestation MUST be reported as unobserved rather than pass or
 fail. An intercept-observer match MUST NOT be described as proof of the public
 source IP or ASN observed by OpenAI; that stronger claim is available only
@@ -202,9 +206,17 @@ when an actual controlled origin is explicitly declared as the observer.
 
 - **GIVEN** the capture boundary exposes a client peer address
 - **WHEN** metadata, full, or none capture mode writes a record
-- **THEN** the record contains a deterministic source-host digest and address
+- **THEN** the record contains a keyed source-host HMAC and address
   family
 - **AND** the raw source host is absent
+
+#### Scenario: Retained evidence resists offline source guessing
+
+- **GIVEN** an attacker obtains the retained capture without the per-comparison
+  HMAC key
+- **WHEN** the attacker enumerates likely hostnames or private addresses
+- **THEN** plain SHA-256 guesses do not reproduce the retained source evidence
+- **AND** the key is absent from every retained artifact
 
 ### Requirement: Controlled captures can attest ASN from an offline database
 

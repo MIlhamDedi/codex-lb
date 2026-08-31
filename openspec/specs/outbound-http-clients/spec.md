@@ -448,7 +448,19 @@ The shared upstream TCP connectors MUST configure connection keepalive of at lea
 
 ### Requirement: Packaged native egress is preferred only across a replay-safe boundary
 
-When the fixed packaged `codex-lb-native-egress` executable is available, direct and account-routed Codex model-discovery, JSON/raw/multipart HTTP, Responses HTTP/SSE, and Responses or Live WebSocket calls MUST prefer it over the corresponding Python data-plane client. Python MUST retain ownership of account selection, route resolution, ordered proxy endpoint fallback, route metadata, and health classification, while each native command MUST target exactly one concrete direct or proxy endpoint. The worker MUST reuse one persistent helper generation and compatible reqwest HTTP/2 client pools across HTTP requests, and MUST multiplex concurrent HTTP and WebSocket operations without cross-delivering events. Native calls MUST preserve standard direct HTTP/HTTPS/SOCKS proxy environment resolution and `NO_PROXY` bypass behavior, and routed calls MUST use the resolved endpoint without consulting environment proxy variables. When the executable is absent or cannot start before dispatch, calls MUST retain their existing Python behavior without preventing startup. A non-idempotent request, WebSocket handshake, or WebSocket frame MUST NOT fall back to Python after its native command may have been dispatched. Helper failure MUST fail operations from that generation without replay and MAY be recovered only by starting a new generation for a later operation. A confirmed pre-dispatch routed connection failure MAY use the next endpoint under the existing route policy, while a TLS verification failure or ambiguous delivery MUST NOT gain new replay eligibility.
+When the fixed packaged `codex-lb-native-egress` executable is available, direct and account-routed Codex model-discovery, JSON/raw/multipart HTTP, Responses HTTP/SSE, and Responses or Live WebSocket calls MUST prefer it over the corresponding Python data-plane client. Python MUST retain ownership of account selection, route resolution, ordered proxy endpoint fallback, route metadata, and health classification, while each native command MUST target exactly one concrete direct or proxy endpoint. The worker MUST reuse one persistent helper generation and compatible reqwest HTTP/2 client pools across HTTP requests, and MUST multiplex concurrent HTTP and WebSocket operations without cross-delivering events. Native calls MUST preserve standard direct HTTP/HTTPS/SOCKS proxy environment resolution and `NO_PROXY` bypass behavior, and routed calls MUST use the resolved endpoint without consulting environment proxy variables. Python fallback is permitted only when the executable is absent or cannot be spawned. Once a helper process launches, a malformed, timed-out, or incompatible hello/negotiation exchange MUST fail closed without dispatching the operation to Python. A non-idempotent request, WebSocket handshake, or WebSocket frame MUST NOT fall back to Python after its native command may have been dispatched. Helper failure MUST fail operations from that generation without replay and MAY be recovered only by starting a new generation for a later operation. A confirmed pre-dispatch routed connection failure MAY use the next endpoint under the existing route policy, while a TLS verification failure or ambiguous delivery MUST NOT gain new replay eligibility.
+
+Credential-bearing routed proxy endpoints MUST use encrypted `https://`
+transport. Route resolution MUST reject a username or password on a plaintext
+`http://` endpoint before either the native helper or Python connector can use
+the URL.
+
+#### Scenario: Plaintext proxy credentials fail before connector selection
+
+- **GIVEN** a routed endpoint contains credentials and uses `http://`
+- **WHEN** codex-lb resolves the route for an HTTP or WebSocket operation
+- **THEN** route resolution fails closed
+- **AND** neither native nor Python egress receives the credential-bearing URL
 
 #### Scenario: Packaged direct request prefers native transport
 
@@ -563,7 +575,10 @@ MUST be case-insensitive.
 Every persistent native HTTP client pool entry MUST use the measured Codex
 initial HTTP/2 stream receive window, connection receive window, maximum frame
 size, and maximum header-list size. It MUST NOT enable adaptive startup flow
-control when that would replace the explicit profile.
+control when that would replace the explicit profile. The maintained profile is
+2,097,152 bytes for the stream receive window, 5,242,880 bytes for the
+connection receive window, 16,384 bytes for maximum frame size, and 16,384
+bytes for maximum header-list size.
 
 #### Scenario: Native helper starts a new HTTP/2 connection
 

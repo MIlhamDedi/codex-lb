@@ -505,9 +505,7 @@ from app.modules.proxy._service.response_create import (
 from app.modules.proxy._service.response_create import (
     _write_response_create_dump as _write_response_create_dump,
 )
-from app.modules.proxy._service.streaming import (
-    _StreamingMixin,
-)
+from app.modules.proxy._service.streaming import _StreamingMixin
 from app.modules.proxy._service.streaming.helpers import (
     _build_rewritten_stream_response_failed_event as _build_rewritten_stream_response_failed_event,
 )
@@ -2353,13 +2351,8 @@ def _remaining_budget_seconds(deadline: float) -> float:
 
 
 def _proxy_request_timeout_event(request_id: str) -> ResponseFailedEvent:
-    return synthetic_transport_failure_event(
-        response_failed_event(
-            "upstream_request_timeout",
-            "Proxy request budget exhausted",
-            response_id=request_id,
-        )
-    )
+    event = response_failed_event("upstream_request_timeout", "Proxy request budget exhausted", response_id=request_id)
+    return synthetic_transport_failure_event(event)
 
 
 def _security_work_advisory_event(

@@ -153,6 +153,7 @@ def test_suite_privacy_failure_retains_safe_report_without_marker(
     report = json.loads((config.run_dir / "outputs" / "privacy-scan.json").read_text())
     assert report["passed"] is False
     assert "privatecredential123" not in str(report)
+    assert not (config.run_dir / "raw-h2" / "captures").exists()
     assert not (config.run_dir / "outputs" / "fast-canary.json").exists()
 
 

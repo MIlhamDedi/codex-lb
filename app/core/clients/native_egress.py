@@ -31,6 +31,7 @@ _REQUIRED_NATIVE_CAPABILITIES = frozenset(
 )
 _NATIVE_EVENT_LINE_LIMIT = 24 * 1024 * 1024
 _NATIVE_STREAM_QUEUE_LIMIT = 64
+_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT = 64
 _NATIVE_CANCEL_TIMEOUT_SECONDS = 2.0
 _NATIVE_WEBSOCKET_COMMAND_TIMEOUT_SECONDS = 30.0
 
@@ -226,12 +227,15 @@ class NativeEgressWebSocket:
         self._request_id = request_id
         self._generation = generation
         self._events = events
-        self._messages: asyncio.Queue[NativeWebSocketMessage | BaseException] = asyncio.Queue()
+        self._messages: asyncio.Queue[NativeWebSocketMessage | BaseException] = asyncio.Queue(
+            maxsize=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT
+        )
         self._pending: dict[str, asyncio.Future[None]] = {}
         self._command_sequence = 0
         self._completed = False
         self._closing = False
         self._remote_closed = False
+        self._terminal_failure: BaseException | None = None
         self._pump_task = asyncio.create_task(
             self._pump(),
             name=f"native-websocket-pump-{request_id}",
@@ -247,6 +251,11 @@ class NativeEgressWebSocket:
         )
 
     async def receive(self) -> NativeWebSocketMessage:
+        if self._completed and self._messages.empty():
+            raise self._terminal_failure or NativeEgressTransportError(
+                "native websocket is closed",
+                failure_phase="websocket_receive",
+            )
         item = await self._messages.get()
         if isinstance(item, BaseException):
             raise item
@@ -346,7 +355,6 @@ class NativeEgressWebSocket:
                 item = await self._events.get()
                 if isinstance(item, BaseException):
                     terminal_failure = item
-                    await self._messages.put(item)
                     return
                 event_type = item.get("type")
                 if event_type == "websocket_sent":
@@ -361,7 +369,7 @@ class NativeEgressWebSocket:
                     text = item.get("text")
                     if not isinstance(text, str):
                         raise NativeEgressProtocolError("native websocket text event is invalid")
-                    await self._messages.put(NativeWebSocketMessage(kind="text", text=text))
+                    self._queue_message(NativeWebSocketMessage(kind="text", text=text))
                     continue
                 if event_type == "websocket_binary":
                     encoded = item.get("data")
@@ -371,7 +379,7 @@ class NativeEgressWebSocket:
                         data = base64.b64decode(encoded, validate=True)
                     except ValueError as exc:
                         raise NativeEgressProtocolError("native websocket binary event is not base64") from exc
-                    await self._messages.put(NativeWebSocketMessage(kind="binary", data=data))
+                    self._queue_message(NativeWebSocketMessage(kind="binary", data=data))
                     continue
                 if event_type == "websocket_close":
                     code = item.get("code")
@@ -381,7 +389,7 @@ class NativeEgressWebSocket:
                     if reason is not None and not isinstance(reason, str):
                         raise NativeEgressProtocolError("native websocket close reason is invalid")
                     self._remote_closed = True
-                    await self._messages.put(
+                    self._queue_message(
                         NativeWebSocketMessage(
                             kind="close",
                             close_code=code,
@@ -395,17 +403,19 @@ class NativeEgressWebSocket:
                     return
                 if event_type == "websocket_error":
                     terminal_failure = _websocket_error_from_event(item)
-                    await self._messages.put(terminal_failure)
                     return
                 if event_type == "cancelled":
                     terminal_failure = NativeEgressTransportError(
                         "native websocket was cancelled",
                         failure_phase="cancelled",
                     )
-                    await self._messages.put(terminal_failure)
                     return
                 raise NativeEgressProtocolError(f"unexpected native websocket event: {event_type!r}")
         except asyncio.CancelledError:
+            terminal_failure = NativeEgressTransportError(
+                "native websocket was closed locally",
+                failure_phase="cancelled",
+            )
             raise
         except BaseException as exc:
             terminal_failure = exc
@@ -414,7 +424,6 @@ class NativeEgressWebSocket:
                 self._generation,
                 self._events,
             )
-            await self._messages.put(exc)
         finally:
             if terminal_failure is None and not self._closing:
                 terminal_failure = NativeEgressTransportError(
@@ -423,7 +432,25 @@ class NativeEgressWebSocket:
                 )
             if terminal_failure is not None:
                 self._fail_pending(terminal_failure)
+                self._queue_terminal(terminal_failure)
             self._finish()
+
+    def _queue_message(self, message: NativeWebSocketMessage) -> None:
+        try:
+            self._messages.put_nowait(message)
+        except asyncio.QueueFull as exc:
+            while not self._messages.empty():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self._messages.get_nowait()
+            raise NativeEgressTransportError(
+                "native websocket consumer exceeded the bounded message queue",
+                failure_phase="consumer_backpressure",
+            ) from exc
+
+    def _queue_terminal(self, failure: BaseException) -> None:
+        self._terminal_failure = failure
+        with contextlib.suppress(asyncio.QueueFull):
+            self._messages.put_nowait(failure)
 
     def _fail_pending(self, failure: BaseException) -> None:
         for future in tuple(self._pending.values()):
@@ -754,7 +781,28 @@ class SubprocessNativeEgressClient:
                 state = self._streams.get(request_id)
                 if state is None or state[0] != generation:
                     continue
-                await state[1].put(event)
+                events = state[1]
+                try:
+                    events.put_nowait(event)
+                    if event.get("type") in {"head", "websocket_open"}:
+                        # Hand the accepted response to its consumer before a
+                        # helper with already-buffered output can fill the body
+                        # queue in this reader task's scheduling turn.
+                        await asyncio.sleep(0)
+                except asyncio.QueueFull:
+                    overflow_failure = NativeEgressTransportError(
+                        "native stream consumer exceeded the bounded event queue",
+                        failure_phase="consumer_backpressure",
+                    )
+                    self._finish_request(request_id, generation, events)
+                    while not events.empty():
+                        with contextlib.suppress(asyncio.QueueEmpty):
+                            events.get_nowait()
+                    events.put_nowait(overflow_failure)
+                    asyncio.create_task(
+                        self._cancel_orphaned_request(process, generation, request_id),
+                        name=f"native-egress-overflow-cancel-{request_id}",
+                    )
         except NativeEgressProtocolError as exc:
             failure = exc
         except BaseException as exc:
@@ -793,6 +841,19 @@ class SubprocessNativeEgressClient:
             except (TimeoutError, NativeEgressError):
                 pass
         self._finish_request(request_id, generation, events)
+
+    async def _cancel_orphaned_request(
+        self,
+        process: asyncio.subprocess.Process,
+        generation: int,
+        request_id: str,
+    ) -> None:
+        with contextlib.suppress(NativeEgressError):
+            await self._send_command(
+                process,
+                generation,
+                {"type": "cancel", "request_id": request_id},
+            )
 
     async def _abort_request(
         self,

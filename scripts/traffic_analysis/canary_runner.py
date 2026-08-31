@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.traffic_analysis.artifacts import atomic_write_json, read_json
+from scripts.traffic_analysis.privacy_scan import scan_tree
 
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
@@ -157,6 +158,17 @@ def _validate_result(run_dir: Path, version: str) -> dict[str, Any]:
     }
     if any(value.get(key) != expected for key, expected in required.items()):
         raise CanaryConfigurationError("fast canary result did not satisfy the success contract")
+    sensitive_directories = [run_dir / "raw-h2" / "data", run_dir / "raw-h2" / "logs"]
+    failure_root = run_dir / "failure-matrix"
+    if failure_root.is_dir() and not failure_root.is_symlink():
+        for scenario in failure_root.iterdir():
+            if scenario.is_dir() and not scenario.is_symlink():
+                sensitive_directories.extend((scenario / "data", scenario / "logs"))
+    if any(path.exists() or path.is_symlink() for path in sensitive_directories):
+        raise CanaryConfigurationError("sensitive canary working files remain after cleanup")
+    privacy_result = scan_tree(run_dir)
+    if privacy_result.get("passed") is not True:
+        raise CanaryConfigurationError("retained canary evidence failed independent privacy validation")
     return dict(value)
 
 

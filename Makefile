@@ -249,6 +249,6 @@ helm-smoke-kind:
 .PHONY: ci-fast ci
 ci-fast: lint typecheck rust-check frontend-test test-unit package
 
-ci: frontend-lint frontend-typecheck frontend-test frontend-build lint typecheck rust-check \
+ci: frontend-lint frontend-typecheck frontend-test frontend-build lint typecheck rust-check rust-audit \
 	test-unit test-integration-core test-integration-bridge test-e2e test-postgres \
 	migration-check migration-check-postgres package docker helm-check helm-smoke-kind
