@@ -12,7 +12,6 @@ import pytest
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.db.sqlite_utils as sqlite_utils
 from app.db.migrate import _build_alembic_config
 from app.db.migration_url import to_sync_database_url
 from app.db.sqlite_utils import normalize_sqlite_url, sqlite_db_path_from_url
@@ -58,40 +57,49 @@ class TestSqlitePathFromUrlWindows:
     def test_memory_database_returns_none(self) -> None:
         assert sqlite_db_path_from_url("sqlite+aiosqlite:///:memory:") is None
 
-    @pytest.mark.parametrize("truthy", ["1", "true", "yes", "on", "y", "t"])
-    def test_uri_mode_memory_database_returns_none_for_every_truthy_flag(self, truthy: str) -> None:
-        url = f"sqlite+aiosqlite:///file:shared?mode=memory&cache=shared&uri={truthy}"
-
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "sqlite+aiosqlite:///file:shared?mode=memory&cache=shared&uri=true",
+            "sqlite:///file:shared?uri=true&cache=shared&mode=memory",
+            "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
+        ],
+    )
+    def test_uri_memory_database_returns_none(self, url: str) -> None:
+        """URI-mode memory databases must not receive file sidecars."""
         assert sqlite_db_path_from_url(url) is None
 
-    def test_uri_mode_file_path_resolves_to_its_filesystem_path(self, tmp_path: Path) -> None:
-        source = tmp_path / "store.db"
-        url = f"sqlite+aiosqlite:///file:{source}?uri=true"
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            (
+                "sqlite+aiosqlite:///file:shared?mode=rwc&uri=true",
+                Path("shared"),
+            ),
+            (
+                "sqlite+aiosqlite:///file:/tmp/store.db?mode=rwc&uri=true",
+                Path("/tmp/store.db"),
+            ),
+            (
+                "sqlite+aiosqlite:///file:/tmp/codex%20lb/store.db?mode=rwc&uri=true",
+                Path("/tmp/codex lb/store.db"),
+            ),
+        ],
+    )
+    def test_uri_file_database_resolves_actual_filesystem_path(self, url: str, expected: Path) -> None:
+        """URI-mode file databases need sidecars beside SQLite's real file."""
+        assert sqlite_db_path_from_url(url) == expected
 
-        assert sqlite_db_path_from_url(url) == source
+    def test_file_uri_without_uri_mode_keeps_literal_path(self) -> None:
+        assert sqlite_db_path_from_url("sqlite+aiosqlite:///file:shared?mode=memory&cache=shared") == Path(
+            "file:shared"
+        )
 
-    def test_uri_mode_localhost_file_path_resolves_to_its_filesystem_path(self, tmp_path: Path) -> None:
-        source = tmp_path / "store.db"
-        url = f"sqlite+aiosqlite:///file://localhost{source}?uri=true"
+    def test_file_uri_tilde_is_not_expanded(self) -> None:
+        assert sqlite_db_path_from_url("sqlite+aiosqlite:///file:~/store.db?uri=true") == Path("~/store.db")
 
-        assert sqlite_db_path_from_url(url) == source
-
-    def test_uri_mode_remote_file_authority_is_not_treated_as_a_local_path(self) -> None:
-        assert sqlite_db_path_from_url("sqlite+aiosqlite:///file://server/share/store.db?uri=true") is None
-
-    def test_uri_mode_windows_drive_file_path_preserves_leading_slash_on_posix(self) -> None:
-        url = "sqlite+aiosqlite:///file:///C:/data/store.db?uri=true"
-
-        if os.name == "nt":
-            pytest.skip("POSIX URI semantics only")
-
-        assert sqlite_db_path_from_url(url) == Path("/C:/data/store.db")
-
-    def test_uri_mode_windows_drive_file_path_drops_uri_leading_slash_on_windows(self, monkeypatch) -> None:
-        url = "sqlite+aiosqlite:///file:///C:/data/store.db?uri=true"
-
-        monkeypatch.setattr(sqlite_utils.os, "name", "nt")
-        assert sqlite_db_path_from_url(url) == Path("C:/data/store.db")
+    def test_file_uri_unsupported_authority_is_not_a_lifecycle_path(self) -> None:
+        assert sqlite_db_path_from_url("sqlite+aiosqlite:///file://remote/store.db?uri=true") is None
 
     def test_normalize_decodes_percent_encoded_file_path(self) -> None:
         assert normalize_sqlite_url(ENCODED_WINDOWS_URL) == f"sqlite:///{DECODED_WINDOWS_PATH}"
