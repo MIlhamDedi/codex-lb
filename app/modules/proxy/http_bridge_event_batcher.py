@@ -11,6 +11,8 @@ from app.modules.proxy.durable_bridge_repository import DurableBridgeOperationEv
 
 logger = logging.getLogger("app.modules.proxy.http_bridge_event_batcher")
 
+_TERMINAL_APPEND_TIMEOUT_SECONDS = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class _PendingOperationEvent:
@@ -81,6 +83,7 @@ class HttpBridgeOperationEventBatcher:
         max_pending_events: int = 2048,
         max_pending_bytes: int = 32 * 1024 * 1024,
         spool_format: str = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
+        terminal_append_timeout_seconds: float = _TERMINAL_APPEND_TIMEOUT_SECONDS,
     ) -> None:
         if spool_format not in {HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1, HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2}:
             raise ValueError("unsupported durable bridge operation spool format")
@@ -91,6 +94,7 @@ class HttpBridgeOperationEventBatcher:
         self._max_pending_events = max_pending_events
         self._max_pending_bytes = max_pending_bytes
         self._spool_format = spool_format
+        self._terminal_append_timeout_seconds = terminal_append_timeout_seconds
         self._pending: dict[str, list[_PendingOperationEvent]] = {}
         self._contexts: dict[str, _PendingOperationEvent] = {}
         self._dropped_operations: set[str] = set()
@@ -210,13 +214,15 @@ class HttpBridgeOperationEventBatcher:
                     )
                 if not persisted:
                     async with self._lock:
-                        self._dropped_operations.add(operation_id)
+                        if operation_id in self._contexts:
+                            self._dropped_operations.add(operation_id)
                         dropped = self._pending.pop(operation_id, [])
                         self._pending_count -= len(dropped)
                         self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in dropped)
             except Exception:
                 async with self._lock:
-                    self._dropped_operations.add(operation_id)
+                    if operation_id in self._contexts:
+                        self._dropped_operations.add(operation_id)
                     dropped = self._pending.pop(operation_id, [])
                     self._pending_count -= len(dropped)
                     self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in dropped)
@@ -284,47 +290,54 @@ class HttpBridgeOperationEventBatcher:
                 ),
             )
             self._closing_operations.add(operation_id)
-        await self.flush_pending_operation(operation_id=operation_id)
-        async with self._lock:
-            context = self._contexts.get(operation_id)
-            dropped = operation_id in self._dropped_operations
-        if context is None:
-            return TerminalOperationEventAppendResult(persisted=False)
-        if dropped:
-            async with self._lock:
-                self._closing_operations.discard(operation_id)
-                self._contexts.pop(operation_id, None)
-                self._dropped_operations.discard(operation_id)
-            return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
         try:
-            if self._spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
-                persisted = await self._durable_bridge.append_terminal_operation_chunk(
-                    operation_id=operation_id,
-                    session_id=context.session_id,
-                    instance_id=context.instance_id,
-                    owner_epoch=context.owner_epoch,
-                    event_text=event_text,
-                    max_bytes=max_bytes,
-                    state=state,
-                    expected_recovery_dispatch_count=expected_recovery_dispatch_count,
-                    response_id=response_id,
+            async with asyncio.timeout(self._terminal_append_timeout_seconds):
+                await self.flush_pending_operation(operation_id=operation_id)
+                async with self._lock:
+                    context = self._contexts.get(operation_id)
+                    dropped = operation_id in self._dropped_operations
+                if context is None:
+                    return TerminalOperationEventAppendResult(persisted=False)
+                if dropped:
+                    return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
+                if self._spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
+                    persisted = await self._durable_bridge.append_terminal_operation_chunk(
+                        operation_id=operation_id,
+                        session_id=context.session_id,
+                        instance_id=context.instance_id,
+                        owner_epoch=context.owner_epoch,
+                        event_text=event_text,
+                        max_bytes=max_bytes,
+                        state=state,
+                        expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                        response_id=response_id,
+                    )
+                else:
+                    persisted = await self._durable_bridge.append_terminal_operation_event(
+                        operation_id=operation_id,
+                        session_id=context.session_id,
+                        instance_id=context.instance_id,
+                        owner_epoch=context.owner_epoch,
+                        event_text=event_text,
+                        max_bytes=max_bytes,
+                        state=state,
+                        expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                        response_id=response_id,
+                    )
+                terminal_persisted = bool(persisted and not dropped)
+                return TerminalOperationEventAppendResult(
+                    persisted=terminal_persisted,
+                    settlement_required=not terminal_persisted,
                 )
-            else:
-                persisted = await self._durable_bridge.append_terminal_operation_event(
-                    operation_id=operation_id,
-                    session_id=context.session_id,
-                    instance_id=context.instance_id,
-                    owner_epoch=context.owner_epoch,
-                    event_text=event_text,
-                    max_bytes=max_bytes,
-                    state=state,
-                    expected_recovery_dispatch_count=expected_recovery_dispatch_count,
-                    response_id=response_id,
-                )
-            terminal_persisted = bool(persisted and not dropped)
+        except TimeoutError:
+            logger.info(
+                "Timed out persisting HTTP bridge terminal transcript operation_id=%s timeout_seconds=%.1f",
+                operation_id,
+                self._terminal_append_timeout_seconds,
+            )
             return TerminalOperationEventAppendResult(
-                persisted=terminal_persisted,
-                settlement_required=not terminal_persisted,
+                persisted=False,
+                settlement_required=True,
             )
         except Exception:
             logger.debug(
@@ -338,6 +351,9 @@ class HttpBridgeOperationEventBatcher:
             )
         finally:
             async with self._lock:
+                pending = self._pending.pop(operation_id, [])
+                self._pending_count -= len(pending)
+                self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in pending)
                 self._closing_operations.discard(operation_id)
                 self._contexts.pop(operation_id, None)
                 self._dropped_operations.discard(operation_id)
