@@ -2185,6 +2185,28 @@ def _should_fallback_to_http_after_websocket_status(transport_mode: str, status:
     return transport_mode == "auto" and status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES
 
 
+def _should_fallback_to_http_after_codex_transport_error(transport_mode: str, exc: CodexTransportError) -> bool:
+    """Whether a routed websocket handshake failure may retry over HTTP.
+
+    The routed opener sanitizes handshake failures into ``CodexTransportError``
+    but preserves the response headers and handshake diagnostic, so an
+    evidence-backed Cloudflare edge challenge keeps its classification here
+    instead of degrading into a terminal 403. Routed challenges stay
+    in-request evidence only: they must not arm the instance-wide
+    transport-failure marker because routed egress is route/account-scoped.
+    """
+
+    if _should_fallback_to_http_after_websocket_status(transport_mode, exc.status_code):
+        return True
+    if transport_mode != "auto":
+        return False
+    return _is_upstream_edge_challenge(
+        exc.status_code,
+        headers=exc.handshake_headers,
+        body=exc.handshake_message,
+    )
+
+
 def _is_upstream_edge_challenge(
     status: int | None,
     *,
@@ -3802,7 +3824,7 @@ async def _stream_responses_with_session(
                 ):
                     yield event_block
             except CodexTransportError as exc:
-                if not _should_fallback_to_http_after_websocket_status(transport_mode, exc.status_code):
+                if not _should_fallback_to_http_after_codex_transport_error(transport_mode, exc):
                     raise
                 async for event_block in _stream_via_http_after_websocket_rejection(
                     rejection_status=exc.status_code,

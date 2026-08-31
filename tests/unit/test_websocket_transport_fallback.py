@@ -869,6 +869,28 @@ async def test_routed_5xx_handshake_stays_in_account_failover(
 
 
 @pytest.mark.asyncio
+async def test_routed_edge_challenge_handshake_stays_out_of_instance_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A challenge on one account's routed egress IP proves nothing about the
+    # direct upstream other accounts reach: it keeps the account-scoped
+    # failover path here, and its preserved classification is consumed by the
+    # raw streaming path's in-request HTTP retry instead of the marker.
+    exc = await _routed_connect_failure(
+        monkeypatch,
+        CodexTransportError(
+            "Codex upstream websocket failed via proxy endpoint ep_1: HTTP 403",
+            status_code=403,
+            handshake_headers={"cf-mitigated": "challenge", "content-type": "text/html"},
+            handshake_message="Invalid response status",
+        ),
+    )
+
+    assert exc.failure_phase == "connect"
+    assert _classify(exc) is None
+
+
+@pytest.mark.asyncio
 async def test_routed_tls_verification_failure_stays_out_of_transport_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

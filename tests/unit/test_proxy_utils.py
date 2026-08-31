@@ -10640,6 +10640,62 @@ def test_upstream_edge_challenge_requires_explicit_edge_evidence():
     )
 
 
+def test_codex_transport_error_preserves_routed_edge_challenge_classification():
+    # The routed opener sanitizes handshake failures into CodexTransportError;
+    # the preserved response headers must keep an evidence-backed Cloudflare
+    # challenge classifiable so auto transport can retry over HTTP, while a
+    # plain routed 403 keeps its terminal fail-closed behavior.
+    from app.core.clients import codex as codex_module
+
+    request_info = cast(RequestInfo, SimpleNamespace(real_url="wss://chatgpt.com/backend-api/codex/responses"))
+    challenge = codex_module._transport_error(
+        "websocket",
+        "ep_1",
+        aiohttp.WSServerHandshakeError(
+            request_info,
+            (),
+            status=403,
+            message="Invalid response status",
+            headers=CIMultiDict({"cf-mitigated": "challenge", "content-type": "text/html"}),
+        ),
+        failure_phase="connect",
+        retryable_same_contract=False,
+    )
+    assert challenge.status_code == 403
+    assert proxy_module._should_fallback_to_http_after_codex_transport_error("auto", challenge)
+    assert not proxy_module._should_fallback_to_http_after_codex_transport_error("websocket", challenge)
+
+    plain_forbidden = codex_module._transport_error(
+        "websocket",
+        "ep_1",
+        aiohttp.WSServerHandshakeError(
+            request_info,
+            (),
+            status=403,
+            message="Invalid response status",
+            headers=CIMultiDict({"content-type": "text/html", "server": "nginx"}),
+        ),
+        failure_phase="connect",
+        retryable_same_contract=False,
+    )
+    assert not proxy_module._should_fallback_to_http_after_codex_transport_error("auto", plain_forbidden)
+
+    upgrade_required = codex_module._transport_error(
+        "websocket",
+        "ep_1",
+        aiohttp.WSServerHandshakeError(
+            request_info,
+            (),
+            status=426,
+            message="Invalid response status",
+            headers=CIMultiDict({}),
+        ),
+        failure_phase="connect",
+        retryable_same_contract=False,
+    )
+    assert proxy_module._should_fallback_to_http_after_codex_transport_error("auto", upgrade_required)
+
+
 @pytest.mark.asyncio
 async def test_stream_responses_auto_transport_falls_back_for_edge_challenge(monkeypatch):
     class Settings:
