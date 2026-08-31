@@ -8,8 +8,10 @@ expires, the proxy MUST keep the event spool incomplete, MUST queue the selected
 terminal event and end-of-stream marker without waiting for transcript
 persistence, and MUST attempt the existing owner-fenced terminal settlement.
 The bounded failure MUST NOT make a partial or uncertain transcript replayable.
-A terminal append that finishes within the bound MUST preserve the existing
-atomic terminal-state and replay behavior.
+A terminal append MUST remain incomplete until it finishes within the bound, at
+which point the proxy MUST schedule an attempt-fenced finalization; only a
+successful finalization makes it replayable. Cleanup that removes the in-memory
+operation context MUST still require fallback settlement.
 
 #### Scenario: Busy transcript writer does not hold live completion
 
@@ -23,5 +25,6 @@ atomic terminal-state and replay behavior.
 #### Scenario: Timely terminal append remains replayable
 
 - **WHEN** terminal transcript drain and append finish within the bound
-- **THEN** the terminal event and intended operation state are persisted atomically
-- **AND** the completed event spool remains eligible for replay
+- **THEN** the terminal event and intended operation state are persisted
+- **AND** the proxy schedules attempt-fenced finalization
+- **AND** successful finalization makes the completed event spool eligible for replay

@@ -2392,6 +2392,7 @@ class DurableBridgeRepository:
         state: str,
         expected_recovery_dispatch_count: int = 0,
         response_id: str | None = None,
+        complete_spool: bool = True,
     ) -> bool:
         """Append a terminal v2 chunk and expose its outcome atomically."""
         event_bytes = len(event_text.encode("utf-8"))
@@ -2464,7 +2465,7 @@ class DurableBridgeRepository:
             operation.state = state
             if response_id is not None:
                 operation.response_id = response_id
-            operation.event_spool_complete = True
+            operation.event_spool_complete = complete_spool
             operation.updated_at = utcnow()
             await self._session.commit()
         return True
@@ -2539,6 +2540,7 @@ class DurableBridgeRepository:
         state: str,
         expected_recovery_dispatch_count: int = 0,
         response_id: str | None = None,
+        complete_spool: bool = True,
     ) -> bool:
         """Append a terminal event and expose its operation state atomically."""
         async with sqlite_writer_section():
@@ -2600,7 +2602,7 @@ class DurableBridgeRepository:
             operation.state = state
             if response_id is not None:
                 operation.response_id = response_id
-            operation.event_spool_complete = True
+            operation.event_spool_complete = complete_spool
             operation.updated_at = utcnow()
             await self._session.commit()
         return persisted
@@ -2690,8 +2692,12 @@ class DurableBridgeRepository:
         session_id: str,
         instance_id: str,
         owner_epoch: int,
+        expected_recovery_dispatch_count: int | None = None,
+        expected_state: str | None = None,
     ) -> bool:
         """Mark a terminal operation replay-complete after its queue drained."""
+        if expected_state is not None and expected_state not in {"completed", "incomplete", "failed"}:
+            return False
         async with sqlite_writer_section():
             owner_exists = await self._session.scalar(
                 select(HttpBridgeSessionRecord.id)
@@ -2702,14 +2708,21 @@ class DurableBridgeRepository:
                 )
                 .with_for_update()
             )
+            predicates = [
+                HttpBridgeOperationRecord.operation_id == operation_id,
+                HttpBridgeOperationRecord.session_id == session_id,
+                HttpBridgeOperationRecord.event_spool_complete.is_(False),
+            ]
+            predicates.append(
+                HttpBridgeOperationRecord.state == expected_state
+                if expected_state is not None
+                else HttpBridgeOperationRecord.state.in_(("completed", "incomplete"))
+            )
+            if expected_recovery_dispatch_count is not None:
+                predicates.append(HttpBridgeOperationRecord.recovery_dispatch_count == expected_recovery_dispatch_count)
             result = await self._session.execute(
                 update(HttpBridgeOperationRecord)
-                .where(
-                    HttpBridgeOperationRecord.operation_id == operation_id,
-                    HttpBridgeOperationRecord.session_id == session_id,
-                    HttpBridgeOperationRecord.state.in_(("completed", "incomplete")),
-                    HttpBridgeOperationRecord.event_spool_complete.is_(False),
-                )
+                .where(*predicates)
                 .values(event_spool_complete=True, updated_at=utcnow())
             )
             if owner_exists is None:

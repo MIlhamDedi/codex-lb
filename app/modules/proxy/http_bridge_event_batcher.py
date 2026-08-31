@@ -108,6 +108,7 @@ class HttpBridgeOperationEventBatcher:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._terminal_append_tasks: set[asyncio.Task[TerminalOperationEventAppendResult]] = set()
+        self._terminal_finalize_tasks: set[asyncio.Task[None]] = set()
 
     async def enqueue(
         self,
@@ -320,7 +321,17 @@ class HttpBridgeOperationEventBatcher:
                     persisted=False,
                     settlement_required=True,
                 )
-            return append_task.result()
+            append_result = append_task.result()
+            if append_result.persisted:
+                self._schedule_terminal_spool_finalization(
+                    operation_id=operation_id,
+                    session_id=session_id,
+                    instance_id=instance_id,
+                    owner_epoch=owner_epoch,
+                    expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                    expected_state=state,
+                )
+            return append_result
 
         append_task.cancel()
         await self._clear_operation(operation_id)
@@ -350,7 +361,7 @@ class HttpBridgeOperationEventBatcher:
                 context = self._contexts.get(operation_id)
                 dropped = operation_id in self._dropped_operations
             if context is None:
-                return TerminalOperationEventAppendResult(persisted=False)
+                return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
             if dropped:
                 return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
             if self._spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
@@ -364,6 +375,7 @@ class HttpBridgeOperationEventBatcher:
                     state=state,
                     expected_recovery_dispatch_count=expected_recovery_dispatch_count,
                     response_id=response_id,
+                    complete_spool=False,
                 )
             else:
                 persisted = await self._durable_bridge.append_terminal_operation_event(
@@ -376,6 +388,7 @@ class HttpBridgeOperationEventBatcher:
                     state=state,
                     expected_recovery_dispatch_count=expected_recovery_dispatch_count,
                     response_id=response_id,
+                    complete_spool=False,
                 )
             terminal_persisted = bool(persisted and not dropped)
             return TerminalOperationEventAppendResult(
@@ -418,6 +431,64 @@ class HttpBridgeOperationEventBatcher:
                 task.get_name(),
                 exc_info=True,
             )
+
+    def _schedule_terminal_spool_finalization(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        expected_recovery_dispatch_count: int,
+        expected_state: str,
+    ) -> None:
+        finalize_task = asyncio.create_task(
+            self._finalize_terminal_spool(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                expected_state=expected_state,
+            ),
+            name=f"http-bridge-terminal-spool-finalize-{operation_id}",
+        )
+        self._terminal_finalize_tasks.add(finalize_task)
+        finalize_task.add_done_callback(self._terminal_finalize_done)
+
+    async def _finalize_terminal_spool(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        expected_recovery_dispatch_count: int,
+        expected_state: str,
+    ) -> None:
+        try:
+            finalized = await self._durable_bridge.finalize_operation_event_spool(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                expected_state=expected_state,
+            )
+            if not finalized:
+                logger.debug("Terminal HTTP bridge spool finalization was fenced operation_id=%s", operation_id)
+        except Exception:
+            logger.debug(
+                "Failed to finalize terminal HTTP bridge spool operation_id=%s",
+                operation_id,
+                exc_info=True,
+            )
+
+    def _terminal_finalize_done(self, task: asyncio.Task[None]) -> None:
+        self._terminal_finalize_tasks.discard(task)
+        if task.cancelled():
+            return
+        task.result()
 
     async def settle_terminal_event(
         self,
@@ -493,3 +564,8 @@ class HttpBridgeOperationEventBatcher:
             terminal_append_task.cancel()
         if terminal_append_tasks:
             await asyncio.wait(terminal_append_tasks, timeout=max(self._terminal_append_timeout_seconds, 0.0))
+        terminal_finalize_tasks = tuple(self._terminal_finalize_tasks)
+        for terminal_finalize_task in terminal_finalize_tasks:
+            terminal_finalize_task.cancel()
+        if terminal_finalize_tasks:
+            await asyncio.wait(terminal_finalize_tasks, timeout=max(self._terminal_append_timeout_seconds, 0.0))

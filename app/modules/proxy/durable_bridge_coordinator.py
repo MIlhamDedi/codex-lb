@@ -717,6 +717,7 @@ class DurableBridgeSessionCoordinator:
         state: str,
         expected_recovery_dispatch_count: int = 0,
         response_id: str | None = None,
+        complete_spool: bool = True,
     ) -> bool:
         async with self._session() as session:
             return await DurableBridgeRepository(session).append_terminal_operation_event(
@@ -729,6 +730,7 @@ class DurableBridgeSessionCoordinator:
                 state=state,
                 expected_recovery_dispatch_count=expected_recovery_dispatch_count,
                 response_id=response_id,
+                complete_spool=complete_spool,
             )
 
     async def append_operation_events(
@@ -767,6 +769,7 @@ class DurableBridgeSessionCoordinator:
         state: str,
         expected_recovery_dispatch_count: int = 0,
         response_id: str | None = None,
+        complete_spool: bool = True,
     ) -> bool:
         async with self._session() as session:
             return await DurableBridgeRepository(session).append_terminal_operation_chunk(
@@ -779,6 +782,7 @@ class DurableBridgeSessionCoordinator:
                 state=state,
                 expected_recovery_dispatch_count=expected_recovery_dispatch_count,
                 response_id=response_id,
+                complete_spool=complete_spool,
             )
 
     async def finalize_operation_event_spool(
@@ -788,6 +792,8 @@ class DurableBridgeSessionCoordinator:
         session_id: str,
         instance_id: str,
         owner_epoch: int,
+        expected_recovery_dispatch_count: int | None = None,
+        expected_state: str | None = None,
     ) -> bool:
         async with self._session() as session:
             return await DurableBridgeRepository(session).finalize_operation_event_spool(
@@ -795,6 +801,8 @@ class DurableBridgeSessionCoordinator:
                 session_id=session_id,
                 instance_id=instance_id,
                 owner_epoch=owner_epoch,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                expected_state=expected_state,
             )
 
     async def settle_terminal_append_failure(

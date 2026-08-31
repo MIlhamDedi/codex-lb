@@ -15,6 +15,7 @@ class _FakeDurableBridge:
         self.batches: list[list[str]] = []
         self.chunk_batches: list[list[str]] = []
         self.terminal_chunks: list[str] = []
+        self.terminal_append_kwargs: list[dict[str, object]] = []
         self.finalized: list[str] = []
         self.updated: list[dict[str, object]] = []
 
@@ -29,10 +30,12 @@ class _FakeDurableBridge:
         return self.append_result
 
     async def append_terminal_operation_event(self, **kwargs) -> bool:
+        self.terminal_append_kwargs.append(dict(kwargs))
         self.terminal_chunks.append(kwargs["event_text"])
         return self.append_result
 
     async def append_terminal_operation_chunk(self, **kwargs) -> bool:
+        self.terminal_append_kwargs.append(dict(kwargs))
         self.terminal_chunks.append(kwargs["event_text"])
         return self.append_result
 
@@ -112,6 +115,25 @@ class _CancellationResistantTerminalDurableBridge(_FakeDurableBridge):
     async def append_terminal_operation_chunk(self, **kwargs) -> bool:
         del kwargs
         return await self._stall_terminal_append()
+
+
+class _LateSuccessfulTerminalDurableBridge(_CancellationResistantTerminalDurableBridge):
+    async def _append_late(self, kwargs: dict[str, object]) -> bool:
+        self.terminal_append_kwargs.append(dict(kwargs))
+        self.append_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.append_cancelled.set()
+            await self.release_append.wait()
+            return True
+        raise AssertionError("stalled terminal append unexpectedly resumed")
+
+    async def append_terminal_operation_event(self, **kwargs) -> bool:
+        return await self._append_late(kwargs)
+
+    async def append_terminal_operation_chunk(self, **kwargs) -> bool:
+        return await self._append_late(kwargs)
 
 
 class _StalledDrainDurableBridge(_FakeDurableBridge):
@@ -260,6 +282,12 @@ async def test_chunk_mode_routes_batch_and_terminal_without_legacy_writes() -> N
         assert result.persisted is True
         assert durable.chunk_batches == [["one", "two"]]
         assert durable.terminal_chunks == ["terminal"]
+        assert durable.terminal_append_kwargs[0]["complete_spool"] is False
+        for _ in range(10):
+            if durable.finalized:
+                break
+            await asyncio.sleep(0)
+        assert durable.finalized == ["op-1"]
         assert durable.batches == []
     finally:
         await batcher.close()
@@ -447,6 +475,75 @@ async def test_cancellation_resistant_terminal_append_does_not_extend_delivery_b
     finally:
         durable.release_append.set()
         await batcher.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spool_format", ["rows_v1", "chunks_v2"])
+async def test_late_success_cannot_finalize_terminal_spool(spool_format: str) -> None:
+    durable = _LateSuccessfulTerminalDurableBridge()
+    batcher = HttpBridgeOperationEventBatcher(
+        durable,
+        max_bytes=1024,
+        flush_interval_seconds=60.0,
+        spool_format=spool_format,
+        terminal_append_timeout_seconds=0.01,
+    )
+    try:
+        result = await batcher.append_terminal_event(
+            operation_id="op-1",
+            session_id="session-1",
+            instance_id="instance-1",
+            owner_epoch=7,
+            event_text="terminal",
+            max_bytes=1024,
+            state="completed",
+            response_id="resp-1",
+        )
+
+        assert result.persisted is False
+        assert result.settlement_required is True
+        durable.release_append.set()
+        late_append_task = next(iter(batcher._terminal_append_tasks))
+        await asyncio.wait_for(late_append_task, timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert durable.terminal_append_kwargs[0]["complete_spool"] is False
+        assert durable.finalized == []
+    finally:
+        durable.release_append.set()
+        await batcher.close()
+
+
+@pytest.mark.asyncio
+async def test_context_discarded_during_terminal_drain_requires_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durable = _FakeDurableBridge()
+    batcher = HttpBridgeOperationEventBatcher(
+        durable,
+        max_bytes=1024,
+        flush_interval_seconds=60.0,
+    )
+
+    async def discard_during_drain(*, operation_id: str) -> bool:
+        await batcher.discard_operation(operation_id=operation_id)
+        return True
+
+    monkeypatch.setattr(batcher, "flush_pending_operation", discard_during_drain)
+    result = await batcher.append_terminal_event(
+        operation_id="op-1",
+        session_id="session-1",
+        instance_id="instance-1",
+        owner_epoch=7,
+        event_text="terminal",
+        max_bytes=1024,
+        state="failed",
+        response_id="resp-1",
+    )
+
+    assert result.persisted is False
+    assert result.settlement_required is True
+    assert durable.terminal_chunks == []
 
 
 @pytest.mark.asyncio

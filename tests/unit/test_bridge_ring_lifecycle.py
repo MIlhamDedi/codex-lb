@@ -2629,6 +2629,85 @@ async def test_late_terminal_append_cannot_restore_replay_after_failure_settleme
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spool_format", [HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1, HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2])
+async def test_terminal_append_stays_incomplete_until_attempt_is_finalized(
+    async_session_factory: Callable[[], AsyncSession],
+    spool_format: str,
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(
+            repository,
+            instance_id="inst-deferred-finalize",
+            session_key_value=f"sid-deferred-finalize-{spool_format}",
+        )
+        fingerprint = durable_bridge_hash(f"deferred-finalize-{spool_format}")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-deferred-finalize",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-deferred-finalize",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        assert await repository.update_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-deferred-finalize",
+            owner_epoch=claim.owner_epoch,
+            state="acknowledged",
+            response_id="resp-deferred-finalize",
+        )
+
+        append_terminal = (
+            repository.append_terminal_operation_chunk
+            if spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+            else repository.append_terminal_operation_event
+        )
+        assert await append_terminal(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-deferred-finalize",
+            owner_epoch=claim.owner_epoch,
+            event_text='data: {"type":"response.completed"}\n\n',
+            max_bytes=1024,
+            state="completed",
+            response_id="resp-deferred-finalize",
+            complete_spool=False,
+        )
+        incomplete = await repository.get_operation(operation_id=operation_id)
+        assert incomplete is not None
+        assert incomplete.state == "completed"
+        assert incomplete.event_spool_complete is False
+
+        assert not await repository.finalize_operation_event_spool(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-deferred-finalize",
+            owner_epoch=claim.owner_epoch,
+            expected_recovery_dispatch_count=1,
+            expected_state="completed",
+        )
+        assert await repository.finalize_operation_event_spool(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-deferred-finalize",
+            owner_epoch=claim.owner_epoch,
+            expected_recovery_dispatch_count=0,
+            expected_state="completed",
+        )
+        completed = await repository.get_operation(operation_id=operation_id)
+        assert completed is not None
+        assert completed.event_spool_complete is True
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_consumed_recovery_checkpoint_does_not_rebind_failed_operation(
     async_session_factory: Callable[[], AsyncSession],
 ) -> None:
