@@ -77,6 +77,33 @@ class _StalledTerminalDurableBridge(_FakeDurableBridge):
         except asyncio.CancelledError:
             self.append_cancelled.set()
             raise
+        raise AssertionError("stalled terminal append unexpectedly resumed")
+
+    async def append_terminal_operation_event(self, **kwargs) -> bool:
+        del kwargs
+        return await self._stall_terminal_append()
+
+    async def append_terminal_operation_chunk(self, **kwargs) -> bool:
+        del kwargs
+        return await self._stall_terminal_append()
+
+
+class _CancellationResistantTerminalDurableBridge(_FakeDurableBridge):
+    def __init__(self) -> None:
+        super().__init__()
+        self.append_started = asyncio.Event()
+        self.append_cancelled = asyncio.Event()
+        self.release_append = asyncio.Event()
+
+    async def _stall_terminal_append(self) -> bool:
+        self.append_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.append_cancelled.set()
+            await self.release_append.wait()
+            return False
+        raise AssertionError("stalled terminal append unexpectedly resumed")
 
     async def append_terminal_operation_event(self, **kwargs) -> bool:
         del kwargs
@@ -100,6 +127,7 @@ class _StalledDrainDurableBridge(_FakeDurableBridge):
         except asyncio.CancelledError:
             self.append_cancelled.set()
             raise
+        raise AssertionError("stalled pending append unexpectedly resumed")
 
     async def append_operation_events(self, **kwargs) -> bool:
         del kwargs
@@ -371,11 +399,54 @@ async def test_stalled_terminal_append_is_bounded_and_requires_settlement(spool_
     )
 
     assert durable.append_started.is_set()
-    assert durable.append_cancelled.is_set()
+    await asyncio.wait_for(durable.append_cancelled.wait(), timeout=1.0)
     assert result.persisted is False
     assert result.settlement_required is True
     assert batcher._contexts == {}
     assert batcher._closing_operations == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spool_format", ["rows_v1", "chunks_v2"])
+async def test_cancellation_resistant_terminal_append_does_not_extend_delivery_bound(spool_format: str) -> None:
+    durable = _CancellationResistantTerminalDurableBridge()
+    batcher = HttpBridgeOperationEventBatcher(
+        durable,
+        max_bytes=1024,
+        flush_interval_seconds=60.0,
+        spool_format=spool_format,
+        terminal_append_timeout_seconds=0.01,
+    )
+    try:
+        result = await asyncio.wait_for(
+            batcher.append_terminal_event(
+                operation_id="op-1",
+                session_id="session-1",
+                instance_id="instance-1",
+                owner_epoch=7,
+                event_text="terminal",
+                max_bytes=1024,
+                state="completed",
+                response_id="resp-1",
+            ),
+            timeout=0.1,
+        )
+
+        assert durable.append_started.is_set()
+        await asyncio.wait_for(durable.append_cancelled.wait(), timeout=1.0)
+        assert result.persisted is False
+        assert result.settlement_required is True
+        assert batcher._contexts == {}
+        assert batcher._closing_operations == set()
+        late_append_tasks = tuple(batcher._terminal_append_tasks)
+        assert len(late_append_tasks) == 1
+        durable.release_append.set()
+        await asyncio.wait_for(late_append_tasks[0], timeout=1.0)
+        await asyncio.sleep(0)
+        assert batcher._terminal_append_tasks == set()
+    finally:
+        durable.release_append.set()
+        await batcher.close()
 
 
 @pytest.mark.asyncio
@@ -408,7 +479,7 @@ async def test_stalled_pending_drain_is_bounded_and_requires_settlement(spool_fo
         )
 
         assert durable.append_started.is_set()
-        assert durable.append_cancelled.is_set()
+        await asyncio.wait_for(durable.append_cancelled.wait(), timeout=1.0)
         assert result.persisted is False
         assert result.settlement_required is True
         assert batcher._pending == {}

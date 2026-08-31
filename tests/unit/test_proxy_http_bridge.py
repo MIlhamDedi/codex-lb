@@ -5992,8 +5992,17 @@ async def test_stalled_terminal_spool_does_not_block_downstream_delivery() -> No
         except asyncio.CancelledError:
             append_cancelled.set()
             raise
+        raise AssertionError("stalled terminal append unexpectedly resumed")
 
-    settle_terminal_append_failure = AsyncMock(return_value=True)
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def settle_terminal_append_failure(**kwargs: Any) -> bool:
+        del kwargs
+        settlement_started.set()
+        await release_settlement.wait()
+        return True
+
     service._durable_bridge = cast(
         Any,
         SimpleNamespace(
@@ -6008,7 +6017,7 @@ async def test_stalled_terminal_spool_does_not_block_downstream_delivery() -> No
     )
     event_block = 'data: {"type":"response.completed"}\n\n'
 
-    terminal_enqueued = await asyncio.wait_for(
+    persist_task = asyncio.create_task(
         http_bridge_upstream_events_module._persist_http_bridge_operation_event(
             service,
             session,
@@ -6017,15 +6026,16 @@ async def test_stalled_terminal_spool_does_not_block_downstream_delivery() -> No
             terminal=True,
             terminal_state="completed",
             terminal_event_queue=event_queue,
-        ),
-        timeout=1.0,
+        )
     )
 
-    assert terminal_enqueued is True
+    await asyncio.wait_for(settlement_started.wait(), timeout=1.0)
     assert append_cancelled.is_set()
-    assert await event_queue.get() == event_block
-    assert await event_queue.get() is None
-    settle_terminal_append_failure.assert_awaited_once()
+    assert await asyncio.wait_for(event_queue.get(), timeout=1.0) == event_block
+    assert await asyncio.wait_for(event_queue.get(), timeout=1.0) is None
+    assert persist_task.done() is False
+    release_settlement.set()
+    assert await asyncio.wait_for(persist_task, timeout=1.0) is True
 
 
 @pytest.mark.asyncio

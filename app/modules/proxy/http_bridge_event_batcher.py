@@ -107,6 +107,7 @@ class HttpBridgeOperationEventBatcher:
         self._flush_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._terminal_append_tasks: set[asyncio.Task[TerminalOperationEventAppendResult]] = set()
 
     async def enqueue(
         self,
@@ -290,55 +291,93 @@ class HttpBridgeOperationEventBatcher:
                 ),
             )
             self._closing_operations.add(operation_id)
+        append_task = asyncio.create_task(
+            self._append_terminal_event_unbounded(
+                operation_id=operation_id,
+                event_text=event_text,
+                max_bytes=max_bytes,
+                state=state,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                response_id=response_id,
+            ),
+            name=f"http-bridge-terminal-spool-{operation_id}",
+        )
+        self._terminal_append_tasks.add(append_task)
+        append_task.add_done_callback(self._terminal_append_done)
         try:
-            async with asyncio.timeout(self._terminal_append_timeout_seconds):
-                await self.flush_pending_operation(operation_id=operation_id)
-                async with self._lock:
-                    context = self._contexts.get(operation_id)
-                    dropped = operation_id in self._dropped_operations
-                if context is None:
-                    return TerminalOperationEventAppendResult(persisted=False)
-                if dropped:
-                    return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
-                if self._spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
-                    persisted = await self._durable_bridge.append_terminal_operation_chunk(
-                        operation_id=operation_id,
-                        session_id=context.session_id,
-                        instance_id=context.instance_id,
-                        owner_epoch=context.owner_epoch,
-                        event_text=event_text,
-                        max_bytes=max_bytes,
-                        state=state,
-                        expected_recovery_dispatch_count=expected_recovery_dispatch_count,
-                        response_id=response_id,
-                    )
-                else:
-                    persisted = await self._durable_bridge.append_terminal_operation_event(
-                        operation_id=operation_id,
-                        session_id=context.session_id,
-                        instance_id=context.instance_id,
-                        owner_epoch=context.owner_epoch,
-                        event_text=event_text,
-                        max_bytes=max_bytes,
-                        state=state,
-                        expected_recovery_dispatch_count=expected_recovery_dispatch_count,
-                        response_id=response_id,
-                    )
-                terminal_persisted = bool(persisted and not dropped)
-                return TerminalOperationEventAppendResult(
-                    persisted=terminal_persisted,
-                    settlement_required=not terminal_persisted,
+            done, _ = await asyncio.wait(
+                {append_task},
+                timeout=max(self._terminal_append_timeout_seconds, 0.0),
+            )
+        except asyncio.CancelledError:
+            append_task.cancel()
+            await self._clear_operation(operation_id)
+            raise
+        if append_task in done:
+            return append_task.result()
+
+        append_task.cancel()
+        await self._clear_operation(operation_id)
+        logger.info(
+            "Timed out persisting HTTP bridge terminal transcript operation_id=%s timeout_seconds=%.1f",
+            operation_id,
+            self._terminal_append_timeout_seconds,
+        )
+        return TerminalOperationEventAppendResult(
+            persisted=False,
+            settlement_required=True,
+        )
+
+    async def _append_terminal_event_unbounded(
+        self,
+        *,
+        operation_id: str,
+        event_text: str,
+        max_bytes: int,
+        state: str,
+        expected_recovery_dispatch_count: int,
+        response_id: str | None,
+    ) -> TerminalOperationEventAppendResult:
+        try:
+            await self.flush_pending_operation(operation_id=operation_id)
+            async with self._lock:
+                context = self._contexts.get(operation_id)
+                dropped = operation_id in self._dropped_operations
+            if context is None:
+                return TerminalOperationEventAppendResult(persisted=False)
+            if dropped:
+                return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
+            if self._spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
+                persisted = await self._durable_bridge.append_terminal_operation_chunk(
+                    operation_id=operation_id,
+                    session_id=context.session_id,
+                    instance_id=context.instance_id,
+                    owner_epoch=context.owner_epoch,
+                    event_text=event_text,
+                    max_bytes=max_bytes,
+                    state=state,
+                    expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                    response_id=response_id,
                 )
-        except TimeoutError:
-            logger.info(
-                "Timed out persisting HTTP bridge terminal transcript operation_id=%s timeout_seconds=%.1f",
-                operation_id,
-                self._terminal_append_timeout_seconds,
-            )
+            else:
+                persisted = await self._durable_bridge.append_terminal_operation_event(
+                    operation_id=operation_id,
+                    session_id=context.session_id,
+                    instance_id=context.instance_id,
+                    owner_epoch=context.owner_epoch,
+                    event_text=event_text,
+                    max_bytes=max_bytes,
+                    state=state,
+                    expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                    response_id=response_id,
+                )
+            terminal_persisted = bool(persisted and not dropped)
             return TerminalOperationEventAppendResult(
-                persisted=False,
-                settlement_required=True,
+                persisted=terminal_persisted,
+                settlement_required=not terminal_persisted,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.debug(
                 "Failed to append terminal HTTP bridge event operation_id=%s",
@@ -350,13 +389,29 @@ class HttpBridgeOperationEventBatcher:
                 settlement_required=True,
             )
         finally:
-            async with self._lock:
-                pending = self._pending.pop(operation_id, [])
-                self._pending_count -= len(pending)
-                self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in pending)
-                self._closing_operations.discard(operation_id)
-                self._contexts.pop(operation_id, None)
-                self._dropped_operations.discard(operation_id)
+            await self._clear_operation(operation_id)
+
+    async def _clear_operation(self, operation_id: str) -> None:
+        async with self._lock:
+            pending = self._pending.pop(operation_id, [])
+            self._pending_count -= len(pending)
+            self._pending_bytes -= sum(len(item.event_text.encode("utf-8")) for item in pending)
+            self._closing_operations.discard(operation_id)
+            self._contexts.pop(operation_id, None)
+            self._dropped_operations.discard(operation_id)
+
+    def _terminal_append_done(self, task: asyncio.Task[TerminalOperationEventAppendResult]) -> None:
+        self._terminal_append_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.info(
+                "Late HTTP bridge terminal transcript task failed task_name=%s",
+                task.get_name(),
+                exc_info=True,
+            )
 
     async def settle_terminal_event(
         self,
@@ -427,3 +482,8 @@ class HttpBridgeOperationEventBatcher:
                 await task
             except asyncio.CancelledError:
                 pass
+        terminal_append_tasks = tuple(self._terminal_append_tasks)
+        for terminal_append_task in terminal_append_tasks:
+            terminal_append_task.cancel()
+        if terminal_append_tasks:
+            await asyncio.wait(terminal_append_tasks, timeout=max(self._terminal_append_timeout_seconds, 0.0))
