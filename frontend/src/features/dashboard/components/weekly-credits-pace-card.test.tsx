@@ -363,6 +363,25 @@ describe("WeeklyCreditsPaceCard runway layout", () => {
     expect(screen.getByText("300 req")).toBeInTheDocument();
   });
 
+  it("stretches the timeline horizon so reset events past 48h are not dropped", () => {
+    render(
+      <WeeklyCreditsPaceCard
+        pace={{
+          ...RUNWAY_PACE,
+          depletionEtaHours: 8,
+          nextReliefInHours: 12,
+          resetEvents: [
+            { at: new Date(Date.now() + 12 * 3_600_000).toISOString(), creditsReturned: 100_800 },
+            { at: new Date(Date.now() + 72 * 3_600_000).toISOString(), creditsReturned: 50_400 },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByTestId("runway-reset-tick")).toHaveLength(2);
+    expect(screen.getByText("3d")).toBeInTheDocument();
+  });
+
   it("does not crash on an ETA beyond the representable Date range", () => {
     render(<WeeklyCreditsPaceCard pace={{ ...RUNWAY_PACE, depletionEtaHours: 3e9 }} />);
 

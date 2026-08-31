@@ -858,6 +858,8 @@
   "formatters.cachedTokensMetaEmpty": "Cached: --",
   "formatters.duration.seconds": "{{count}}초",
   "formatters.duration.minutes": "{{count}}분",
+  "formatters.duration.hours": "{{count}}시간",
+  "formatters.duration.days": "{{count}}일",
   "formatters.duration.minutesSeconds": "{{minutes}}분 {{seconds}}초",
   "formatters.duration.hoursMinutes": "{{hours}}시간 {{minutes}}분",
   "formatters.duration.daysHours": "{{days}}일 {{hours}}시간",

@@ -70,6 +70,31 @@ export function DashboardSkeleton() {
                 <Skeleton className="h-3 w-10" />
               </div>
             </div>
+            {/* Attribution + recommendations are conditional in the loaded
+                card; the skeleton reserves their footprint so the sections
+                below do not shift once the overview arrives. */}
+            <div>
+              <Skeleton className="h-3 w-28" />
+              <div className="mt-1.5 space-y-1">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <div key={i} className="flex items-center justify-between gap-3">
+                    <Skeleton className="h-3 w-24" />
+                    <Skeleton className="h-3 w-36" />
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-lg border px-3 py-2">
+              <Skeleton className="h-3 w-28" />
+              <div className="mt-2 space-y-1.5">
+                {Array.from({ length: 2 }).map((_, i) => (
+                  <div key={i} className="flex items-center justify-between gap-3">
+                    <Skeleton className="h-3 w-16" />
+                    <Skeleton className="h-3 w-24" />
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       </div>

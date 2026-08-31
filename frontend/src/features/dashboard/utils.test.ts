@@ -835,9 +835,22 @@ describe("buildDashboardView", () => {
     expect(view.weeklyCreditPace).toBe(overviewPace);
   });
 
-  it("uses the projections weekly pace only when the overview omits the field (older backend)", () => {
+  it("uses the projections weekly pace when the overview omits the field (older backend)", () => {
     const overview = createDashboardOverview();
     expect(overview.weeklyCreditPace).toBeUndefined();
+    const projectionsPace = serverWeeklyPace({ runwayStatus: "safe", headroomPercent: 40, headroomCredits: 40_320 });
+
+    const view = buildDashboardView(overview, createDefaultRequestLogs(), false, {
+      weeklyCreditPace: projectionsPace,
+    });
+
+    expect(view.weeklyCreditPace).toBe(projectionsPace);
+  });
+
+  it("uses the projections weekly pace when the overview serves an explicit null (older backend)", () => {
+    // Old backends serve `weeklyCreditPace: null` rather than omitting the
+    // field, so a served null must not be read as an authoritative "no pace".
+    const overview = { ...createDashboardOverview(), weeklyCreditPace: null };
     const projectionsPace = serverWeeklyPace({ runwayStatus: "safe", headroomPercent: 40, headroomCredits: 40_320 });
 
     const view = buildDashboardView(overview, createDefaultRequestLogs(), false, {
@@ -895,7 +908,7 @@ describe("buildDashboardView", () => {
     expect(view.weeklyCreditPace).toBe(serverPace);
   });
 
-  it("keeps an explicit null backend weekly credit pace instead of falling back locally", () => {
+  it("falls back to the local projection when the overview serves null and projections have none", () => {
     const weeklyResetAt = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
     const overview = createDashboardOverview({
       weeklyCreditPace: null,
@@ -915,19 +928,14 @@ describe("buildDashboardView", () => {
       ],
     });
 
+    // Old backends serve null instead of omitting the field, so the client
+    // must still synthesize a pace locally rather than hiding the card.
     expect(buildWeeklyCreditPace(overview.accounts)).not.toBeNull();
 
     const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
 
-    expect(view.weeklyCreditPace).toBeNull();
-
-    // A retained projections copy must not resurrect a pace the fresh
-    // overview explicitly nulled out.
-    const viewWithStaleProjections = buildDashboardView(overview, createDefaultRequestLogs(), false, {
-      weeklyCreditPace: serverWeeklyPace(),
-    });
-
-    expect(viewWithStaleProjections.weeklyCreditPace).toBeNull();
+    expect(view.weeklyCreditPace).not.toBeNull();
+    expect(view.weeklyCreditPace?.accountCount).toBe(1);
   });
 
   it("keeps donut totals anchored to window capacity even when displayed slices are constrained", () => {

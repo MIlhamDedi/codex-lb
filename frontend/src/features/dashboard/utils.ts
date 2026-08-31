@@ -863,14 +863,14 @@ export function buildDashboardView(
     requestLogs,
     safeLinePrimary: buildDepletionView(projections?.depletionPrimary ?? overview.depletionPrimary),
     safeLineSecondary: buildDepletionView(projections?.depletionSecondary ?? overview.depletionSecondary),
-    // The overview payload is the freshest verdict and always wins. TanStack
-    // Query retains the last successful projections payload across later
-    // failures, so a stale projections copy must never override a fresh
-    // overview; it only backfills older backends whose overview omits the
-    // field entirely.
+    // A present overview pace is the freshest verdict and always wins.
+    // TanStack Query retains the last successful projections payload across
+    // later failures, so a stale projections copy must never override it.
+    // Older backends serve `weeklyCreditPace: null` (they cannot compute the
+    // runway model), which is indistinguishable from a fresh backend with no
+    // eligible accounts — so null falls back to the projections copy and then
+    // to the local projection instead of hiding the card entirely.
     weeklyCreditPace:
-      overview.weeklyCreditPace !== undefined
-        ? overview.weeklyCreditPace
-        : projections?.weeklyCreditPace ?? buildWeeklyCreditPace(overview.accounts),
+      overview.weeklyCreditPace ?? projections?.weeklyCreditPace ?? buildWeeklyCreditPace(overview.accounts),
   };
 }

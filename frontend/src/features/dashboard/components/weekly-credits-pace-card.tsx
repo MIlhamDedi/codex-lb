@@ -2,8 +2,9 @@ import { Gauge } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import type { WeeklyCreditPace, WeeklyCreditRunwayStatus } from "@/features/dashboard/utils";
+import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { cn } from "@/lib/utils";
-import { formatCompactNumber, formatModelLabel } from "@/utils/formatters";
+import { formatCompactNumber, formatDateTimeInline, formatModelLabel } from "@/utils/formatters";
 
 const PRO_WEEKLY_CAPACITY_CREDITS = 50_400;
 
@@ -50,7 +51,7 @@ function scheduleGapLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTransla
   const scheduleGapCredits = pace.smoothedScheduleGapCredits ?? pace.scheduleGapCredits;
   const deltaPercent = pace.smoothedDeltaPercent ?? pace.deltaPercent;
   const smoothingMinutes = pace.paceGapSmoothingMinutes ?? 0;
-  const window = smoothingMinutes > 0 ? formatDurationHours(smoothingMinutes / 60) : null;
+  const window = smoothingMinutes > 0 ? formatDurationHours(smoothingMinutes / 60, t) : null;
   if (scheduleGapCredits > 0) {
     return window
       ? t("dashboard.weeklyPace.lines.overPlannedWindow", { credits: formatCompactNumber(scheduleGapCredits), window })
@@ -81,19 +82,23 @@ function forecastLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslatio
   return t("dashboard.weeklyPace.lines.poolCoversPace");
 }
 
-function formatDurationHours(hours: number): string {
+function formatDurationHours(hours: number, t: ReturnType<typeof useTranslation>["t"]): string {
   const totalMinutes = Math.max(1, Math.ceil(hours * 60));
   const days = Math.floor(totalMinutes / 1440);
   const hoursPart = Math.floor((totalMinutes % 1440) / 60);
   const minutesPart = totalMinutes % 60;
 
   if (days > 0) {
-    return hoursPart > 0 ? `${days}d ${hoursPart}h` : `${days}d`;
+    return hoursPart > 0
+      ? t("formatters.duration.daysHours", { days, hours: hoursPart })
+      : t("formatters.duration.days", { count: days });
   }
   if (hoursPart > 0) {
-    return minutesPart > 0 ? `${hoursPart}h ${minutesPart}m` : `${hoursPart}h`;
+    return minutesPart > 0
+      ? t("formatters.duration.hoursMinutes", { hours: hoursPart, minutes: minutesPart })
+      : t("formatters.duration.hours", { count: hoursPart });
   }
-  return `${minutesPart}m`;
+  return t("formatters.duration.minutes", { count: minutesPart });
 }
 
 function breakEvenLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslation>["t"]): string | null {
@@ -104,7 +109,7 @@ function breakEvenLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslati
     return t("dashboard.weeklyPace.recommendations.untilReset");
   }
   return t("dashboard.weeklyPace.recommendations.pauseUntilReset", {
-    duration: formatDurationHours(pace.pauseForBreakEvenHours),
+    duration: formatDurationHours(pace.pauseForBreakEvenHours, t),
   });
 }
 
@@ -177,38 +182,37 @@ function buildRunwayTimeline(
   etaHours: number | null,
   reliefHours: number | null,
   resetEvents: WeeklyCreditPace["resetEvents"],
-  locale: string,
+  formatAbsolute: (epochMs: number) => string,
 ): RunwayTimeline {
   const nowMs = Date.now();
-  const absoluteTimeFormatter = new Intl.DateTimeFormat(locale, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
   // A tiny positive burn rate can push the ETA past the representable Date
-  // range; format() would throw, so the absolute label is skipped instead.
+  // range; formatting would throw, so the absolute label is skipped instead.
   const etaDate = etaHours != null ? new Date(nowMs + etaHours * 3_600_000) : null;
-  const etaAtLabel = etaDate != null && Number.isFinite(etaDate.getTime()) ? absoluteTimeFormatter.format(etaDate) : null;
-  const horizonHours = Math.max(etaHours ?? 0, reliefHours ?? 0, TIMELINE_MIN_HORIZON_HOURS);
-  const etaPercent = etaHours != null ? Math.min(100, Math.max(0, (etaHours / horizonHours) * 100)) : null;
-  const resetTicks = (resetEvents ?? []).flatMap((event): RunwayTick[] => {
+  const etaAtLabel = etaDate != null && Number.isFinite(etaDate.getTime()) ? formatAbsolute(etaDate.getTime()) : null;
+  const upcomingResets = (resetEvents ?? []).flatMap((event): { hoursFromNow: number; atMs: number; creditsReturned: number }[] => {
     const atMs = Date.parse(event.at);
     if (!Number.isFinite(atMs)) {
       return [];
     }
     const hoursFromNow = (atMs - nowMs) / 3_600_000;
-    if (hoursFromNow < 0 || hoursFromNow > horizonHours) {
-      return [];
-    }
-    return [
-      {
-        leftPercent: Math.min(100, (hoursFromNow / horizonHours) * 100),
-        creditsReturned: event.creditsReturned,
-        atLabel: absoluteTimeFormatter.format(new Date(atMs)),
-      },
-    ];
+    return hoursFromNow < 0 ? [] : [{ hoursFromNow, atMs, creditsReturned: event.creditsReturned }];
   });
+  // The horizon stretches to the latest reset event so later relief from the
+  // backend's seven-day event window is never silently dropped off the rail.
+  const horizonHours = Math.max(
+    etaHours ?? 0,
+    reliefHours ?? 0,
+    ...upcomingResets.map((event) => event.hoursFromNow),
+    TIMELINE_MIN_HORIZON_HOURS,
+  );
+  const etaPercent = etaHours != null ? Math.min(100, Math.max(0, (etaHours / horizonHours) * 100)) : null;
+  const resetTicks = upcomingResets.map(
+    (event): RunwayTick => ({
+      leftPercent: Math.min(100, (event.hoursFromNow / horizonHours) * 100),
+      creditsReturned: event.creditsReturned,
+      atLabel: formatAbsolute(event.atMs),
+    }),
+  );
   return { etaAtLabel, horizonHours, etaPercent, resetTicks };
 }
 
@@ -223,7 +227,8 @@ function RunwayWeeklyCreditsPaceCard({
   headroomPercent: number;
   headroomCredits: number;
 }) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
+  const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
 
   const burnRate = pace.burnRateRecentCreditsPerHour ?? null;
   const etaHours = pace.depletionEtaHours != null && Number.isFinite(pace.depletionEtaHours) ? pace.depletionEtaHours : null;
@@ -233,11 +238,14 @@ function RunwayWeeklyCreditsPaceCard({
     pace.saturatedAccountCount != null && pace.accountCount > 0 && pace.saturatedAccountCount === pace.accountCount;
   const runsDry = runwayStatus === "runs_dry";
 
+  // The depletion/reset tooltips are read-only timestamps, so they follow the
+  // dashboard's date-display and 12/24-hour preferences via the shared
+  // formatter rather than a locale-default Intl instance.
   const { etaAtLabel, horizonHours, etaPercent, resetTicks } = buildRunwayTimeline(
     etaHours,
     reliefHours,
     pace.resetEvents,
-    i18n.resolvedLanguage ?? i18n.language,
+    (epochMs) => formatDateTimeInline(new Date(epochMs).toISOString(), dateDisplayFormat),
   );
 
   const topApiKeys = pace.topApiKeys ?? [];
@@ -283,7 +291,7 @@ function RunwayWeeklyCreditsPaceCard({
                 title={etaAtLabel ?? undefined}
                 className={cn(runsDry && "font-medium text-red-600 dark:text-red-400")}
               >
-                {t("dashboard.weeklyPace.runsOutIn", { duration: formatDurationHours(etaHours) })}
+                {t("dashboard.weeklyPace.runsOutIn", { duration: formatDurationHours(etaHours, t) })}
               </span>
             ) : burnRate == null ? (
               // null burn rate means "too few recent samples to measure",
@@ -303,14 +311,14 @@ function RunwayWeeklyCreditsPaceCard({
           {runsDry && etaHours != null && reliefHours != null ? (
             <p className="font-medium tabular-nums text-red-600 dark:text-red-400">
               {t("dashboard.weeklyPace.runsDryBeforeRelief", {
-                eta: formatDurationHours(etaHours),
-                relief: formatDurationHours(reliefHours),
+                eta: formatDurationHours(etaHours, t),
+                relief: formatDurationHours(reliefHours, t),
               })}
             </p>
           ) : reliefHours != null ? (
             <p className="tabular-nums text-muted-foreground">
               {t("dashboard.weeklyPace.reliefLine", {
-                duration: formatDurationHours(reliefHours),
+                duration: formatDurationHours(reliefHours, t),
                 credits: formatCompactNumber(Math.max(0, reliefCredits ?? 0)),
               })}
             </p>
@@ -351,7 +359,7 @@ function RunwayWeeklyCreditsPaceCard({
           </div>
           <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
             <span>{t("dashboard.weeklyPace.timelineNow")}</span>
-            <span className="tabular-nums">{formatDurationHours(horizonHours)}</span>
+            <span className="tabular-nums">{formatDurationHours(horizonHours, t)}</span>
           </div>
         </div>
 
@@ -366,16 +374,19 @@ function RunwayWeeklyCreditsPaceCard({
                   // Prefer the stable wire id; older backends omit it, and key
                   // names are not unique, so name+index disambiguates then.
                   key={apiKey.apiKeyId ?? `${apiKey.name}-${index}`}
-                  className="grid grid-cols-[minmax(0,1fr)_5.5rem_5rem_6.5rem] items-baseline gap-3 text-xs text-muted-foreground"
+                  // The fixed metric columns need ~324px on their own, so
+                  // below sm the key name wraps onto its own line instead of
+                  // forcing the card past narrow (<375px) viewports.
+                  className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-xs text-muted-foreground sm:grid sm:grid-cols-[minmax(0,1fr)_5.5rem_5rem_6.5rem]"
                 >
-                  <span className="min-w-0 truncate">{apiKey.name}</span>
-                  <span className="text-right tabular-nums">
+                  <span className="w-full min-w-0 truncate sm:w-auto">{apiKey.name}</span>
+                  <span className="tabular-nums sm:text-right">
                     {t("dashboard.weeklyPace.attributionRequests", { value: formatCompactNumber(apiKey.requests) })}
                   </span>
-                  <span className="text-right tabular-nums">
+                  <span className="tabular-nums sm:text-right">
                     {t("dashboard.weeklyPace.attributionTokens", { value: formatCompactNumber(apiKey.billableTokens) })}
                   </span>
-                  <span className="truncate text-right text-foreground/70">
+                  <span className="min-w-0 flex-1 truncate text-right text-foreground/70 sm:flex-none">
                     {formatModelLabel(apiKey.dominantModel, null)}
                   </span>
                 </li>
