@@ -20,8 +20,37 @@ from app.core.clients.native_egress import (
     discover_native_egress_client,
 )
 
+_HELPER_PROTOCOL_PREAMBLE = r"""
+import json
+import sys
+
+hello = json.loads(sys.stdin.readline())
+assert hello == {
+    "type": "client_hello",
+    "min_protocol_version": 1,
+    "max_protocol_version": 1,
+}
+print(json.dumps({
+    "type": "server_hello",
+    "protocol_version": 1,
+    "capabilities": [
+        "failure_provenance_v1",
+        "http",
+        "http2_profile_v1",
+        "websocket",
+        "websocket_send_ack",
+    ],
+}), flush=True)
+"""
+
 
 def _write_helper(path: Path, source: str) -> None:
+    if source.startswith("#!/usr/bin/env python3\n"):
+        source = source.replace(
+            "#!/usr/bin/env python3\n",
+            f"#!/usr/bin/env python3\n{_HELPER_PROTOCOL_PREAMBLE}\n",
+            1,
+        )
     path.write_text(source, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -92,6 +121,33 @@ async def test_subprocess_native_egress_reuses_process_and_streams_response(tmp_
 
     await client.aclose()
     assert process.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_subprocess_native_egress_rejects_incompatible_helper(tmp_path: Path) -> None:
+    helper = tmp_path / "native-helper"
+    helper.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+json.loads(sys.stdin.readline())
+print(json.dumps({
+    "type": "server_hello",
+    "protocol_version": 2,
+    "capabilities": [],
+}), flush=True)
+sys.stdin.read()
+""",
+        encoding="utf-8",
+    )
+    helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+    client = SubprocessNativeEgressClient(helper)
+
+    with pytest.raises(NativeEgressProtocolError, match="unsupported protocol version"):
+        await client.request(NativeEgressRequest(method="GET", url="https://example.test", headers={}))
+
+    assert client._process is None
 
 
 @pytest.mark.asyncio

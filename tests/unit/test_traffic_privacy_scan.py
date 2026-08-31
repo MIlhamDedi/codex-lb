@@ -24,9 +24,7 @@ def test_privacy_scan_reports_kinds_without_echoing_secret(tmp_path: Path) -> No
     result = scan_tree(tmp_path)
 
     assert result["passed"] is False
-    assert result["findings"] == [
-        {"path": "capture.jsonl", "kinds": ["bearer_token", "secret_key"]}
-    ]
+    assert result["findings"] == [{"path": "capture.jsonl", "kinds": ["bearer_token", "secret_key"]}]
     assert secret not in str(result)
 
 

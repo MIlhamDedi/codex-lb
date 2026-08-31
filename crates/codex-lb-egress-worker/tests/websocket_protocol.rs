@@ -39,6 +39,26 @@ async fn missing_pong_emits_liveness_timeout() {
     let mut stdin = helper.stdin.take().expect("helper stdin");
     let stdout = helper.stdout.take().expect("helper stdout");
     let mut lines = BufReader::new(stdout).lines();
+    let hello = json!({
+        "type": "client_hello",
+        "min_protocol_version": 1,
+        "max_protocol_version": 1
+    });
+    stdin
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .expect("send protocol handshake");
+    let ready: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("handshake timeout")
+            .expect("read handshake event")
+            .expect("handshake event line"),
+    )
+    .expect("decode handshake event");
+    assert_eq!(ready["type"], "server_hello");
+    assert_eq!(ready["protocol_version"], 1);
+
     let connect = json!({
         "type": "websocket_connect",
         "request_id": "liveness-test",

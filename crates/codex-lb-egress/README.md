@@ -1,9 +1,13 @@
-# Codex native egress slice
+# Codex native egress library
 
-This optional persistent helper is the native side of
-`app.core.clients.native_egress`. It uses the Codex release family's pinned
-`reqwest`, `rustls`, and `aws-lc-rs` stack and streams a framed JSON protocol on
-stdin/stdout.
+This crate owns the reusable Codex-family HTTP, TLS, and WebSocket transport.
+The separately packaged `codex-lb-egress-worker` crate owns the stdio process,
+and `codex-lb-protocol` owns its versioned wire types. Keeping the binary shell
+separate lets a future Rust application call this library without inheriting a
+subprocess boundary.
+
+See the [Rust migration architecture](../../docs/rust-architecture.md) for
+workspace boundaries and migration rules.
 
 The official Linux containers build and install it as
 `codex-lb-native-egress`. Other installations do not require Rust or this
@@ -20,7 +24,9 @@ POST, handshake, or frame is never replayed through Python.
 
 One helper process lives per codex-lb worker. Newline-delimited HTTP and
 WebSocket commands carry opaque request ids, and every response event echoes
-that id. WebSocket send/close commands also carry a command id; the helper
+that id. Before accepting commands, each generation negotiates its protocol
+version and required capabilities with Python. WebSocket send/close commands
+also carry a command id; the helper
 acknowledges it only after the native sink accepts the frame. Concurrent HTTP
 tasks share a reqwest pool partitioned by effective proxy URL and connect
 timeout, while each WebSocket has a bounded command channel and an owning

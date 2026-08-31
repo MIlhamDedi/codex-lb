@@ -43,11 +43,11 @@ class FastCanaryConfig:
 
     @property
     def native_manifest(self) -> Path:
-        return self.repo / "native" / "codex-egress" / "Cargo.toml"
+        return self.repo / "Cargo.toml"
 
     @property
     def native_bin_dir(self) -> Path:
-        return self.repo / "native" / "codex-egress" / "target" / "release"
+        return self.repo / "target" / "release"
 
     @property
     def failure_baseline(self) -> Path:
@@ -181,7 +181,18 @@ def run_suite(
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         command_runner(
-            ("cargo", "build", "--locked", "--release", "--manifest-path", str(config.native_manifest)),
+            (
+                "cargo",
+                "build",
+                "--locked",
+                "--release",
+                "--package",
+                "codex-lb-egress-worker",
+                "--bin",
+                "codex-lb-native-egress",
+                "--manifest-path",
+                str(config.native_manifest),
+            ),
             config.repo,
             None,
         )

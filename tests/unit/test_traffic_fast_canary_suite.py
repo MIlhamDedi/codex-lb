@@ -16,8 +16,7 @@ from scripts.traffic_analysis import fast_canary_suite
 def _config(tmp_path: Path) -> fast_canary_suite.FastCanaryConfig:
     repo = tmp_path / "repo"
     repo.mkdir()
-    manifest = repo / "native" / "codex-egress" / "Cargo.toml"
-    manifest.parent.mkdir(parents=True)
+    manifest = repo / "Cargo.toml"
     manifest.write_text("[package]\nname='test'\n")
     baseline = repo / "scripts" / "traffic_analysis" / "baselines" / "failure-profile-v1.json"
     baseline.parent.mkdir(parents=True)
@@ -111,7 +110,7 @@ def test_suite_writes_marker_only_after_cleanup_and_privacy_scan(
     assert not (config.run_dir / "raw-h2" / "data").exists()
     assert not (config.run_dir / "failure-matrix" / "success" / "logs").exists()
     assert seen_failure_environment["CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS"] == "365"
-    assert seen_failure_environment["PATH"].startswith(str(config.repo / "native/codex-egress/target/release"))
+    assert seen_failure_environment["PATH"].startswith(str(config.repo / "target/release"))
 
 
 def test_suite_failure_cleans_sensitive_files_without_marker(

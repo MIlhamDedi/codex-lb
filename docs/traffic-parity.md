@@ -588,6 +588,9 @@ timeout, and WebSockets are independently multiplexed in that process. Workers
 do not share pools with each other. The native HTTP pool uses the maintained
 Codex initial HTTP/2 SETTINGS and connection-window profile, and native
 Responses/model-discovery header names retain the maintained direct order.
+Each helper generation negotiates a versioned capability contract before the
+first request. A present but incompatible binary fails before dispatch instead
+of silently falling back to Python.
 Source IP/ASN (which follows the selected proxy), HPACK history, TCP behavior,
 TLS extension order, and request/frame timing remain separately observable
 dimensions. Decoded header order and casing are captured and compared, but

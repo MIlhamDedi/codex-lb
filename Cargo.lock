@@ -98,11 +98,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-lb-native-egress"
+name = "codex-lb-egress"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
+ "codex-lb-protocol",
  "futures-util",
  "hyper",
  "hyper-rustls",
@@ -110,13 +111,31 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-native-certs",
- "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
  "tungstenite",
  "url",
+]
+
+[[package]]
+name = "codex-lb-egress-worker"
+version = "0.1.0"
+dependencies = [
+ "codex-lb-egress",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tungstenite",
+]
+
+[[package]]
+name = "codex-lb-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

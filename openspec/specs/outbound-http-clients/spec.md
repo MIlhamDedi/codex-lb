@@ -600,3 +600,26 @@ direct-client profile explicitly requires it.
 - **WHEN** codex-lb fetches models for an authenticated ChatGPT account
 - **THEN** the decoded header-name order matches the maintained direct profile
 - **AND** no standalone `version` header is present
+
+### Requirement: Native helper compatibility is negotiated before dispatch
+
+Each newly started native helper generation MUST complete a bounded,
+versioned client/server hello exchange before accepting an HTTP or WebSocket
+command. The Python adapter MUST require the negotiated protocol version and
+every capability used by its current call sites. A helper that is present but
+malformed, times out during negotiation, selects an unsupported version, or
+omits a required capability MUST fail as an incompatible protocol before
+dispatch and MUST NOT be treated as an unavailable helper eligible for Python
+fallback.
+
+#### Scenario: Compatible helper generation starts
+
+- **WHEN** the helper selects a mutually supported protocol version and reports every required capability
+- **THEN** the adapter starts the generation reader and may dispatch requests
+- **AND** later compatible requests reuse that negotiated generation
+
+#### Scenario: Installed helper is incompatible
+
+- **WHEN** the helper handshake times out, is malformed, selects an unsupported version, or lacks a required capability
+- **THEN** the adapter terminates that process before dispatch
+- **AND** the attempted operation fails without Python replay

@@ -18,6 +18,17 @@ from multidict import CIMultiDict
 logger = logging.getLogger(__name__)
 
 _NATIVE_EGRESS_EXECUTABLE = "codex-lb-native-egress"
+_NATIVE_PROTOCOL_VERSION = 1
+_NATIVE_PROTOCOL_HANDSHAKE_TIMEOUT_SECONDS = 2.0
+_REQUIRED_NATIVE_CAPABILITIES = frozenset(
+    {
+        "failure_provenance_v1",
+        "http",
+        "http2_profile_v1",
+        "websocket",
+        "websocket_send_ack",
+    }
+)
 _NATIVE_EVENT_LINE_LIMIT = 24 * 1024 * 1024
 _NATIVE_STREAM_QUEUE_LIMIT = 64
 _NATIVE_CANCEL_TIMEOUT_SECONDS = 2.0
@@ -657,6 +668,11 @@ class SubprocessNativeEgressClient:
             if process.stdin is None or process.stdout is None:
                 await _stop_process(process)
                 raise NativeEgressUnavailable("native helper pipes are unavailable")
+            try:
+                await self._negotiate_process(process)
+            except BaseException:
+                await _stop_process(process)
+                raise
             self._generation += 1
             generation = self._generation
             self._process = process
@@ -665,6 +681,42 @@ class SubprocessNativeEgressClient:
                 name=f"native-egress-reader-{generation}",
             )
             return process, generation
+
+    async def _negotiate_process(self, process: asyncio.subprocess.Process) -> None:
+        """Fail closed before dispatch when the installed worker is incompatible."""
+
+        stdin = process.stdin
+        stdout = process.stdout
+        if stdin is None or stdout is None:
+            raise NativeEgressProtocolError("native helper handshake pipes are unavailable")
+        hello = {
+            "type": "client_hello",
+            "min_protocol_version": _NATIVE_PROTOCOL_VERSION,
+            "max_protocol_version": _NATIVE_PROTOCOL_VERSION,
+        }
+        try:
+            stdin.write(json.dumps(hello, separators=(",", ":")).encode("utf-8") + b"\n")
+            await stdin.drain()
+            event = await asyncio.wait_for(
+                _read_event(stdout),
+                timeout=_NATIVE_PROTOCOL_HANDSHAKE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise NativeEgressProtocolError("native helper protocol handshake timed out") from exc
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise NativeEgressProtocolError("native helper closed during protocol handshake") from exc
+
+        if event.get("type") != "server_hello":
+            raise NativeEgressProtocolError("native helper did not acknowledge the protocol handshake")
+        version = event.get("protocol_version")
+        if version != _NATIVE_PROTOCOL_VERSION:
+            raise NativeEgressProtocolError(f"native helper selected unsupported protocol version: {version!r}")
+        capabilities = event.get("capabilities")
+        if not isinstance(capabilities, list) or not all(isinstance(value, str) for value in capabilities):
+            raise NativeEgressProtocolError("native helper capabilities have an invalid shape")
+        missing = sorted(_REQUIRED_NATIVE_CAPABILITIES.difference(capabilities))
+        if missing:
+            raise NativeEgressProtocolError(f"native helper is missing required capabilities: {', '.join(missing)}")
 
     async def _send_command(
         self,

@@ -44,11 +44,7 @@ def _normalize_tls_id(value: Any) -> Any:
 def _normalized_ids(values: Any, *, remove_psk: bool = False) -> list[Any] | None:
     if not isinstance(values, list):
         return None
-    return [
-        _normalize_tls_id(value)
-        for value in values
-        if not (remove_psk and value == _PSK_EXTENSION)
-    ]
+    return [_normalize_tls_id(value) for value in values if not (remove_psk and value == _PSK_EXTENSION)]
 
 
 def stable_tls_profile(tls: Any) -> Any:
