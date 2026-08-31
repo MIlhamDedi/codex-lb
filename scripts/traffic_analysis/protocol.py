@@ -52,7 +52,7 @@ class ProtocolEvent:
 
     @property
     def is_terminal(self) -> bool:
-        return self.type in TERMINAL_EVENT_TYPES
+        return self.done or self.type in TERMINAL_EVENT_TYPES
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"type": self.type, "data": self.data}

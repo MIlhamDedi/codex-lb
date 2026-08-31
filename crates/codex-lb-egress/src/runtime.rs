@@ -268,11 +268,9 @@ pub async fn run_stdio() -> Result<(), RequestError> {
                             Some(ActiveRequest::Http(cancellation)) => {
                                 let _ = cancellation.send(());
                             }
-                            Some(ActiveRequest::WebSocket { commands, abort }) => {
-                                if commands.try_send(WebSocketCommand::Cancel).is_err() {
-                                    abort.abort();
-                                    emit(&output, &NativeEvent::Cancelled { request_id }).await?;
-                                }
+                            Some(ActiveRequest::WebSocket { abort, .. }) => {
+                                abort.abort();
+                                emit(&output, &NativeEvent::Cancelled { request_id }).await?;
                             }
                             None => {
                                 emit(&output, &NativeEvent::Cancelled { request_id }).await?;
@@ -297,10 +295,8 @@ pub async fn run_stdio() -> Result<(), RequestError> {
             ActiveRequest::Http(cancellation) => {
                 let _ = cancellation.send(());
             }
-            ActiveRequest::WebSocket { commands, abort } => {
-                if commands.try_send(WebSocketCommand::Cancel).is_err() {
-                    abort.abort();
-                }
+            ActiveRequest::WebSocket { abort, .. } => {
+                abort.abort();
             }
         }
     }

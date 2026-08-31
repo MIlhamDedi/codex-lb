@@ -127,12 +127,13 @@ async def test_account_binding_uses_bound_pool_and_same_pool_fallbacks(
     assert route.fallbacks[0].proxy_url == "socks5h://proxy-two.test:1080"
 
 
-def test_resolver_rejects_credentials_on_plaintext_http_proxy() -> None:
+@pytest.mark.parametrize("scheme", ["http", "socks5", "socks5h"])
+def test_resolver_rejects_credentials_on_plaintext_proxy(scheme: str) -> None:
     encryptor = _encryptor()
     endpoint = ProxyEndpoint(
         id="unsafe",
         name="unsafe",
-        scheme="http",
+        scheme=scheme,
         host="proxy.test",
         port=8080,
         username="user",

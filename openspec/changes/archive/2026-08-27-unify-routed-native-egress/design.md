@@ -29,10 +29,10 @@ control plane and a native single-attempt data plane.
 - `CodexClient` discovers or receives the shared native client and prepares an
   immutable wire request before iterating route endpoints.
 - Each endpoint is supplied to the helper as one concrete credential-bearing
-  proxy URL. Credential-bearing `http://` endpoints are rejected during route
-  resolution, before either connector can observe them; credentials require an
-  encrypted `https://` proxy endpoint. The helper never chooses a fallback
-  endpoint.
+  proxy URL. Credential-bearing `http://`, `socks5://`, and `socks5h://`
+  endpoints are rejected during route resolution, before either connector can
+  observe them; credentials require an encrypted `https://` proxy endpoint. The
+  helper never chooses a fallback endpoint.
 - Native helper unavailability before command dispatch uses the existing
   aiohttp path for that endpoint. Every other native failure is mapped to
   `CodexTransportError` and processed by the existing route safety rules.

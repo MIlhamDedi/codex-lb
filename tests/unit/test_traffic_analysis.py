@@ -16,7 +16,7 @@ from scripts.traffic_analysis import generate_report as report_module
 from scripts.traffic_analysis import tls_randomization
 from scripts.traffic_analysis.compare import compare_paths, compare_turns
 from scripts.traffic_analysis.generate_report import build_report
-from scripts.traffic_analysis.protocol import HTTP_JSON, HTTP_SSE, parse_sse, parse_websocket_data
+from scripts.traffic_analysis.protocol import HTTP_JSON, HTTP_SSE, ProtocolEvent, parse_sse, parse_websocket_data
 from scripts.traffic_analysis.turns import extract_turns, extract_turns_with_diagnostics
 
 
@@ -159,6 +159,12 @@ def test_parse_sse_accepts_crlf_multiline_data_and_done() -> None:
     assert events[0].data["delta"] == "ok"
     assert events[0].event_id == "event-1"
     assert events[1].done is True
+
+
+def test_explicit_done_flag_is_terminal_independent_of_event_name() -> None:
+    event = ProtocolEvent(type="message", data="[DONE]", done=True)
+
+    assert event.is_terminal is True
 
 
 def test_metadata_digest_restores_known_websocket_event_type() -> None:

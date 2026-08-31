@@ -809,7 +809,7 @@ async def test_socks_websocket_uses_proxy_connector_and_closes_session(
     route = ResolvedUpstreamRoute(
         mode="account_bound",
         pool_id="pool_1",
-        endpoint=ResolvedProxyEndpoint("ep_1", scheme, "proxy.test", 1080, "u;session", "p@x:y"),
+        endpoint=ResolvedProxyEndpoint("ep_1", scheme, "proxy.test", 1080),
     )
     _SocksConnector.calls = []
     _SocksWsSession.latest = None
@@ -826,8 +826,8 @@ async def test_socks_websocket_uses_proxy_connector_and_closes_session(
         "host": "proxy.test",
         "port": 1080,
         "proxy_type": ProxyType.SOCKS5,
-        "username": "u;session",
-        "password": "p@x:y",
+        "username": None,
+        "password": None,
         "rdns": True,
         "ssl": "present",
     }
@@ -848,7 +848,7 @@ async def test_socks_websocket_cancel_during_enter_closes_local_session(
     route = ResolvedUpstreamRoute(
         mode="account_bound",
         pool_id="pool_1",
-        endpoint=ResolvedProxyEndpoint("ep_1", "socks5h", "proxy.test", 1080, "u", "p"),
+        endpoint=ResolvedProxyEndpoint("ep_1", "socks5h", "proxy.test", 1080),
     )
     entered = asyncio.Event()
 

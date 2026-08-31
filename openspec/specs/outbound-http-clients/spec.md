@@ -452,12 +452,12 @@ When the fixed packaged `codex-lb-native-egress` executable is available, direct
 
 Credential-bearing routed proxy endpoints MUST use encrypted `https://`
 transport. Route resolution MUST reject a username or password on a plaintext
-`http://` endpoint before either the native helper or Python connector can use
-the URL.
+`http://`, `socks5://`, or `socks5h://` endpoint before either the native helper
+or Python connector can use the URL.
 
 #### Scenario: Plaintext proxy credentials fail before connector selection
 
-- **GIVEN** a routed endpoint contains credentials and uses `http://`
+- **GIVEN** a routed endpoint contains credentials and uses `http://`, `socks5://`, or `socks5h://`
 - **WHEN** codex-lb resolves the route for an HTTP or WebSocket operation
 - **THEN** route resolution fails closed
 - **AND** neither native nor Python egress receives the credential-bearing URL

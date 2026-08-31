@@ -309,6 +309,21 @@ class _StreamingRetryMixin:
         upstream_transport_policy_label = "explicit" if upstream_stream_transport_override is not None else "configured"
         upstream_transport_sticky = _http_downstream_request_is_sticky(payload, headers)
         preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(headers)
+
+        def _must_abort_native_transport_failure(
+            exc: ProxyResponseError,
+            *,
+            downstream_visible: bool,
+        ) -> bool:
+            if not preserve_native_failure_lifecycle or downstream_visible:
+                return False
+            error = _parse_openai_error(exc.payload)
+            error_code = _normalize_error_code(
+                error.code if error else None,
+                error.type if error else None,
+            )
+            return error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES
+
         upstream_stream_transport = upstream_stream_transport_override
         if upstream_stream_transport is None:
             configured_transport, explicit_transport = _resolved_configured_stream_transport(settings, base_settings)
@@ -929,6 +944,11 @@ class _StreamingRetryMixin:
                     )
                     return
                 except ProxyResponseError as exc:
+                    if _must_abort_native_transport_failure(
+                        exc,
+                        downstream_visible=settlement.downstream_visible,
+                    ):
+                        raise
                     error = _parse_openai_error(exc.payload)
                     error_code = _normalize_error_code(
                         error.code if error else None,
@@ -2108,6 +2128,11 @@ class _StreamingRetryMixin:
                                 await _finalize_terminal_settlement_after_downstream_close(settlement, account)
                             raise
                         except (_TransientStreamError, ProxyResponseError) as tex:
+                            if isinstance(tex, ProxyResponseError) and _must_abort_native_transport_failure(
+                                tex,
+                                downstream_visible=settlement.downstream_visible,
+                            ):
+                                raise
                             if account.id == account_model_replacement_account_id:
                                 # Account/model routing gets exactly one selected
                                 # replacement.  Its own pre-visible 5xx/transport
@@ -2546,6 +2571,16 @@ class _StreamingRetryMixin:
                         await proxy._handle_stream_error(account, exc.error, exc.code)
                     return
                 except ProxyResponseError as exc:
+                    if _must_abort_native_transport_failure(
+                        exc,
+                        downstream_visible=settlement.downstream_visible,
+                    ):
+                        # A native Codex transport failure is ambiguous once the
+                        # helper may have dispatched the request. Re-raising the
+                        # original exception aborts the downstream stream without
+                        # replaying side effects on this or another account.
+                        await _drain_pending_post_refresh_penalty_on_terminal(settlement)
+                        raise
                     if _facade()._is_proxy_budget_exhausted_error(exc):
                         await _settle_process_network_budget_exhaustion(account, settlement)
                         if preserve_native_failure_lifecycle:
@@ -2824,6 +2859,11 @@ class _StreamingRetryMixin:
                                 if close_cancellation is not None:
                                     raise close_cancellation
                         except ProxyResponseError as retry_exc:
+                            if _must_abort_native_transport_failure(
+                                retry_exc,
+                                downstream_visible=settlement.downstream_visible,
+                            ):
+                                raise
                             if _facade()._is_proxy_budget_exhausted_error(retry_exc):
                                 await _settle_process_network_budget_exhaustion(account, settlement)
                                 if preserve_native_failure_lifecycle:

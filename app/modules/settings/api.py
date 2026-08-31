@@ -269,9 +269,11 @@ async def create_upstream_proxy_endpoint(
     _write_access=Depends(require_dashboard_write_access),
     context: SettingsContext = Depends(get_settings_context),
 ) -> UpstreamProxyEndpointResponse:
-    if payload.scheme == "http" and (payload.username is not None or payload.password is not None):
+    if payload.scheme in {"http", "socks5", "socks5h"} and (
+        payload.username is not None or payload.password is not None
+    ):
         raise DashboardBadRequestError(
-            "Plaintext HTTP proxies cannot carry credentials",
+            "Plaintext proxies cannot carry credentials",
             code="plaintext_proxy_credentials_forbidden",
         )
     encryptor = TokenEncryptor()

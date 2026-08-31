@@ -757,12 +757,13 @@ async def test_upstream_proxy_endpoint_test_rejects_proxy_auth_response(async_cl
 
 
 @pytest.mark.asyncio
-async def test_upstream_proxy_endpoint_create_rejects_plaintext_credentials(async_client):
+@pytest.mark.parametrize("scheme", ["http", "socks5", "socks5h"])
+async def test_upstream_proxy_endpoint_create_rejects_plaintext_credentials(async_client, scheme: str):
     response = await async_client.post(
         "/api/settings/upstream-proxy/endpoints",
         json={
             "name": "Unsafe proxy",
-            "scheme": "http",
+            "scheme": scheme,
             "host": "proxy.internal",
             "port": 8080,
             "username": "user",

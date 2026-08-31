@@ -46,7 +46,6 @@ pub(crate) enum WebSocketCommand {
         code: u16,
         reason: String,
     },
-    Cancel,
 }
 
 #[derive(Debug)]
@@ -194,10 +193,6 @@ pub(crate) async fn execute_websocket(
                                 return Ok(());
                             }
                         }
-                    }
-                    WebSocketCommand::Cancel => {
-                        emit(output, &NativeEvent::Cancelled { request_id }).await?;
-                        return Ok(());
                     }
                 }
             }

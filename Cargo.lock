@@ -124,6 +124,7 @@ name = "codex-lb-egress-worker"
 version = "0.1.0"
 dependencies = [
  "codex-lb-egress",
+ "futures-util",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
