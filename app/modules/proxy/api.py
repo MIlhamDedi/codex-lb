@@ -6246,6 +6246,7 @@ async def _stream_responses(
                 forwarded_file_owner_account_id=forwarded_file_owner_account_id,
                 client_ip=client_ip,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                http_bridge_active=bridge_active,
                 capacity_startup_wait_event=capacity_wait_event,
                 capacity_startup_ready_event=capacity_ready_event,
             )
@@ -6273,7 +6274,7 @@ async def _stream_responses(
 
         async def _retry() -> AsyncIterator[str]:
             retry_reservation = reservation
-            if prefer_http_bridge and api_key is not None and reservation is not None:
+            if bridge_active and api_key is not None and reservation is not None:
                 retry_service_tier = dict(payload.to_payload()).get("service_tier")
                 retry_reservation = await _enforce_request_limits(
                     api_key,
@@ -6299,6 +6300,7 @@ async def _stream_responses(
                 forwarded_file_owner_account_id=forwarded_file_owner_account_id,
                 client_ip=client_ip,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                http_bridge_active=bridge_active,
                 capacity_startup_wait_event=capacity_wait_event,
                 capacity_startup_ready_event=capacity_ready_event,
             )
@@ -6593,6 +6595,7 @@ async def _collect_responses(
             suppress_text_done_events=suppress_text_done_events,
             downstream_turn_state=downstream_turn_state,
             client_ip=client_ip,
+            http_bridge_active=bridge_active,
         )
     else:
         stream = context.service.stream_responses(
