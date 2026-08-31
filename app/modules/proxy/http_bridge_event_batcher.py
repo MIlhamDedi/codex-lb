@@ -314,6 +314,12 @@ class HttpBridgeOperationEventBatcher:
             await self._clear_operation(operation_id)
             raise
         if append_task in done:
+            if append_task.cancelled():
+                await self._clear_operation(operation_id)
+                return TerminalOperationEventAppendResult(
+                    persisted=False,
+                    settlement_required=True,
+                )
             return append_task.result()
 
         append_task.cancel()

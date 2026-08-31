@@ -450,6 +450,38 @@ async def test_cancellation_resistant_terminal_append_does_not_extend_delivery_b
 
 
 @pytest.mark.asyncio
+async def test_close_turns_cancelled_terminal_append_into_settlement_required() -> None:
+    durable = _StalledTerminalDurableBridge()
+    batcher = HttpBridgeOperationEventBatcher(
+        durable,
+        max_bytes=1024,
+        flush_interval_seconds=60.0,
+        terminal_append_timeout_seconds=60.0,
+    )
+    append_task = asyncio.create_task(
+        batcher.append_terminal_event(
+            operation_id="op-1",
+            session_id="session-1",
+            instance_id="instance-1",
+            owner_epoch=7,
+            event_text="terminal",
+            max_bytes=1024,
+            state="completed",
+            response_id="resp-1",
+        )
+    )
+
+    await asyncio.wait_for(durable.append_started.wait(), timeout=1.0)
+    await asyncio.wait_for(batcher.close(), timeout=1.0)
+    result = await asyncio.wait_for(append_task, timeout=1.0)
+
+    assert result.persisted is False
+    assert result.settlement_required is True
+    assert batcher._contexts == {}
+    assert batcher._closing_operations == set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("spool_format", ["rows_v1", "chunks_v2"])
 async def test_stalled_pending_drain_is_bounded_and_requires_settlement(spool_format: str) -> None:
     durable = _StalledDrainDurableBridge()

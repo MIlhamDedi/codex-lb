@@ -2560,6 +2560,75 @@ async def test_terminal_append_failure_settlement_is_visible_to_recovery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spool_format", [HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1, HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2])
+async def test_late_terminal_append_cannot_restore_replay_after_failure_settlement(
+    async_session_factory: Callable[[], AsyncSession],
+    spool_format: str,
+) -> None:
+    session = async_session_factory()
+    try:
+        repository = DurableBridgeRepository(session)
+        claim = await _claim(
+            repository,
+            instance_id="inst-late-terminal",
+            session_key_value=f"sid-late-terminal-{spool_format}",
+        )
+        fingerprint = durable_bridge_hash(f"late-terminal-{spool_format}")
+        operation_id = durable_bridge_operation_id(claim.id, fingerprint)
+        assert await repository.record_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-late-terminal",
+            owner_epoch=claim.owner_epoch,
+            request_fingerprint=fingerprint,
+            account_id="account-late-terminal",
+            model="gpt-5.6",
+            parent_response_id=None,
+        )
+        assert await repository.update_operation(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-late-terminal",
+            owner_epoch=claim.owner_epoch,
+            state="acknowledged",
+            response_id="resp-late-terminal",
+        )
+        assert await repository.settle_terminal_append_failure(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-late-terminal",
+            owner_epoch=claim.owner_epoch,
+            state="completed",
+            expected_response_id="resp-late-terminal",
+            response_id="resp-late-terminal",
+        )
+
+        append_terminal = (
+            repository.append_terminal_operation_chunk
+            if spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+            else repository.append_terminal_operation_event
+        )
+        assert not await append_terminal(
+            operation_id=operation_id,
+            session_id=claim.id,
+            instance_id="inst-late-terminal",
+            owner_epoch=claim.owner_epoch,
+            event_text='data: {"type":"response.completed"}\n\n',
+            max_bytes=1024,
+            state="completed",
+            response_id="resp-late-terminal",
+        )
+
+        operation = await repository.get_operation(operation_id=operation_id)
+        assert operation is not None
+        assert operation.state == "completed"
+        assert operation.event_spool_complete is False
+        assert await repository.get_operation_events(operation_id=operation_id) == []
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_consumed_recovery_checkpoint_does_not_rebind_failed_operation(
     async_session_factory: Callable[[], AsyncSession],
 ) -> None:

@@ -307,6 +307,8 @@ class DurableBridgeRepository:
         if owner_exists is None or operation is None:
             await self._session.rollback()
             return None
+        if not operation.event_spool_complete and operation.state in {"completed", "incomplete", "failed"}:
+            return operation, False
         if operation.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
             if await self._operation_has_legacy_events(operation_id):
                 return operation, False
@@ -2560,6 +2562,9 @@ class DurableBridgeRepository:
                 .with_for_update()
             )
             if owner_exists is None or operation is None:
+                await self._session.rollback()
+                return False
+            if not operation.event_spool_complete and operation.state in {"completed", "incomplete", "failed"}:
                 await self._session.rollback()
                 return False
             event_size = len(event_text.encode("utf-8"))
