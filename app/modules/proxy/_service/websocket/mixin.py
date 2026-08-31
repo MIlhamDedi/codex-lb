@@ -1638,6 +1638,11 @@ class _WebSocketMixin:
                             ),
                         )
                     except asyncio.TimeoutError:
+                        if shutdown_state.is_draining():
+                            # Re-enter the loop so the drain gate above wins
+                            # over an idle close when draining began while
+                            # receive() was blocked.
+                            continue
                         if not await proxy._downstream_websocket_is_idle(
                             pending_requests,
                             pending_lock=pending_lock,

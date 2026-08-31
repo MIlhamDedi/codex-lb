@@ -9396,6 +9396,25 @@ async def test_non_streaming_response_preserves_unfinished_status(status: str) -
     assert result.status == status
 
 
+@pytest.mark.asyncio
+async def test_collect_responses_payload_does_not_treat_in_progress_as_terminal() -> None:
+    async def stream() -> AsyncIterator[str]:
+        yield proxy_module.format_sse_event(
+            {"type": "response.in_progress", "response": {"id": "resp_background", "status": "in_progress"}}
+        )
+        yield proxy_module.format_sse_event(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_background", "status": "completed", "output": []},
+            }
+        )
+
+    result = await proxy_api._collect_responses_payload(stream())
+
+    assert isinstance(result, OpenAIResponsePayload)
+    assert result.status == "completed"
+
+
 @pytest.mark.parametrize(
     ("headers", "expected"),
     [

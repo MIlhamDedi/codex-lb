@@ -8667,6 +8667,7 @@ async def _collect_responses_payload(
 ) -> OpenAIResponseResult:
     output_items: dict[int, dict[str, JsonValue]] = {}
     terminal_result: OpenAIResponseResult | None = None
+    nonterminal_result: OpenAIResponsePayload | None = None
     contract_violation_kind: str | None = None
     async for line in stream:
         payload = _parse_sse_payload(line)
@@ -8707,7 +8708,11 @@ async def _collect_responses_payload(
                 else:
                     parsed = None
                 if parsed is not None:
-                    terminal_result = parsed
+                    if event_type in ("response.queued", "response.in_progress"):
+                        if isinstance(parsed, OpenAIResponsePayload):
+                            nonterminal_result = parsed
+                    else:
+                        terminal_result = parsed
                     continue
             error_kind = contract_violation_kind or "invalid_json"
             terminal_result = _public_contract_error_envelope(
@@ -8717,6 +8722,8 @@ async def _collect_responses_payload(
 
     if terminal_result is not None:
         return terminal_result
+    if nonterminal_result is not None:
+        return nonterminal_result
     error_kind = contract_violation_kind or "upstream_stream_truncated"
     return _public_contract_error_envelope(
         error_kind,
