@@ -48,6 +48,7 @@ from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_inva
 from app.core.clients.files import FileProxyError
 from app.core.clients.proxy import (
     _SSE_SEPARATOR_OVERLAP,
+    CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE,
     CODEX_LB_REQUIRED_CAPABILITY_HEADER,
     CodexControlRequestPrivacyPolicy,
     CodexControlResponse,
@@ -78,6 +79,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.errors import (
     HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    SYNTHETIC_TRANSPORT_FAILURE_MARKER,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
     is_previous_response_not_found_error,
@@ -86,6 +88,7 @@ from app.core.errors import (
     openai_error,
     response_failed_event,
     sanitize_public_error_detail,
+    synthetic_transport_failure_event,
 )
 from app.core.exceptions import (
     ProxyAuthError,
@@ -721,6 +724,8 @@ def _is_openai_sdk_request(
 ) -> bool:
     if _has_explicit_openai_sdk_marker(request):
         return True
+    if _is_native_codex_request(request.headers):
+        return False
     if payload is None or not _has_openai_responses_shape(payload):
         return False
     if isinstance(payload, Mapping):
@@ -1120,6 +1125,7 @@ async def responses(
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
 
+    backend_non_streaming_requested = responses_payload.stream is False
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
     (
         prohibit_fast_mode,
@@ -1165,7 +1171,7 @@ async def responses(
             api_key,
             route="responses",
             raw_model=raw_source_model,
-            require_streaming=True,
+            require_streaming=not backend_non_streaming_requested,
         )
         if disabled_denial is not None:
             return disabled_denial
@@ -1173,7 +1179,8 @@ async def responses(
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
         # not reject them.
-        responses_payload.stream = True
+        if not backend_non_streaming_requested:
+            responses_payload.stream = True
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
         return await _source_responses_response(
             request,
@@ -1191,22 +1198,36 @@ async def responses(
         service_tier_was_enforced=service_tier_was_enforced,
     )
 
-    response = await _stream_responses(
-        request,
-        responses_payload,
-        context,
-        api_key,
-        codex_session_affinity=True,
-        openai_cache_affinity=True,
-        prefer_http_bridge=True,
-        api_key_policy_already_applied=True,
-        prohibit_fast_mode=prohibit_fast_mode,
-        # The Codex CLI consumes codex.* vendor events and the upstream's
-        # native event ordering, while OpenAI SDK clients pointed at this
-        # compatibility route need the same SSE contract enforcement as /v1.
-        enforce_openai_sdk_contract=openai_sdk_request,
-        native_codex_heartbeat=native_codex_heartbeat,
-    )
+    if not backend_non_streaming_requested:
+        response = await _stream_responses(
+            request,
+            responses_payload,
+            context,
+            api_key,
+            codex_session_affinity=True,
+            openai_cache_affinity=True,
+            prefer_http_bridge=True,
+            api_key_policy_already_applied=True,
+            prohibit_fast_mode=prohibit_fast_mode,
+            # The Codex CLI consumes codex.* vendor events and the upstream's
+            # native event ordering, while OpenAI SDK clients pointed at this
+            # compatibility route need the same SSE contract enforcement as /v1.
+            enforce_openai_sdk_contract=openai_sdk_request,
+            native_codex_heartbeat=native_codex_heartbeat,
+        )
+    else:
+        response = await _collect_responses(
+            request,
+            responses_payload,
+            context,
+            api_key,
+            codex_session_affinity=True,
+            openai_cache_affinity=True,
+            prefer_http_bridge=False,
+            api_key_policy_already_applied=True,
+            preserve_upstream_stream_mode=True,
+            prohibit_fast_mode=prohibit_fast_mode,
+        )
     return _mark_subscription_prompt_cache_fallback(response, responses_payload)
 
 
@@ -1254,7 +1275,7 @@ async def responses_websocket(
     turn_state = proxy_affinity_module.ensure_downstream_turn_state(websocket.headers)
     await websocket.accept(headers=proxy_affinity_module.build_downstream_turn_state_accept_headers(turn_state))
     forwarded_headers = dict(websocket.headers)
-    if client_turn_state is None:
+    if client_turn_state is None and CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE.synthesized_turn_state_header:
         forwarded_headers["x-codex-turn-state"] = turn_state
     await context.service.proxy_responses_websocket(
         websocket,
@@ -1624,7 +1645,7 @@ async def v1_responses_websocket(
     turn_state = proxy_affinity_module.ensure_downstream_turn_state(websocket.headers)
     await websocket.accept(headers=proxy_affinity_module.build_downstream_turn_state_accept_headers(turn_state))
     forwarded_headers = dict(websocket.headers)
-    if client_turn_state is None:
+    if client_turn_state is None and CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE.synthesized_turn_state_header:
         forwarded_headers["x-codex-turn-state"] = turn_state
     await context.service.proxy_responses_websocket(
         websocket,
@@ -6079,8 +6100,15 @@ async def _stream_responses(
         if include_rate_limit_headers
         else {}
     )
-    bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
     effective_headers = forwarded_headers or request.headers
+    preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(effective_headers)
+    bridge_active = await _http_bridge_active_for_request(
+        payload,
+        effective_headers,
+        api_key,
+        preferred=prefer_http_bridge,
+        policy_already_applied=forwarded_request,
+    )
     bridge_recovery_eligible = _http_bridge_recovery_request_eligible(
         payload,
         bridge_active=bridge_active,
@@ -6347,7 +6375,13 @@ async def _stream_responses(
                 owner_forward_rejected_event=responses_owner_forward_rejected_event,
             )
         )
-        if startup_recovery_allowed:
+        native_transport_startup_failure = (
+            preserve_native_failure_lifecycle
+            and isinstance(startup_error, ProxyResponseError)
+            and startup_error_code
+            in {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}
+        )
+        if startup_recovery_allowed or native_transport_startup_failure:
             assert isinstance(startup_error, ProxyResponseError)
 
             # A durable bridge can fail before the startup probe observes the
@@ -6398,25 +6432,28 @@ async def _stream_responses(
             recovery_stream_factory=recovery_stream_factory,
             allow_client_full_history_once=bridge_recovery_eligible,
             require_durable_recovery_fence=bridge_recovery_eligible,
+            preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
         ),
         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
     )
     service_stream = stream
     use_codex_keepalive = native_codex_heartbeat or not enforce_openai_sdk_contract
     keepalive_frame = CODEX_KEEPALIVE_FRAME if use_codex_keepalive else SSE_KEEPALIVE_FRAME
-    if use_codex_keepalive:
+    if use_codex_keepalive and not preserve_native_failure_lifecycle:
         stream = _prepend_initial_sse_heartbeat(
             stream,
             keepalive_frame,
             request_id=get_request_id(),
             route_family="responses",
         )
-    stream = inject_sse_keepalives(
-        stream,
-        get_settings().sse_keepalive_interval_seconds,
-        keepalive_frame=keepalive_frame,
-        on_keepalive=lambda: _record_stream_keepalive("responses"),
-    )
+    if not preserve_native_failure_lifecycle:
+        stream = inject_sse_keepalives(
+            stream,
+            get_settings().sse_keepalive_interval_seconds,
+            keepalive_frame=keepalive_frame,
+            on_keepalive=lambda: _record_stream_keepalive("responses"),
+        )
     # Outermost so a client close after the initial heartbeat still closes
     # the service stream, including when the startup probe already completed.
     stream = _guard_responses_startup_handoff(
@@ -6444,6 +6481,31 @@ def _strip_internal_bridge_headers(headers: Mapping[str, str]) -> dict[str, str]
     return {key: value for key, value in headers.items() if not key.lower().startswith("x-codex-bridge-")}
 
 
+async def _http_bridge_active_for_request(
+    payload: ResponsesRequest,
+    headers: Mapping[str, str],
+    api_key: ApiKeyData | None,
+    *,
+    preferred: bool,
+    policy_already_applied: bool = False,
+) -> bool:
+    base_settings = proxy_service_module.get_settings()
+    if not preferred or not base_settings.http_responses_session_bridge_enabled:
+        return False
+    if policy_already_applied:
+        # The origin already made the authoritative policy decision before
+        # forwarding to this bridge owner.
+        return True
+    dashboard_settings = await proxy_service_module.get_settings_cache().get()
+    return proxy_service_module._http_bridge_allowed_by_transport_policy(
+        payload,
+        headers,
+        api_key=api_key,
+        dashboard_settings=dashboard_settings,
+        base_settings=base_settings,
+    )
+
+
 async def _collect_responses(
     request: Request,
     payload: ResponsesRequest,
@@ -6455,10 +6517,13 @@ async def _collect_responses(
     suppress_text_done_events: bool = False,
     prefer_http_bridge: bool = False,
     api_key_policy_already_applied: bool = False,
+    preserve_upstream_stream_mode: bool = False,
     prohibit_fast_mode: bool = False,
 ) -> Response:
     service_tier_was_enforced = False
     if not api_key_policy_already_applied:
+        # The replaced effort is discarded: this path uses subscription
+        # accounts, so the backend-hang rewrite must stick.
         service_tier_was_enforced = apply_api_key_enforcement(
             payload,
             api_key,
@@ -6494,7 +6559,12 @@ async def _collect_responses(
         reservation,
         reservation_cleanup=reservation_cleanup,
     )
-    bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
+    bridge_active = await _http_bridge_active_for_request(
+        payload,
+        request.headers,
+        api_key,
+        preferred=prefer_http_bridge,
+    )
     bridge_recovery_eligible = _http_bridge_recovery_request_eligible(
         payload,
         bridge_active=bridge_active,
@@ -6509,7 +6579,8 @@ async def _collect_responses(
         if downstream_turn_state is not None
         else {}
     )
-    payload.stream = True
+    if not preserve_upstream_stream_mode:
+        payload.stream = True
     if prefer_http_bridge:
         stream = context.service.stream_http_responses(
             payload,
@@ -7801,6 +7872,7 @@ async def _stream_response_error_events(
     recovery_stream_factory: Callable[[], AsyncIterator[str]] | None = None,
     allow_client_full_history_once: bool = False,
     require_durable_recovery_fence: bool = False,
+    preserve_native_failure_lifecycle: bool = False,
 ) -> AsyncIterator[str]:
     cleanup = reservation_cleanup or _ResponsesReservationCleanup(
         owns_reservation=owns_reservation,
@@ -7923,6 +7995,13 @@ async def _stream_response_error_events(
                     server_recovery_max_attempts,
                 )
         await release_owned_reservation()
+        if preserve_native_failure_lifecycle and error_code in {
+            "stream_incomplete",
+            "stream_idle_timeout",
+            "upstream_request_timeout",
+            "upstream_unavailable",
+        }:
+            raise
         response_id = None
         if isinstance(exc.payload, dict):
             response_id = _response_id_from_event_payload(cast(dict[str, JsonValue], exc.payload))
@@ -7945,15 +8024,21 @@ async def _stream_response_error_events(
             # exception stores seconds.  Clients that do not implement the
             # directive safely ignore the extra comment line.
             retry_hint = f"retry: {max(1, math.ceil(exc.retry_after_seconds * 1000))}\n"
-        yield retry_hint + format_sse_event(
-            response_failed_event(
-                error.code if error and error.code else "upstream_error",
-                error.message if error and error.message else "Upstream error",
-                error.type if error and error.type else "server_error",
-                response_id=response_id,
-                error_param=error.param_state if error else None,
-            )
+        failed_event = response_failed_event(
+            error.code if error and error.code else "upstream_error",
+            error.message if error and error.message else "Upstream error",
+            error.type if error and error.type else "server_error",
+            response_id=response_id,
+            error_param=error.param_state if error else None,
         )
+        if error_code in {
+            "stream_incomplete",
+            "stream_idle_timeout",
+            "upstream_request_timeout",
+            "upstream_unavailable",
+        }:
+            failed_event = synthetic_transport_failure_event(failed_event)
+        yield retry_hint + format_sse_event(failed_event)
 
 
 def _stream_startup_error_response(
@@ -7973,7 +8058,9 @@ def _stream_startup_error_response(
             ),
         )
         startup_headers = dict(headers)
-        if error.retry_after_seconds is not None and error.retry_after_seconds > 0:
+        if error.retry_after_header is not None:
+            startup_headers.setdefault("Retry-After", error.retry_after_header)
+        elif error.retry_after_seconds is not None and error.retry_after_seconds > 0:
             startup_headers.setdefault("Retry-After", str(error.retry_after_seconds))
         return _logged_error_json_response(
             request,
@@ -8656,6 +8743,7 @@ async def _normalize_public_responses_stream(
     *,
     enforce_openai_sdk_contract: bool = True,
     forward_unparseable_data: bool = False,
+    preserve_native_failure_lifecycle: bool = False,
 ) -> AsyncIterator[str]:
     stream = _normalize_reasoning_summary_stream(stream)
     """Normalize the upstream SSE event stream for the public /v1 surface.
@@ -8780,6 +8868,11 @@ async def _normalize_public_responses_stream(
                 yield event_block
             continue
         parsed_payload = payload
+        if payload.get(SYNTHETIC_TRANSPORT_FAILURE_MARKER) is True:
+            payload = dict(payload)
+            payload.pop(SYNTHETIC_TRANSPORT_FAILURE_MARKER, None)
+            if preserve_native_failure_lifecycle:
+                continue
         raw_event_type = payload.get("type")
         if (
             enforce_openai_sdk_contract
@@ -8911,6 +9004,10 @@ async def _normalize_public_responses_stream(
         # terminal here would mislabel a stream the proxy could not
         # interpret (for example a successful source stream whose terminal
         # event was not valid JSON) as a failure.
+        return
+    if preserve_native_failure_lifecycle:
+        # First-party Codex owns transport-failure interpretation. Preserve a
+        # missing terminal instead of manufacturing one on the LB boundary.
         return
     error_kind = contract_violation_kind or (
         "upstream_stream_truncated" if enforce_openai_sdk_contract else "stream_incomplete"

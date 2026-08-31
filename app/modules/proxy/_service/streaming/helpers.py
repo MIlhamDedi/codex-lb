@@ -42,6 +42,7 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     OpenAIErrorParam,
     response_failed_event,
+    synthetic_transport_failure_event,
 )
 from app.core.errors import (
     PREVIOUS_RESPONSE_NOT_FOUND_CODE as PREVIOUS_RESPONSE_NOT_FOUND_CODE,
@@ -720,6 +721,8 @@ def _build_rewritten_stream_response_failed_event(
         error_type="server_error",
         response_id=response_id,
     )
+    if error_code in {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}:
+        rewritten_event_payload = synthetic_transport_failure_event(rewritten_event_payload)
     rewritten_event_block = format_sse_event(rewritten_event_payload)
     rewritten_payload = parse_sse_data_json(rewritten_event_block)
     rewritten_event = parse_sse_event(rewritten_event_block)

@@ -78,6 +78,7 @@ from app.core.errors import (
     previous_response_id_from_not_found_message,
     previous_response_stream_incomplete_error,
     response_failed_event,
+    synthetic_transport_failure_event,
 )
 from app.core.errors import (
     is_previous_response_not_found_public_shape as _is_previous_response_not_found_public_shape,  # noqa: F401
@@ -551,6 +552,9 @@ from app.modules.proxy._service.streaming.helpers import (
 )
 from app.modules.proxy._service.streaming.helpers import (
     _upstream_turn_state_from_socket as _upstream_turn_state_from_socket,
+)
+from app.modules.proxy._service.streaming.retry import (
+    _http_bridge_allowed_by_transport_policy as _http_bridge_allowed_by_transport_policy,
 )
 from app.modules.proxy._service.streaming.retry import (
     _http_downstream_request_is_sticky as _http_downstream_request_is_sticky,
@@ -2349,10 +2353,12 @@ def _remaining_budget_seconds(deadline: float) -> float:
 
 
 def _proxy_request_timeout_event(request_id: str) -> ResponseFailedEvent:
-    return response_failed_event(
-        "upstream_request_timeout",
-        "Proxy request budget exhausted",
-        response_id=request_id,
+    return synthetic_transport_failure_event(
+        response_failed_event(
+            "upstream_request_timeout",
+            "Proxy request budget exhausted",
+            response_id=request_id,
+        )
     )
 
 

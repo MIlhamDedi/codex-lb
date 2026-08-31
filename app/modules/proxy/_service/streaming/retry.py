@@ -16,11 +16,19 @@ from app.core.balancer import failover_decision
 from app.core.balancer.types import ClassifiedFailure, UpstreamError
 from app.core.clients.proxy import (
     ProxyResponseError,
+    _is_native_codex_request,
     _resolve_stream_transport,
     is_confirmed_pre_dispatch_transport_error,
     pop_stream_timeout_overrides,
 )
-from app.core.errors import openai_error, response_failed_event
+from app.core.errors import (
+    ResponseFailedEvent,
+    openai_error,
+    synthetic_transport_failure_event,
+)
+from app.core.errors import (
+    response_failed_event as _base_response_failed_event,
+)
 from app.core.openai.requests import ResponsesRequest, extract_input_file_ids
 from app.core.resilience.network_recovery import (
     NetworkRecoveryDecision,
@@ -86,8 +94,23 @@ _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
 _HTTP_DOWNSTREAM_TRANSPORT_POLICY_DEFAULT = "smart"
 _HTTP_DOWNSTREAM_TRANSPORT_POLICIES = frozenset({"smart", "always_http", "always_websocket", "pinned"})
+_NATIVE_CODEX_TRANSPORT_FAILURE_CODES = frozenset(
+    {"stream_incomplete", "stream_idle_timeout", "upstream_request_timeout", "upstream_unavailable"}
+)
 
 logger = logging.getLogger(__name__)
+
+
+def response_failed_event(code: str, message: str, *args: Any, **kwargs: Any) -> ResponseFailedEvent:
+    """Tag transport terminals synthesized inside the retry layer.
+
+    Raw upstream SSE events never pass through this constructor, so the marker
+    distinguishes LB translation from a terminal the origin actually sent.
+    """
+    event = _base_response_failed_event(code, message, *args, **kwargs)
+    if code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES:
+        return synthetic_transport_failure_event(event)
+    return event
 
 
 def _facade() -> Any:
@@ -185,6 +208,34 @@ def _resolved_configured_stream_transport(dashboard_settings: Any, base_settings
     return configured, configured in ("http", "websocket")
 
 
+def _http_bridge_allowed_by_transport_policy(
+    payload: ResponsesRequest,
+    headers: Mapping[str, str],
+    *,
+    api_key: ApiKeyData | None,
+    dashboard_settings: Any,
+    base_settings: Any,
+) -> bool:
+    """Apply ordinary HTTP transport precedence before entering the WS bridge."""
+
+    configured_transport, explicit_transport = _resolved_configured_stream_transport(
+        dashboard_settings,
+        base_settings,
+    )
+    if explicit_transport:
+        return configured_transport == "websocket"
+    if _is_native_codex_request(headers):
+        # A first-party Codex client owns its WebSocket -> HTTP fallback. Once
+        # it submits HTTP, sticky metadata must not promote it back to WS.
+        return False
+    policy, _override_applied = _effective_http_downstream_transport_policy(
+        api_key,
+        dashboard_settings,
+        base_settings,
+    )
+    return _resolve_http_downstream_transport(policy, payload=payload, headers=headers) == "websocket"
+
+
 async def _iter_account_capacity_recovery_wait(
     *,
     request_id: str,
@@ -273,6 +324,7 @@ class _StreamingRetryMixin:
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         upstream_transport_policy_label = "explicit" if upstream_stream_transport_override is not None else "configured"
         upstream_transport_sticky = _http_downstream_request_is_sticky(payload, headers)
+        preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(headers)
         upstream_stream_transport = upstream_stream_transport_override
         if upstream_stream_transport is None:
             configured_transport, explicit_transport = _resolved_configured_stream_transport(settings, base_settings)
@@ -296,11 +348,19 @@ class _StreamingRetryMixin:
                 and request_transport == _REQUEST_TRANSPORT_HTTP
                 and upstream_stream_transport == "websocket"
             ):
-                policy, override_applied = _effective_http_downstream_transport_policy(api_key, settings, base_settings)
                 sticky = upstream_transport_sticky
-                upstream_transport_policy_label = policy
-                policy_transport = _resolve_http_downstream_transport(policy, payload=payload, headers=headers)
-                upstream_stream_transport = "http" if policy_transport == "http" else configured_transport
+                if _is_native_codex_request(headers):
+                    policy = "native_codex_http"
+                    override_applied = False
+                    upstream_transport_policy_label = policy
+                    upstream_stream_transport = "http"
+                else:
+                    policy, override_applied = _effective_http_downstream_transport_policy(
+                        api_key, settings, base_settings
+                    )
+                    upstream_transport_policy_label = policy
+                    policy_transport = _resolve_http_downstream_transport(policy, payload=payload, headers=headers)
+                    upstream_stream_transport = "http" if policy_transport == "http" else configured_transport
                 logger.info(
                     "http_downstream_transport_decision policy=%s override_applied=%s sticky=%s "
                     "upstream_stream_transport=%s request_id=%s",
@@ -1142,6 +1202,8 @@ class _StreamingRetryMixin:
                         conversation_id=conversation_id,
                         client_ip=client_ip,
                     )
+                    if preserve_native_failure_lifecycle:
+                        return
                     yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                     return
                 while True:
@@ -1199,6 +1261,8 @@ class _StreamingRetryMixin:
                                 conversation_id=conversation_id,
                                 client_ip=client_ip,
                             )
+                            if preserve_native_failure_lifecycle:
+                                return
                             yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                             return
                         event = response_failed_event(
@@ -1714,6 +1778,8 @@ class _StreamingRetryMixin:
                             conversation_id=conversation_id,
                             client_ip=client_ip,
                         )
+                        if preserve_native_failure_lifecycle:
+                            return
                         yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                         return
                     try:
@@ -1971,6 +2037,8 @@ class _StreamingRetryMixin:
                             conversation_id=conversation_id,
                             client_ip=client_ip,
                         )
+                        if preserve_native_failure_lifecycle:
+                            return
                         yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                         return
                     transient_retries = 0
@@ -2126,11 +2194,15 @@ class _StreamingRetryMixin:
                                 else:
                                     settlement.error = tex.error
                                 settlement.account_health_error = _facade()._should_penalize_stream_error(error_code)
-                                try:
-                                    yield format_sse_event(event)
-                                except (asyncio.CancelledError, GeneratorExit):
-                                    await _finalize_terminal_settlement_after_downstream_close(settlement, account)
-                                    raise
+                                if not (
+                                    preserve_native_failure_lifecycle
+                                    and error_code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES
+                                ):
+                                    try:
+                                        yield format_sse_event(event)
+                                    except (asyncio.CancelledError, GeneratorExit):
+                                        await _finalize_terminal_settlement_after_downstream_close(settlement, account)
+                                        raise
                                 settled = await _settle_stream_usage_before_pending_penalty(settlement)
                                 if settled and settlement.account_health_error:
                                     await proxy._handle_stream_error(
@@ -2368,6 +2440,8 @@ class _StreamingRetryMixin:
                                 continue
                             if recovery_decision == "exhausted":
                                 await _settle_process_network_budget_exhaustion(account, settlement)
+                                if preserve_native_failure_lifecycle:
+                                    return
                                 yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                                 return
                             transient_retries += 1
@@ -2490,6 +2564,8 @@ class _StreamingRetryMixin:
                 except ProxyResponseError as exc:
                     if _facade()._is_proxy_budget_exhausted_error(exc):
                         await _settle_process_network_budget_exhaustion(account, settlement)
+                        if preserve_native_failure_lifecycle:
+                            return
                         yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                         return
                     account_model_retry = await _retry_account_model_rejection(
@@ -2532,6 +2608,8 @@ class _StreamingRetryMixin:
                                 conversation_id=conversation_id,
                                 client_ip=client_ip,
                             )
+                            if preserve_native_failure_lifecycle:
+                                return
                             yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                             return
                         try:
@@ -2730,6 +2808,8 @@ class _StreamingRetryMixin:
                                 conversation_id=conversation_id,
                                 client_ip=client_ip,
                             )
+                            if preserve_native_failure_lifecycle:
+                                return
                             yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                             return
                         try:
@@ -2762,6 +2842,8 @@ class _StreamingRetryMixin:
                         except ProxyResponseError as retry_exc:
                             if _facade()._is_proxy_budget_exhausted_error(retry_exc):
                                 await _settle_process_network_budget_exhaustion(account, settlement)
+                                if preserve_native_failure_lifecycle:
+                                    return
                                 yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                                 return
                             if settlement.downstream_visible:
@@ -3094,7 +3176,13 @@ class _StreamingRetryMixin:
                     retries_exhausted_msg,
                     response_id=request_id,
                 )
-                yield format_sse_event(event)
+                if last_retryable_stream_error.code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES:
+                    event = synthetic_transport_failure_event(event)
+                if not (
+                    preserve_native_failure_lifecycle
+                    and last_retryable_stream_error.code in _NATIVE_CODEX_TRANSPORT_FAILURE_CODES
+                ):
+                    yield format_sse_event(event)
                 if not any_attempt_logged:
                     await proxy._write_request_log(
                         account_id=None,
