@@ -24,6 +24,7 @@ from app.core.clients.proxy import (  # noqa: F401
     _inline_input_image_urls,
     _ws_transport_payload_budget_bytes,
     filter_inbound_headers,
+    is_confirmed_pre_dispatch_transport_error,
     pop_compact_timeout_overrides,
     pop_stream_timeout_overrides,
     pop_transcribe_timeout_overrides,
@@ -36,6 +37,7 @@ from app.core.clients.proxy import compact_responses as core_compact_responses  
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import UpstreamWebSocketTransportError
 from app.core.errors import (
+    PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     OpenAIErrorEnvelope,
     openai_error,
     response_failed_event,
@@ -72,9 +74,20 @@ from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR,
+    _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
+    _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+    _HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
+    _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR,
+    _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR,
+    _bind_http_bridge_proxy_injected_anchor,
+    _capture_http_bridge_denied_anchor_fence,
     _effective_http_bridge_idle_ttl_seconds,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_durable_lookup_allows_turn_state_takeover,
+    _http_bridge_eventless_budget_seconds,
+    _http_bridge_eventless_max_keepalive_count,
+    _http_bridge_eventless_timeout_message,
     _http_bridge_is_context_overflow_error,
     _http_bridge_is_explicit_previous_response_rejection,
     _http_bridge_is_previous_response_owner_unavailable,
@@ -101,6 +114,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _proxy_admission_wait_timeout_seconds,
     _record_bridge_reattach,
     _record_continuity_fail_closed,
+    _release_http_bridge_denied_anchor_fences,
     _release_http_bridge_unanchored_handoff,
     _release_http_bridge_unanchored_handoffs_for_request,
     _reserve_http_bridge_unanchored_handoff,
@@ -142,6 +156,9 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _websocket_event_error_param,
     _websocket_event_error_type,
 )
+from app.modules.proxy._service.http_bridge.upstream_events import (
+    _abandon_durable_http_bridge_continuity,
+)
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
 )
@@ -167,6 +184,7 @@ from app.modules.proxy._service.support import (
     _DeferredAccountBackoffTracker,
     _event_type_from_payload,
     _HTTPBridgeOwnerForward,
+    _HTTPBridgeRetryCircuitAttemptSelection,
     _HTTPBridgeSession,
     _HTTPBridgeSessionKey,
     _is_local_account_cap_code,
@@ -175,6 +193,9 @@ from app.modules.proxy._service.support import (
     _signal_propagated_responses_service_cleanup_ready,
     _ttft_event_visible_at,
     _WebSocketRequestState,
+    mark_upstream_websocket_transport_failure,
+    upstream_websocket_transport_recently_failed,
+    websocket_connect_transport_failure_code,
 )
 from app.modules.proxy._service.support import (
     _websocket_route_log_kwargs as _websocket_route_log_kwargs,
@@ -498,7 +519,7 @@ def _http_bridge_dead_owner_previous_response_not_found_terminal(
             cast(str, error["message"]),
             error_type=cast(str, error["type"]),
             response_id=response_id,
-            error_param=cast(str, error["param"]),
+            error_param=cast(str | None, error["param"]),
         ),
     )
 
@@ -565,6 +586,10 @@ _HTTP_BRIDGE_AMBIGUOUS_RECOVERY_ERROR_CODES = frozenset(
         "stream_incomplete",
         "stream_idle_timeout",
         "upstream_request_timeout",
+        # Pre-response bridge timeouts replaced the upstream_request_timeout
+        # code that startup cooldown fail-closed used to raise; they leave
+        # upstream acceptance exactly as unknown as it was before.
+        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
     }
 )
 
@@ -978,6 +1003,33 @@ class _HTTPBridgeStreamingMixin:
                 request_id,
             )
             runtime_config = dataclasses.replace(runtime_config, enabled=False)
+        # The bridge exists to hold upstream websocket sessions, so a pinned
+        # "http" upstream transport must bypass it; without this gate the
+        # dashboard pin is silently ignored for bridged follow-up turns.
+        configured_upstream_transport = getattr(dashboard_settings, "upstream_stream_transport", "default")
+        if configured_upstream_transport == "default":
+            configured_upstream_transport = getattr(_service_get_settings(), "upstream_stream_transport", "auto")
+        if runtime_config.enabled and configured_upstream_transport == "http":
+            logger.info(
+                "stream_responses bypassing http bridge for pinned http upstream transport request_id=%s",
+                request_id,
+            )
+            force_upstream_stream_transport = "http"
+            runtime_config = dataclasses.replace(runtime_config, enabled=False)
+        # While the websocket transport-failure marker is armed, every
+        # responses path must degrade to the HTTP upstream: the bridge would
+        # stall on its websocket session creation, and the raw path's "smart"
+        # policy can resolve a sticky follow-up straight back to the
+        # unavailable websocket upstream.
+        if force_upstream_stream_transport is None and upstream_websocket_transport_recently_failed():
+            if runtime_config.enabled:
+                logger.info(
+                    "stream_responses bypassing http bridge for recent upstream websocket transport failure "
+                    "request_id=%s",
+                    request_id,
+                )
+                runtime_config = dataclasses.replace(runtime_config, enabled=False)
+            force_upstream_stream_transport = "http"
         if not runtime_config.enabled:
             stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
             async for line in stream_with_retry(
@@ -1001,36 +1053,102 @@ class _HTTPBridgeStreamingMixin:
 
         request_scope_id = ensure_request_scope_id()
         deferred_account_backoff_tracker = _DeferredAccountBackoffTracker()
+        bridge_yielded_any = False
+        bridge_transport_unavailable = False
         try:
-            async for line in self._stream_via_http_bridge(
-                payload,
-                headers,
-                codex_session_affinity=codex_session_affinity,
-                propagate_http_errors=propagate_http_errors,
-                openai_cache_affinity=openai_cache_affinity,
-                api_key=api_key,
-                api_key_reservation=api_key_reservation,
-                suppress_text_done_events=suppress_text_done_events,
-                idle_ttl_seconds=runtime_config.idle_ttl_seconds,
-                codex_idle_ttl_seconds=runtime_config.codex_idle_ttl_seconds,
-                max_sessions=runtime_config.max_sessions,
-                queue_limit=runtime_config.queue_limit,
-                prompt_cache_idle_ttl_seconds=runtime_config.prompt_cache_idle_ttl_seconds,
-                downstream_turn_state=downstream_turn_state,
-                forwarded_request=forwarded_request,
-                forwarded_original_request_unanchored=forwarded_original_request_unanchored,
-                forwarded_legacy_signature=forwarded_legacy_signature,
-                proxy_api_authorization=proxy_api_authorization,
-                forwarded_affinity_kind=forwarded_affinity_kind,
-                forwarded_affinity_key=forwarded_affinity_key,
-                rewritten_file_account_id=rewritten_file_account_id,
-                client_ip=client_ip,
-                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-                capacity_startup_wait_event=capacity_startup_wait_event,
-                capacity_startup_ready_event=capacity_startup_ready_event,
-                deferred_account_backoff_tracker=deferred_account_backoff_tracker,
-            ):
-                yield line
+            try:
+                async for line in self._stream_via_http_bridge(
+                    payload,
+                    headers,
+                    codex_session_affinity=codex_session_affinity,
+                    propagate_http_errors=propagate_http_errors,
+                    openai_cache_affinity=openai_cache_affinity,
+                    api_key=api_key,
+                    api_key_reservation=api_key_reservation,
+                    suppress_text_done_events=suppress_text_done_events,
+                    idle_ttl_seconds=runtime_config.idle_ttl_seconds,
+                    codex_idle_ttl_seconds=runtime_config.codex_idle_ttl_seconds,
+                    max_sessions=runtime_config.max_sessions,
+                    queue_limit=runtime_config.queue_limit,
+                    prompt_cache_idle_ttl_seconds=runtime_config.prompt_cache_idle_ttl_seconds,
+                    downstream_turn_state=downstream_turn_state,
+                    forwarded_request=forwarded_request,
+                    forwarded_original_request_unanchored=forwarded_original_request_unanchored,
+                    forwarded_legacy_signature=forwarded_legacy_signature,
+                    proxy_api_authorization=proxy_api_authorization,
+                    forwarded_affinity_kind=forwarded_affinity_kind,
+                    forwarded_affinity_key=forwarded_affinity_key,
+                    rewritten_file_account_id=rewritten_file_account_id,
+                    client_ip=client_ip,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    capacity_startup_wait_event=capacity_startup_wait_event,
+                    capacity_startup_ready_event=capacity_startup_ready_event,
+                    deferred_account_backoff_tracker=deferred_account_backoff_tracker,
+                ):
+                    bridge_yielded_any = True
+                    yield line
+            except ProxyResponseError as exc:
+                # A transient failure to establish the bridge's upstream
+                # websocket session must not fail the turn while the plain
+                # HTTP upstream path is healthy. The replay is safe only for
+                # failures carrying pre-submit session-creation provenance —
+                # a post-dispatch ``upstream_unavailable`` (for example a
+                # submit whose request already holds upstream response
+                # events) must propagate, or the raw-HTTP retry dispatches
+                # the same turn twice. It is also confined to the
+                # subscription path: API-key reservations are settled by the
+                # finally block below, so re-entering streaming with the
+                # same reservation would double-settle it. The
+                # ``failure_phase == "connect"`` requirement confines the
+                # replay to websocket-open transport evidence: an exhausted
+                # token-refresh loop surfaces the same 502
+                # ``upstream_unavailable`` envelope from this pre-submit
+                # stage, but it is account evidence — retrying it over raw
+                # HTTP re-runs the same failing refresh and buries the
+                # actionable error under ``no_accounts``.
+                # Classify by the connect-site transport provenance, never by
+                # the sanitized code: the responses policy preserves the
+                # upstream handshake body, so a direct 5xx bridge connect
+                # surfaces as ``upstream_error`` or whatever the edge
+                # returned. The provenance also subsumes the phase and status
+                # gates — refresh transport errors, routed handshakes and
+                # credential-scoped rejections never carry it, so they keep
+                # their own handling instead of being replayed over raw HTTP.
+                transport_failure_code = websocket_connect_transport_failure_code(
+                    exc,
+                    confirmed_pre_dispatch=is_confirmed_pre_dispatch_transport_error(exc),
+                )
+                # The bridge retry circuit's own cooldown suppression is
+                # generated locally, so it carries no connect provenance. It
+                # is admitted on the marker the pre-dispatch submission gate
+                # attaches once the request is proved replay-safe, and it is
+                # bridge-scoped rather than websocket transport evidence.
+                # The marker, never the error code: an ordinary pre-submit
+                # budget exhaustion emits the same ``upstream_request_timeout``
+                # from ``_raise_proxy_budget_exhausted`` and collects the same
+                # pre-submit provenance, but it is admission-queue or
+                # host-network evidence. Replaying it would double every
+                # request exactly when the instance is saturated, and would
+                # feed a doomed raw-HTTP attempt into its own recovery wait.
+                cooldown_suppression = getattr(exc, _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR, False)
+                if (
+                    bridge_yielded_any
+                    or api_key_reservation is not None
+                    or not getattr(exc, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, False)
+                    or getattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, False)
+                    or (transport_failure_code is None and not cooldown_suppression)
+                ):
+                    raise
+                if transport_failure_code is not None:
+                    # Bridge session creation runs its own pre-dispatch
+                    # failover, which never reaches the websocket failover
+                    # decision, so this is the only place bridge-only traffic
+                    # can arm the marker. Without it every later HTTP request
+                    # re-attempts the dead websocket bridge before falling
+                    # back, and the next downstream handshake is accepted
+                    # instead of denied with 426.
+                    mark_upstream_websocket_transport_failure()
+                bridge_transport_unavailable = True
         finally:
             with anyio.CancelScope(shield=True):
                 try:
@@ -1062,8 +1180,32 @@ class _HTTPBridgeStreamingMixin:
                         self,
                         request_scope_id=request_scope_id,
                     )
+        if not bridge_transport_unavailable:
+            return
+        logger.warning(
+            "stream_responses http bridge upstream unavailable; retrying over http upstream transport request_id=%s",
+            request_id,
+        )
+        stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
+        async for line in stream_with_retry(
+            payload,
+            headers,
+            codex_session_affinity=codex_session_affinity,
+            propagate_http_errors=propagate_http_errors,
+            openai_cache_affinity=openai_cache_affinity,
+            api_key=api_key,
+            api_key_reservation=api_key_reservation,
+            suppress_text_done_events=suppress_text_done_events,
+            request_transport=_REQUEST_TRANSPORT_HTTP,
+            rewritten_file_account_id=rewritten_file_account_id,
+            file_account_resolution_complete=True,
+            upstream_stream_transport_override="http",
+            client_ip=client_ip,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
+            yield line
 
-    async def _stream_via_http_bridge(
+    async def _stream_via_http_bridge_impl(
         self: Any,
         payload: ResponsesRequest,
         headers: Mapping[str, str],
@@ -1092,11 +1234,12 @@ class _HTTPBridgeStreamingMixin:
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
         deferred_account_backoff_tracker: _DeferredAccountBackoffTracker | None = None,
+        _denied_anchor_request_id: str | None = None,
     ) -> AsyncIterator[str]:
         del suppress_text_done_events
         dead_owner_anchor = False
         dead_owner_process_epoch_mismatch = False
-        request_id = ensure_request_id()
+        request_id = _denied_anchor_request_id or ensure_request_id()
         dashboard_settings = await _service_get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
         if deferred_account_backoff_tracker is None:
@@ -1331,7 +1474,8 @@ class _HTTPBridgeStreamingMixin:
             current_instance = _service_get_settings().http_responses_session_bridge_instance_id
             current_process_epoch = http_bridge_owner_process_epoch()
             dead_owner_process_epoch_mismatch = (
-                durable_lookup.owner_process_epoch is not None
+                durable_lookup.owner_instance_id == current_instance
+                and durable_lookup.owner_process_epoch is not None
                 and durable_lookup.owner_process_epoch != current_process_epoch
             )
             dead_owner_anchor = _http_bridge_durable_owner_is_dead(
@@ -1651,6 +1795,15 @@ class _HTTPBridgeStreamingMixin:
                 previous_response_trimmed_input_fingerprint = _fingerprint_input_items(previous_response_input_items)
                 effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
+        if proxy_injected_previous_response_id and request_state.previous_response_id is not None:
+            # Capture denial provenance before owner lookups below can suspend
+            # while a detached predecessor rejects the same durable anchor.
+            _bind_http_bridge_proxy_injected_anchor(
+                self,
+                request_state,
+                response_id=request_state.previous_response_id,
+                fence_request_id=request_id,
+            )
         request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
         request_state.affinity_policy = affinity
         _apply_http_bridge_downstream_turn_state(
@@ -2065,6 +2218,18 @@ class _HTTPBridgeStreamingMixin:
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
             except ProxyResponseError as exc:
+                # Session creation failed before the turn was submitted
+                # upstream; record that provenance so the outer wrapper knows
+                # a raw-HTTP replay cannot dispatch the turn twice.
+                setattr(exc, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, True)
+                # A bridge-injected anchor lives only on ``effective_payload``:
+                # the raw path recovers the owner from the turn-state header
+                # but never injects a response anchor, so replaying the
+                # incoming payload would send the new turn alone and silently
+                # drop the prior conversation. Only a payload that already
+                # carries its own continuity is a safe fresh raw-HTTP replay.
+                if effective_payload.previous_response_id != payload.previous_response_id:
+                    setattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, True)
                 if not owner_unavailable_allows_account_neutral_replay(exc):
                     exc_code, _exc_message = _proxy_error_code_message(exc)
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
@@ -2396,6 +2561,9 @@ class _HTTPBridgeStreamingMixin:
                 recovery_payload = effective_payload
                 recovery_anchor_input_count: int | None = None
                 recovery_anchor_input_fingerprint: str | None = None
+                recovery_anchor_fence_generation: int | None = None
+                recovery_anchor_fence_was_already_denied = False
+                recovery_anchor_fence_response_id: str | None = None
                 if (
                     not owner_forward_fresh_replay
                     # The quarantine skip (#1534) applies to the local recovery
@@ -2445,6 +2613,16 @@ class _HTTPBridgeStreamingMixin:
                                 "previous_response_id": durable_lookup.latest_response_id,
                                 "input": recovery_input[durable_full_resend_anchor_count:],
                             }
+                        )
+                        recovery_anchor_fence_response_id = durable_lookup.latest_response_id
+                        assert recovery_anchor_fence_response_id is not None
+                        (
+                            recovery_anchor_fence_generation,
+                            recovery_anchor_fence_was_already_denied,
+                        ) = _capture_http_bridge_denied_anchor_fence(
+                            self,
+                            recovery_anchor_fence_response_id,
+                            request_id,
                         )
                         if durable_lookup.latest_response_id != session.last_completed_response_id:
                             session.last_pending_tool_calls = {}
@@ -2514,6 +2692,25 @@ class _HTTPBridgeStreamingMixin:
                         retry_request_state.input_item_count = recovery_anchor_input_count
                         retry_request_state.input_full_fingerprint = recovery_anchor_input_fingerprint
                         retry_request_state.proxy_injected_previous_response_id = True
+                        retry_request_state.denied_proxy_injected_anchor_fence_generation_at_prepare = (
+                            recovery_anchor_fence_generation
+                            if recovery_anchor_fence_generation is not None
+                            else request_state.denied_proxy_injected_anchor_fence_generation_at_prepare
+                        )
+                        retry_request_state.denied_proxy_injected_anchor_fence_was_already_denied = (
+                            recovery_anchor_fence_was_already_denied
+                            or request_state.denied_proxy_injected_anchor_fence_was_already_denied
+                        )
+                        retry_request_state.denied_proxy_injected_anchor_fence_response_id = (
+                            recovery_anchor_fence_response_id
+                            if recovery_anchor_fence_response_id is not None
+                            else request_state.denied_proxy_injected_anchor_fence_response_id
+                        )
+                        retry_request_state.denied_proxy_injected_anchor_fence_request_id = (
+                            request_id
+                            if recovery_anchor_fence_response_id is not None
+                            else request_state.denied_proxy_injected_anchor_fence_request_id
+                        )
                         # ``recovery_anchor_input_count`` is only set when
                         # ``durable_full_resend_anchor_count`` is not None,
                         # which itself requires the incoming payload to have
@@ -2675,6 +2872,13 @@ class _HTTPBridgeStreamingMixin:
             request_state.proxy_injected_previous_response_id = True
             request_state.proxy_injected_anchor_had_full_resend_payload = session_level_payload_looks_like_full_resend
             request_state.fresh_upstream_request_text = fresh_upstream_request_text
+            if request_state.previous_response_id is not None:
+                _bind_http_bridge_proxy_injected_anchor(
+                    self,
+                    request_state,
+                    response_id=request_state.previous_response_id,
+                    fence_request_id=request_id,
+                )
             # Session-level anchor injection may be attached to a payload
             # that relied on the anchor for context (for example a
             # single-item follow-up turn whose prior history is only
@@ -2768,6 +2972,18 @@ class _HTTPBridgeStreamingMixin:
                 request_state.input_full_fingerprint = previous_response_trimmed_input_fingerprint
             if proxy_injected_previous_response_id:
                 request_state.proxy_injected_previous_response_id = True
+                request_state.denied_proxy_injected_anchor_fence_response_id = (
+                    previous_request_state.denied_proxy_injected_anchor_fence_response_id
+                )
+                request_state.denied_proxy_injected_anchor_fence_request_id = (
+                    previous_request_state.denied_proxy_injected_anchor_fence_request_id
+                )
+                request_state.denied_proxy_injected_anchor_fence_generation_at_prepare = (
+                    previous_request_state.denied_proxy_injected_anchor_fence_generation_at_prepare
+                )
+                request_state.denied_proxy_injected_anchor_fence_was_already_denied = (
+                    previous_request_state.denied_proxy_injected_anchor_fence_was_already_denied
+                )
                 # Unlike ``fresh_upstream_request_is_retry_safe`` below, this
                 # flag only asks whether the client's payload looked like a
                 # full resend, which cannot change between the original
@@ -3242,7 +3458,7 @@ class _HTTPBridgeStreamingMixin:
                 await self._reset_http_bridge_session_after_local_terminal_error(
                     session,
                     error_code="stream_incomplete",
-                    error_message="Upstream websocket closed before response.completed",
+                    error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 recovery_path = "context_overflow_fresh_turn"
                 retry_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
@@ -3264,7 +3480,7 @@ class _HTTPBridgeStreamingMixin:
                 await self._reset_http_bridge_session_after_local_terminal_error(
                     session,
                     error_code="stream_incomplete",
-                    error_message="Upstream websocket closed before response.completed",
+                    error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 raise
             elif previous_response_rejected_full_resend:
@@ -3274,7 +3490,7 @@ class _HTTPBridgeStreamingMixin:
                 await self._reset_http_bridge_session_after_local_terminal_error(
                     session,
                     error_code="stream_incomplete",
-                    error_message="Upstream websocket closed before response.completed",
+                    error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 switch_to_account_neutral_replay(
                     event="previous_response_recover_fresh_resend",
@@ -3323,7 +3539,7 @@ class _HTTPBridgeStreamingMixin:
                 await self._reset_http_bridge_session_after_local_terminal_error(
                     session,
                     error_code="stream_incomplete",
-                    error_message="Upstream websocket closed before response.completed",
+                    error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 recovery_path = "local_previous_response_same_owner_fresh_replay"
                 retry_previous_response_id = None
@@ -3345,7 +3561,7 @@ class _HTTPBridgeStreamingMixin:
                 await self._reset_http_bridge_session_after_local_terminal_error(
                     session,
                     error_code="stream_incomplete",
-                    error_message="Upstream websocket closed before response.completed",
+                    error_message=_HTTP_BRIDGE_LOCAL_RESET_MESSAGE,
                 )
                 recovery_path = "local_previous_response_error"
                 retry_payload = effective_payload
@@ -3395,7 +3611,11 @@ class _HTTPBridgeStreamingMixin:
                             preferred_account_id=retry_preferred_account_id,
                             preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
                             fallback_on_preferred_account_unavailable=not (
-                                file_required_preferred_account and retry_preferred_account_id is not None
+                                file_required_preferred_account
+                                or (
+                                    recovery_path == "local_previous_response_same_owner_fresh_replay"
+                                    and retry_preferred_account_id is not None
+                                )
                             ),
                             request_usage_budget=estimate_api_key_request_usage(retry_payload),
                             request_deadline=request_deadline,
@@ -3503,6 +3723,46 @@ class _HTTPBridgeStreamingMixin:
                 retry_request_state.operation_attempt_generation = request_state.operation_attempt_generation
                 retry_request_state.operation_persisted_response_id = request_state.operation_persisted_response_id
                 retry_request_state.operation_rebind_required = request_state.operation_rebind_required
+                # An anchored recovery replays the proxy's own anchor, so the
+                # retry inherits its provenance. Without this the retry looks
+                # client-anchored: diagnostics report
+                # ``previous_response_source=client_supplied`` for an id no
+                # client sent, ``_http_bridge_request_state_wedged_reattach``
+                # cannot recognise the reattach, and an upstream denial of the
+                # anchor is not attributable to this proxy. The anchor-free
+                # recovery paths carry no anchor at all, so the flag stays
+                # false there and cannot describe an id the retry never sends.
+                retry_request_state.proxy_injected_previous_response_id = (
+                    request_state.proxy_injected_previous_response_id and retry_previous_response_id is not None
+                )
+                retry_request_state.denied_proxy_injected_anchor_fence_generation_at_prepare = (
+                    request_state.denied_proxy_injected_anchor_fence_generation_at_prepare
+                    if retry_request_state.proxy_injected_previous_response_id
+                    else None
+                )
+                retry_request_state.denied_proxy_injected_anchor_fence_was_already_denied = (
+                    request_state.denied_proxy_injected_anchor_fence_was_already_denied
+                    if retry_request_state.proxy_injected_previous_response_id
+                    else False
+                )
+                retry_request_state.denied_proxy_injected_anchor_fence_response_id = (
+                    request_state.denied_proxy_injected_anchor_fence_response_id
+                    if retry_request_state.proxy_injected_previous_response_id
+                    else None
+                )
+                retry_request_state.denied_proxy_injected_anchor_fence_request_id = (
+                    request_state.denied_proxy_injected_anchor_fence_request_id
+                    if retry_request_state.proxy_injected_previous_response_id
+                    else None
+                )
+                # Carried with the flag above, not separately: the anchor's
+                # retirability depends on whether the payload it was injected
+                # onto was full-resend shaped, and a retry that replays the
+                # anchor replays that shape too.
+                retry_request_state.proxy_injected_anchor_had_full_resend_payload = (
+                    request_state.proxy_injected_anchor_had_full_resend_payload
+                    and retry_request_state.proxy_injected_previous_response_id
+                )
                 if local_previous_response_recovery:
                     # The prior response.failed/error made the operation
                     # terminal. Re-enter record_operation so its owner fence
@@ -3568,6 +3828,27 @@ class _HTTPBridgeStreamingMixin:
             except Exception:
                 pass
 
+    async def _stream_via_http_bridge(
+        self: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        """Run one bridge request and release its process-level anchor pins."""
+        request_id = ensure_request_id()
+        inner_stream = self._stream_via_http_bridge_impl(
+            *args,
+            _denied_anchor_request_id=request_id,
+            **kwargs,
+        )
+        try:
+            async for event_block in inner_stream:
+                yield event_block
+        finally:
+            try:
+                await inner_stream.aclose()
+            finally:
+                _release_http_bridge_denied_anchor_fences(self, request_id)
+
     async def _reset_http_bridge_session_after_local_terminal_error(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -3593,6 +3874,7 @@ class _HTTPBridgeStreamingMixin:
             error_message=error_message,
             api_key=None,
             response_create_gate=session.response_create_gate,
+            penalize_account=False,
         )
         await self._close_http_bridge_session(session, release_durable_session=not preserve_durable_lease)
 
@@ -3634,8 +3916,9 @@ class _HTTPBridgeStreamingMixin:
                                 cast(
                                     Mapping[str, JsonValue],
                                     response_failed_event(
-                                        "stream_idle_timeout",
-                                        "Clean-close recovery exceeded the request budget",
+                                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                                        "HTTP responses session bridge clean-close recovery "
+                                        "exceeded the request budget",
                                         response_id=downstream_response_id,
                                     ),
                                 )
@@ -3654,27 +3937,26 @@ class _HTTPBridgeStreamingMixin:
                 )
             except UpstreamWebSocketTransportError as exc:
                 if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
-                    stream_idle_timeout_total.labels(surface="http_bridge").inc()
+                    stream_idle_timeout_total.labels(surface="http_bridge_eventless").inc()
                 logger.info(
-                    "HTTP bridge stream idle recovery retry%s failed with transport error request_id=%s error_code=%s",
+                    "HTTP bridge eventless recovery retry%s failed with transport error request_id=%s error_code=%s",
                     " after circuit cooldown" if after_circuit_cooldown else "",
                     request_state.request_id,
                     exc.error_code,
                 )
+                mark_bridge_eventless_failure()
+                await record_bridge_eventless_timeout_failure()
+                eventless_message = _http_bridge_eventless_timeout_message(session.unmatched_upstream_liveness_count)
                 if getattr(
                     _service_get_settings(),
                     "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
                     "fail_closed",
                 ) == "server_indefinite_recovery" and _http_bridge_server_anchored_replay_enabled(request_state):
-                    # Let the outer server-owned recovery loop classify this
-                    # eventless transport failure as retryable. Returning a
-                    # synthetic response.failed event would make the loop
-                    # believe the attempt completed successfully after one try.
                     raise ProxyResponseError(
-                        502,
+                        503,
                         openai_error(
-                            "stream_idle_timeout",
-                            str(exc),
+                            _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                            eventless_message,
                             error_type="server_error",
                         ),
                     ) from exc
@@ -3684,8 +3966,8 @@ class _HTTPBridgeStreamingMixin:
                         cast(
                             Mapping[str, JsonValue],
                             response_failed_event(
-                                exc.error_code,
-                                str(exc),
+                                _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                                eventless_message,
                                 response_id=downstream_response_id,
                             ),
                         )
@@ -3817,12 +4099,14 @@ class _HTTPBridgeStreamingMixin:
                 return None
             await self._release_websocket_request_state_reservation(request_state)
             request_state.api_key_reservation = None
+            mark_bridge_eventless_failure()
+            eventless_message = _http_bridge_eventless_timeout_message(session.unmatched_upstream_liveness_count)
             if propagate_http_errors:
                 raise ProxyResponseError(
                     503,
                     openai_error(
-                        "upstream_request_timeout",
-                        "HTTP responses session bridge recovery exceeded the request budget.",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        eventless_message,
                         error_type="server_error",
                     ),
                 )
@@ -3830,12 +4114,63 @@ class _HTTPBridgeStreamingMixin:
                 cast(
                     Mapping[str, JsonValue],
                     response_failed_event(
-                        "stream_idle_timeout",
-                        "HTTP responses session bridge recovery exceeded the request budget",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        eventless_message,
                         response_id=_websocket_downstream_response_id(request_state),
                     ),
                 )
             )
+
+        def mark_bridge_eventless_failure() -> None:
+            """Record the pre-response-start classification on the request log.
+
+            ``stream_idle_timeout`` describes a stream that started and then
+            went quiet for ``stream_idle_timeout_seconds``. Nothing about this
+            phase matches that, and stamping request logs with it hid every
+            eventless bridge handoff wedge behind an upstream-shaped label.
+            """
+
+            if request_state.failure_phase_override is None:
+                request_state.failure_phase_override = "bridge"
+            if request_state.failure_detail_override is None:
+                request_state.failure_detail_override = _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL
+
+        async def record_bridge_eventless_timeout_failure(
+            selection: _HTTPBridgeRetryCircuitAttemptSelection | None = None,
+        ) -> None:
+            if selection is None:
+                consecutive_failures = await self._record_http_bridge_retry_circuit_failure(
+                    session,
+                    detail=_HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                )
+            else:
+                consecutive_failures = await self._record_http_bridge_retry_circuit_failure_for_attempt_selection(
+                    session,
+                    detail=_HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                    selection=selection,
+                )
+            observed_response_events = max(
+                request_state.response_event_count,
+                int(
+                    request_state.response_id is not None
+                    or request_state.latency_response_created_ms is not None
+                    or request_state.downstream_visible
+                ),
+            )
+            if (
+                observed_response_events > 0
+                or consecutive_failures is None
+                or consecutive_failures
+                < _service_get_settings().http_responses_session_bridge_anchor_poison_failure_threshold
+            ):
+                return
+            if await _abandon_durable_http_bridge_continuity(self, session):
+                await self._retire_stale_pending_http_bridge_session(
+                    session,
+                    detail="repeated_zero_event_idle_timeout",
+                    response_events_seen=0,
+                    retired_request_count=0,
+                )
 
         async def startup_continuity_cooldown_terminal_event() -> str | None:
             if (
@@ -3850,15 +4185,16 @@ class _HTTPBridgeStreamingMixin:
             if retry_cooldown_seconds <= 0:
                 return None
             if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
-                stream_idle_timeout_total.labels(surface="http_bridge").inc()
+                stream_idle_timeout_total.labels(surface="http_bridge_eventless").inc()
             _record_continuity_fail_closed(
                 surface="http_bridge",
                 reason="retry_circuit_cooldown_continuity_bound",
                 previous_response_id=request_state.previous_response_id,
                 session_id=downstream_turn_state or request_state.session_id,
             )
+            mark_bridge_eventless_failure()
             logger.info(
-                "HTTP bridge stream idle timeout fail-closed before submit without safe replay "
+                "HTTP bridge eventless timeout fail-closed before submit without safe replay "
                 "request_id=%s retry_after_seconds=%.1f",
                 request_state.request_id,
                 retry_cooldown_seconds,
@@ -3882,9 +4218,8 @@ class _HTTPBridgeStreamingMixin:
                 raise ProxyResponseError(
                     503,
                     openai_error(
-                        "upstream_request_timeout",
-                        "HTTP responses session bridge is cooling down after repeated upstream "
-                        "timeouts; retry shortly.",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
                         error_type="server_error",
                     ),
                     retry_after_seconds=max(1, math.ceil(retry_cooldown_seconds)),
@@ -3898,8 +4233,8 @@ class _HTTPBridgeStreamingMixin:
                     )
                     if request_state.durable_owner_dead
                     else response_failed_event(
-                        "stream_idle_timeout",
-                        "Upstream did not respond within the keepalive window",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
                         response_id=_websocket_downstream_response_id(request_state),
                     ),
                 )
@@ -4014,15 +4349,16 @@ class _HTTPBridgeStreamingMixin:
             and event_queue.empty()
         ):
             if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
-                stream_idle_timeout_total.labels(surface="http_bridge").inc()
+                stream_idle_timeout_total.labels(surface="http_bridge_eventless").inc()
             _record_continuity_fail_closed(
                 surface="http_bridge",
                 reason="retry_circuit_cooldown_continuity_bound",
                 previous_response_id=request_state.previous_response_id,
                 session_id=downstream_turn_state or request_state.session_id,
             )
+            mark_bridge_eventless_failure()
             logger.info(
-                "HTTP bridge stream idle timeout fail-closed at startup without safe replay "
+                "HTTP bridge eventless timeout fail-closed at startup without safe replay "
                 "request_id=%s retry_after_seconds=%.1f",
                 request_state.request_id,
                 initial_retry_cooldown_seconds,
@@ -4036,8 +4372,8 @@ class _HTTPBridgeStreamingMixin:
                     )
                     if request_state.durable_owner_dead
                     else response_failed_event(
-                        "stream_idle_timeout",
-                        "Upstream did not respond within the keepalive window",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
                         response_id=_websocket_downstream_response_id(request_state),
                     ),
                 )
@@ -4060,9 +4396,8 @@ class _HTTPBridgeStreamingMixin:
                 raise ProxyResponseError(
                     503,
                     openai_error(
-                        "upstream_request_timeout",
-                        "HTTP responses session bridge is cooling down after repeated upstream "
-                        "timeouts; retry shortly.",
+                        _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                        _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
                         error_type="server_error",
                     ),
                     retry_after_seconds=max(1, math.ceil(initial_retry_cooldown_seconds)),
@@ -4158,13 +4493,27 @@ class _HTTPBridgeStreamingMixin:
                         or request_state.response_event_count > 0
                         or request_state.latency_response_created_ms is not None
                     )
+                    # Before response.created the downstream queue is silent by
+                    # design, so stream_idle_timeout_seconds does not describe
+                    # this phase. Use the named settings-derived pre-response
+                    # budget (aligned with the owner-side stuck gate) instead of
+                    # the implicit _STREAM_KEEPALIVE_MAX_COUNT * interval
+                    # product that used to expire at ~60s under any settings.
+                    eventless_budget_seconds = _http_bridge_eventless_budget_seconds(
+                        settings,
+                        fallback_seconds=keepalive_interval * stream_keepalive_max_count,
+                    )
                     max_keepalive_count = (
                         max(
                             stream_keepalive_max_count,
                             math.ceil(max(0.001, stream_idle_timeout_seconds) / keepalive_interval),
                         )
                         if response_started
-                        else stream_keepalive_max_count
+                        else _http_bridge_eventless_max_keepalive_count(
+                            settings,
+                            keepalive_interval_seconds=keepalive_interval,
+                            floor_count=stream_keepalive_max_count,
+                        )
                     )
                     wait_timeout = keepalive_interval
                     if circuit_keepalive_waiting:
@@ -4275,7 +4624,7 @@ class _HTTPBridgeStreamingMixin:
                                             yield keepalive_event
                                         continue
                                     if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
-                                        stream_idle_timeout_total.labels(surface="http_bridge").inc()
+                                        stream_idle_timeout_total.labels(surface="http_bridge_eventless").inc()
                                     _record_continuity_fail_closed(
                                         surface="http_bridge",
                                         reason=(
@@ -4286,8 +4635,9 @@ class _HTTPBridgeStreamingMixin:
                                         previous_response_id=request_state.previous_response_id,
                                         session_id=downstream_turn_state or request_state.session_id,
                                     )
+                                    mark_bridge_eventless_failure()
                                     logger.info(
-                                        "HTTP bridge stream idle timeout fail-closed without safe replay "
+                                        "HTTP bridge eventless timeout fail-closed without safe replay "
                                         "request_id=%s retry_after_seconds=%.1f continuity_bound=%s",
                                         request_state.request_id,
                                         retry_cooldown_seconds,
@@ -4311,8 +4661,8 @@ class _HTTPBridgeStreamingMixin:
                                             )
                                             if request_state.durable_owner_dead
                                             else response_failed_event(
-                                                "stream_idle_timeout",
-                                                "Upstream did not respond within the keepalive window",
+                                                _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                                                _HTTP_BRIDGE_EVENTLESS_COOLDOWN_MESSAGE,
                                                 response_id=downstream_response_id,
                                             ),
                                         )
@@ -4335,9 +4685,10 @@ class _HTTPBridgeStreamingMixin:
                                                 yield keepalive_event
                                             continue
                                         if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
-                                            stream_idle_timeout_total.labels(surface="http_bridge").inc()
+                                            stream_idle_timeout_total.labels(surface="http_bridge_eventless").inc()
+                                        mark_bridge_eventless_failure()
                                         logger.info(
-                                            "HTTP bridge stream idle timeout during retry circuit cooldown "
+                                            "HTTP bridge eventless timeout during retry circuit cooldown "
                                             "request_id=%s retry_after_seconds=%.1f remaining_budget_seconds=%.1f",
                                             request_state.request_id,
                                             retry_cooldown_seconds,
@@ -4354,8 +4705,9 @@ class _HTTPBridgeStreamingMixin:
                                             cast(
                                                 Mapping[str, JsonValue],
                                                 response_failed_event(
-                                                    "stream_idle_timeout",
-                                                    "Upstream retry circuit cooldown exceeds the request budget",
+                                                    _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                                                    "HTTP responses session bridge retry cooldown "
+                                                    "exceeds the request budget",
                                                     response_id=downstream_response_id,
                                                 ),
                                             )
@@ -4415,26 +4767,31 @@ class _HTTPBridgeStreamingMixin:
                                             if keepalive_event is not None:
                                                 yield keepalive_event
                                             continue
-                                        await self._record_http_bridge_retry_circuit_failure_for_attempt_selection(
-                                            session,
-                                            detail="stream_idle_timeout",
-                                            selection=timed_out_retry_circuit_attempt_selection,
+                                        await record_bridge_eventless_timeout_failure(
+                                            timed_out_retry_circuit_attempt_selection
                                         )
                                         if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
-                                            stream_idle_timeout_total.labels(surface="http_bridge").inc()
+                                            stream_idle_timeout_total.labels(surface="http_bridge_eventless").inc()
+                                        mark_bridge_eventless_failure()
                                         logger.info(
-                                            "HTTP bridge stream idle timeout request_id=%s keepalive_count=%s "
-                                            "max_keepalive_count=%s",
+                                            "HTTP bridge eventless timeout request_id=%s keepalive_count=%s "
+                                            "max_keepalive_count=%s eventless_budget_seconds=%.1f "
+                                            "unmatched_upstream_liveness=%s",
                                             request_state.request_id,
                                             keepalive_count,
                                             max_keepalive_count,
+                                            eventless_budget_seconds,
+                                            session.unmatched_upstream_liveness_count,
+                                        )
+                                        eventless_message = _http_bridge_eventless_timeout_message(
+                                            session.unmatched_upstream_liveness_count
                                         )
                                         yield format_sse_event(
                                             cast(
                                                 Mapping[str, JsonValue],
                                                 response_failed_event(
-                                                    "stream_idle_timeout",
-                                                    "Upstream did not respond within the keepalive window",
+                                                    _HTTP_BRIDGE_EVENTLESS_TIMEOUT_DETAIL,
+                                                    eventless_message,
                                                     response_id=downstream_response_id,
                                                 ),
                                             )
@@ -4515,7 +4872,10 @@ class _HTTPBridgeStreamingMixin:
                     ) = _build_rewritten_stream_response_failed_event(
                         response_id=_websocket_downstream_response_id(request_state),
                         error_code="stream_incomplete",
-                        error_message="Upstream websocket closed before response.completed",
+                        # Canonical public masking for an upstream
+                        # previous_response_not_found rejection (see
+                        # app.modules.proxy.api._mask_previous_response_not_found_error).
+                        error_message=PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
                     )
                 if (
                     not yielded_any
@@ -4529,7 +4889,7 @@ class _HTTPBridgeStreamingMixin:
                             request_state.error_http_status_override,
                             openai_error(
                                 "bridge_previous_response_not_found",
-                                "Upstream websocket closed before response.completed",
+                                PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
                             ),
                         )
                     raise ProxyResponseError(

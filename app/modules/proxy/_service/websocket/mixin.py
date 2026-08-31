@@ -64,6 +64,7 @@ from app.core.clients.proxy_websocket import (
     is_account_neutral_websocket_error_code,
 )
 from app.core.errors import (
+    STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES,
     OpenAIErrorEnvelope,
     openai_error,
     response_failed_event,
@@ -343,6 +344,9 @@ from app.modules.proxy._service.support import (
     _WebSocketRequestState,
     _WebSocketTransientRefreshFailover,
     _WebSocketUpstreamControl,
+    clear_upstream_websocket_transport_failure,
+    mark_upstream_websocket_transport_failure,
+    websocket_connect_transport_failure_code,
 )
 from app.modules.proxy._service.support import (
     _HTTPBridgeOwnerForward as _HTTPBridgeOwnerForward,
@@ -514,6 +518,23 @@ _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_MESSAGE = (
     "security-work-authorized. codex-lb did not fall back to an ordinary account."
 )
 _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_ACTION = "fail_closed_capability_routing"
+
+
+@dataclass(slots=True)
+class _WebSocketConnectProgress:
+    """Whether an upstream websocket open reached the direct network connector.
+
+    Local websocket-connect admission and the account's route resolution run
+    inside the same request budget scope as the connector, so a budget
+    timeout that fires before this flag is set is local-contention evidence,
+    not upstream websocket transport evidence. The flag is confined to the
+    direct connector for the same reason a routed handshake failure carries
+    no transport provenance: a stalled routed open proves only that one
+    account's proxy endpoint is unhealthy, and a cancelled open raises no
+    ``ProxyResponseError`` for the routed exclusion to act on.
+    """
+
+    direct_upstream_connect_started: bool = False
 
 
 class _WebSocketReplaySequenceRegression(Exception):
@@ -1795,7 +1816,10 @@ class _WebSocketMixin:
                                     # response.create that switches to a source-owned model
                                     # would otherwise be forwarded to the subscription account
                                     # already attached to the open upstream. Model sources are
-                                    # only reachable from the HTTP request path.
+                                    # only reachable from the HTTP request path. Ownership
+                                    # includes disabled sources, which no subscription account
+                                    # can serve either; over HTTP those meet the 503
+                                    # ``model_source_disabled`` denial.
                                     #
                                     # Gated on an existing upstream on purpose: a first turn has
                                     # no socket yet and must fall through to the connect guard,
@@ -2800,15 +2824,26 @@ class _WebSocketMixin:
             scope_cancelled = True
             raise
         finally:
-            remaining_drain_timeout = shutdown_state.remaining_drain_timeout_seconds()
-            cleanup_timeout = (
-                _WEBSOCKET_SCOPE_CLEANUP_TIMEOUT_SECONDS
-                if remaining_drain_timeout is None
-                else max(float(remaining_drain_timeout), 0.0)
-            )
-            task_cleanup_timeout = (
-                _facade()._TASK_CANCEL_TIMEOUT_SECONDS if remaining_drain_timeout is None else cleanup_timeout
-            )
+
+            def current_scope_cleanup_timeout() -> float:
+                # The scope-cleanup wait guards terminal settlement (request
+                # finalization, lease release), which may legitimately outlive
+                # the drain deadline: when the server has published its
+                # post-drain cleanup reserve, draw on the shared
+                # drain-plus-reserve remainder — mirroring the shielded
+                # terminal-settlement wait — so an exhausted drain does not
+                # abandon the cleanup task with a zero budget. Without a
+                # published reserve (reversible operator drain, embedded
+                # lifespans) this stays bounded by the drain remainder.
+                remaining = shutdown_state.remaining_post_drain_cleanup_timeout_seconds()
+                if remaining is None:
+                    remaining = shutdown_state.remaining_drain_timeout_seconds()
+                return _WEBSOCKET_SCOPE_CLEANUP_TIMEOUT_SECONDS if remaining is None else max(float(remaining), 0.0)
+
+            def current_cleanup_timeout() -> float:
+                remaining = shutdown_state.remaining_drain_timeout_seconds()
+                return _facade()._TASK_CANCEL_TIMEOUT_SECONDS if remaining is None else max(float(remaining), 0.0)
+
             cleanup_phase = "not_started"
 
             async def finalize_websocket_scope() -> None:
@@ -2829,7 +2864,7 @@ class _WebSocketMixin:
                     await _close_websocket_upstream_for_cleanup(
                         proxy,
                         upstream,
-                        timeout_seconds=task_cleanup_timeout,
+                        timeout_seconds=current_cleanup_timeout(),
                     )
                 if reader_to_await is not None:
                     try:
@@ -2853,7 +2888,7 @@ class _WebSocketMixin:
                         cleanup_phase = "retired_create_lease"
                         await _facade()._await_cancelled_task(
                             retired_create_lease_release_task,
-                            timeout_seconds=task_cleanup_timeout,
+                            timeout_seconds=current_cleanup_timeout(),
                             label="proxy websocket retired create lease release",
                             cancel=False,
                         )
@@ -2868,7 +2903,7 @@ class _WebSocketMixin:
                         cleanup_phase = "unsent_request"
                         await _facade()._await_cancelled_task(
                             request_state_failure_task,
-                            timeout_seconds=task_cleanup_timeout,
+                            timeout_seconds=current_cleanup_timeout(),
                             label="proxy websocket unsent request finalization",
                             cancel=False,
                         )
@@ -2970,15 +3005,16 @@ class _WebSocketMixin:
                     )
 
             cleanup_task.add_done_callback(log_scope_cleanup_failure)
+            scope_cleanup_timeout = current_scope_cleanup_timeout()
             done, _ = await asyncio.wait(
                 {cleanup_task},
-                timeout=max(float(cleanup_timeout), 0.0),
+                timeout=scope_cleanup_timeout,
             )
             if not done:
                 _facade().logger.warning(
                     "Websocket scope cleanup exceeded its cleanup budget "
                     "timeout_seconds=%.3f cleanup_phase=%s background_cleanup_tasks=%d",
-                    max(float(cleanup_timeout), 0.0),
+                    scope_cleanup_timeout,
                     cleanup_phase,
                     sum(1 for task in proxy._background_cleanup_tasks if not task.done()),
                 )
@@ -3458,6 +3494,9 @@ class _WebSocketMixin:
         # model is not supported when using Codex with a ChatGPT account."
         # Codex clients fall back to the HTTP transport when a WebSocket
         # connect fails, and that path routes to the source correctly.
+        # Ownership includes disabled sources: no subscription account can
+        # serve those either, and the HTTP fallback answers them with the
+        # informative 503 ``model_source_disabled`` denial.
         #
         # Evaluated once per connect series rather than inside the failover
         # loop below: source ownership is a property of the requested model, so
@@ -3665,7 +3704,19 @@ class _WebSocketMixin:
                 if selected_account_model_replacement:
                     # The account/model retry budget selected this replacement;
                     # its connection failure must be surfaced rather than
-                    # consuming another account through generic failover.
+                    # consuming another account through generic failover. A
+                    # connect-phase transport failure on the replacement open
+                    # is still websocket-transport evidence, so arm the
+                    # handshake-denial marker even though the failover
+                    # decision is skipped.
+                    if (
+                        websocket_connect_transport_failure_code(
+                            exc,
+                            confirmed_pre_dispatch=confirmed_pre_dispatch,
+                        )
+                        is not None
+                    ):
+                        mark_upstream_websocket_transport_failure()
                     action = "surface"
                 else:
                     action = await proxy._decide_websocket_failover_action(
@@ -4421,6 +4472,30 @@ class _WebSocketMixin:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
         confirmed_pre_dispatch = is_confirmed_pre_dispatch_transport_error(exc)
+        transport_failure_code = websocket_connect_transport_failure_code(
+            exc,
+            confirmed_pre_dispatch=confirmed_pre_dispatch,
+        )
+        if transport_failure_code is not None:
+            # A server-level failure of the websocket open itself is transport
+            # evidence, not account evidence. Codex clients only activate
+            # their HTTP transport fallback on a handshake-level HTTP 426, so
+            # surface the failure immediately (the routes deny the next
+            # handshake with 426 while the transport-failure marker is armed)
+            # and skip the account error penalty: penalizing here drives the
+            # owner account into transient backoff and fails the HTTP retry
+            # closed on hard session affinity even though the HTTP upstream
+            # path is healthy.
+            mark_upstream_websocket_transport_failure()
+            _facade().logger.info(
+                "Websocket connect transient transport failure surfaced for HTTP fallback "
+                "request_id=%s account_id=%s status=%s code=%s",
+                request_state.request_log_id or request_state.request_id,
+                account.id,
+                exc.status_code,
+                transport_failure_code,
+            )
+            return "surface"
         if confirmed_pre_dispatch:
             # A proven pre-dispatch proxy connect failure is account-local
             # transient evidence. The caller applies the bounded transient
@@ -4494,9 +4569,15 @@ class _WebSocketMixin:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 _raise_proxy_budget_exhausted()
+            connect_progress = _WebSocketConnectProgress()
             try:
                 with anyio.fail_after(remaining_seconds):
-                    upstream = await proxy._open_upstream_websocket(account, headers, request_state=request_state)
+                    upstream = await proxy._open_upstream_websocket(
+                        account,
+                        headers,
+                        request_state=request_state,
+                        connect_progress=connect_progress,
+                    )
                 recovery.log_recovered()
                 return upstream
             except ProxyResponseError as exc:
@@ -4508,11 +4589,39 @@ class _WebSocketMixin:
                 if decision == "retry":
                     continue
                 if decision == "exhausted":
+                    # The budget-exhausted emit bypasses the failover
+                    # decision, so arm the handshake-denial marker here for
+                    # failures the decision path would have armed for. The
+                    # provenance gate matters: this loop also runs route
+                    # resolution, whose ``upstream_proxy_unavailable``
+                    # failures are pre-dispatch route evidence and must not
+                    # deny handshakes with 426.
+                    if (
+                        websocket_connect_transport_failure_code(
+                            exc,
+                            confirmed_pre_dispatch=is_confirmed_pre_dispatch_transport_error(exc),
+                        )
+                        is not None
+                    ):
+                        mark_upstream_websocket_transport_failure()
                     _raise_proxy_budget_exhausted()
                 raise
             except TimeoutError:
                 if time.monotonic() - started_at < timeout_seconds:
                     raise
+                # The websocket open itself consumed the connect budget, which
+                # is the same transport evidence as a classified connect
+                # timeout: the budget-exhausted emit below bypasses the
+                # failover decision, so arm the handshake-denial marker here
+                # or short-budget deployments never steer clients to HTTP.
+                # A budget shorter than the local admission wait expires
+                # before the connector ever runs; denying handshakes then
+                # would answer local contention by pushing every client onto
+                # HTTP, amplifying the overload it came from. A stalled
+                # routed open is route-scoped for the same reason its
+                # handshake failures are, so it stays out of this too.
+                if connect_progress.direct_upstream_connect_started:
+                    mark_upstream_websocket_transport_failure()
                 _raise_proxy_budget_exhausted()
 
     async def _open_upstream_websocket(
@@ -4521,6 +4630,7 @@ class _WebSocketMixin:
         headers: dict[str, str],
         *,
         request_state: "_WebSocketRequestState | None" = None,
+        connect_progress: _WebSocketConnectProgress | None = None,
     ) -> UpstreamWebSocket:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
@@ -4542,6 +4652,8 @@ class _WebSocketMixin:
                         error_type="server_error",
                     ),
                 ) from exc
+            if connect_progress is not None and route is None:
+                connect_progress.direct_upstream_connect_started = True
             upstream = await _facade()._call_with_supported_optional_kwargs(
                 _facade().connect_responses_websocket,
                 headers,
@@ -4554,6 +4666,14 @@ class _WebSocketMixin:
             )
             if request_state is not None:
                 _record_websocket_route_metadata(request_state, upstream=upstream, route=route)
+            if route is None:
+                # Symmetric with arming: a routed success proves only that one
+                # account's proxy endpoint is healthy, so it must not clear a
+                # denial state that direct-upstream evidence armed. Because a
+                # routed open can neither arm nor clear, an all-routed
+                # deployment simply never uses the marker, and a mixed one
+                # still falls back to the bounded TTL.
+                clear_upstream_websocket_transport_failure()
             return upstream
         finally:
             connect_lease.release()
@@ -6059,7 +6179,7 @@ class _WebSocketMixin:
         if (
             error_code == "stream_incomplete"
             and request_state.previous_response_id is not None
-            and error_message == "Upstream websocket closed before response.completed"
+            and error_message in STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES
         ):
             settlement.account_health_error = False
         proxy._cancel_request_state_api_key_reservation_heartbeat(request_state)
@@ -6449,7 +6569,7 @@ class _WebSocketMixin:
         try:
             settlement_succeeded = await asyncio.shield(finalization_task)
         except asyncio.CancelledError:
-            remaining_timeout = shutdown_state.remaining_drain_timeout_seconds()
+            remaining_timeout = shutdown_state.remaining_post_drain_cleanup_timeout_seconds()
             timeout_seconds = (
                 _facade()._TASK_CANCEL_TIMEOUT_SECONDS
                 if remaining_timeout is None
@@ -6487,11 +6607,18 @@ class _WebSocketMixin:
         if penalize_account:
             for request_state in remaining:
                 request_error_code = request_state.error_code_override or error_code
+                request_error_message = request_state.error_message_override or error_message
+                if (
+                    request_error_code == "stream_incomplete"
+                    and request_state.previous_response_id is not None
+                    and request_error_message in STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES
+                ):
+                    continue
                 if request_error_code in _facade()._TRANSIENT_RETRY_CODES or _facade()._should_penalize_stream_error(
                     request_error_code
                 ):
                     penalty_code = request_error_code
-                    penalty_message = request_state.error_message_override or error_message
+                    penalty_message = request_error_message
                     break
 
         reservation_release_succeeded = True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Mapping, Sequence
@@ -17,7 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
+    HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
+    HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
     HttpBridgeOperationEvent,
+    HttpBridgeOperationEventChunk,
     HttpBridgeOperationRecord,
     HttpBridgeRecoveryAttemptRecord,
     HttpBridgeRecoveryAttemptState,
@@ -33,6 +37,12 @@ from app.modules.proxy.continuity import (
     HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS,
     is_http_bridge_account_neutral_replay,
 )
+from app.modules.proxy.durable_bridge_transcript_codec import (
+    DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS,
+    DurableBridgeTranscriptDecodeError,
+    decode_durable_bridge_transcript_chunk,
+    encode_durable_bridge_transcript_chunk,
+)
 
 _ANONYMOUS_API_KEY_SCOPE = "__anonymous__"
 REQUIRED_DURABLE_BRIDGE_TABLES = (
@@ -42,8 +52,10 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_recovery_attempts",
     "http_bridge_operations",
     "http_bridge_operation_events",
+    "http_bridge_operation_event_chunks",
 )
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
+DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE = 50
 _PURGE_CLOSED_BATCH_SIZE = 500
 # Claim retry budget: insert races and epoch-CAS losses re-read and retry;
 # each round has a winner, so a small budget converges under any realistic
@@ -211,6 +223,12 @@ class DurableBridgeOperationEventInput:
     event_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class DurableBridgeOperationPurgeBatchResult:
+    selected_operations: int
+    deleted_operations: int
+
+
 class DurableBridgeRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -218,6 +236,144 @@ class DurableBridgeRepository:
     async def _commit_writer_section(self) -> None:
         async with sqlite_writer_section():
             await self._session.commit()
+
+    async def _delete_operation_spool_material(self, operation_ids: Sequence[str]) -> None:
+        if not operation_ids:
+            return
+        await self._session.execute(
+            delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id.in_(operation_ids))
+        )
+        await self._session.execute(
+            delete(HttpBridgeOperationEventChunk).where(HttpBridgeOperationEventChunk.operation_id.in_(operation_ids))
+        )
+
+    async def _operation_has_spool_material(self, operation_id: str) -> bool:
+        legacy_event = await self._session.scalar(
+            select(HttpBridgeOperationEvent.event_id)
+            .where(HttpBridgeOperationEvent.operation_id == operation_id)
+            .limit(1)
+        )
+        if legacy_event is not None:
+            return True
+        chunk_sequence = await self._session.scalar(
+            select(HttpBridgeOperationEventChunk.first_sequence_number)
+            .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+            .limit(1)
+        )
+        return chunk_sequence is not None
+
+    async def _operation_has_legacy_events(self, operation_id: str) -> bool:
+        event_id = await self._session.scalar(
+            select(HttpBridgeOperationEvent.event_id)
+            .where(HttpBridgeOperationEvent.operation_id == operation_id)
+            .limit(1)
+        )
+        return event_id is not None
+
+    async def _lock_operation_for_chunk_append(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        expected_recovery_dispatch_count: int | None = None,
+    ) -> tuple[HttpBridgeOperationRecord, bool] | None:
+        owner_exists = await self._session.scalar(
+            select(HttpBridgeSessionRecord.id)
+            .where(
+                HttpBridgeSessionRecord.id == session_id,
+                HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+            )
+            .with_for_update()
+        )
+        operation_statement = select(HttpBridgeOperationRecord).where(
+            HttpBridgeOperationRecord.operation_id == operation_id,
+            HttpBridgeOperationRecord.session_id == session_id,
+        )
+        if expected_recovery_dispatch_count is not None:
+            operation_statement = operation_statement.where(
+                HttpBridgeOperationRecord.recovery_dispatch_count == expected_recovery_dispatch_count
+            )
+        operation = await self._session.scalar(operation_statement.with_for_update())
+        if owner_exists is None or operation is None:
+            await self._session.rollback()
+            return None
+        if operation.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
+            if await self._operation_has_legacy_events(operation_id):
+                return operation, False
+            return operation, True
+        if operation.spool_format != HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1:
+            return operation, False
+        if int(operation.event_bytes or 0) != 0 or await self._operation_has_spool_material(operation_id):
+            return operation, False
+        return operation, True
+
+    async def _next_operation_chunk_sequence(self, operation_id: str) -> int:
+        latest = (
+            await self._session.execute(
+                select(
+                    HttpBridgeOperationEventChunk.first_sequence_number,
+                    HttpBridgeOperationEventChunk.event_count,
+                )
+                .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+                .order_by(HttpBridgeOperationEventChunk.first_sequence_number.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+        if latest is None:
+            return 1
+        first_sequence_number, event_count = latest
+        return int(first_sequence_number) + int(event_count)
+
+    async def _chunk_append_owner_exists(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+    ) -> bool:
+        return (
+            await self._session.scalar(
+                select(HttpBridgeSessionRecord.id).where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                )
+            )
+        ) is not None
+
+    async def _chunk_append_preflight_allows_encoding(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_bytes: int,
+        event_count: int,
+        max_bytes: int,
+    ) -> bool:
+        if not await self._chunk_append_owner_exists(
+            session_id=session_id,
+            instance_id=instance_id,
+            owner_epoch=owner_epoch,
+        ):
+            return False
+        current_event_bytes = await self._session.scalar(
+            select(HttpBridgeOperationRecord.event_bytes).where(
+                HttpBridgeOperationRecord.operation_id == operation_id,
+                HttpBridgeOperationRecord.session_id == session_id,
+            )
+        )
+        if current_event_bytes is None:
+            return False
+        first_sequence_number = await self._next_operation_chunk_sequence(operation_id)
+        return (
+            int(current_event_bytes) + event_bytes <= max_bytes
+            and first_sequence_number - 1 + event_count <= DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS
+        )
 
     async def get_session(
         self,
@@ -1009,6 +1165,61 @@ class DurableBridgeRepository:
             values=values,
         )
 
+    async def clear_latest_response_anchor_if_matches(
+        self,
+        *,
+        session_id: str,
+        api_key_scope: str,
+        instance_id: str,
+        owner_epoch: int,
+        response_id: str,
+    ) -> DurableBridgeSessionSnapshot | None:
+        """Clear one response anchor and its matching alias under the owner fence.
+
+        The response-id predicate makes a concurrent newer completion win over
+        a stale denial. Only the denied response alias is removed; turn-state
+        and other response aliases remain routable.
+        """
+
+        values: dict[str, object] = {
+            "latest_response_id": None,
+            "latest_input_item_count": None,
+            "latest_input_full_fingerprint": None,
+            "latest_pending_tool_calls_json": None,
+        }
+        async with sqlite_writer_section():
+            cleared = await self._session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.api_key_scope == api_key_scope,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.latest_response_id == response_id,
+                )
+                .values(**values)
+                .returning(HttpBridgeSessionRecord.id)
+            )
+            if cleared.scalar_one_or_none() is None:
+                await self._session.rollback()
+                return None
+            await self._session.execute(
+                delete(HttpBridgeSessionAlias).where(
+                    HttpBridgeSessionAlias.session_id == session_id,
+                    HttpBridgeSessionAlias.alias_kind == "previous_response_id",
+                    HttpBridgeSessionAlias.alias_hash == durable_bridge_hash(response_id),
+                    HttpBridgeSessionAlias.alias_value == response_id,
+                    HttpBridgeSessionAlias.api_key_scope == api_key_scope,
+                )
+            )
+            row = await self._session.get(
+                HttpBridgeSessionRecord,
+                session_id,
+                populate_existing=True,
+            )
+            await self._session.commit()
+        return _to_snapshot(row)
+
     async def record_recovery_attempt(
         self,
         *,
@@ -1394,13 +1605,10 @@ class DurableBridgeRepository:
                     # previous attempt's SSE spool atomically so a later
                     # successful retry cannot replay a stale response.failed
                     # event before its fresh response.created sequence.
-                    await self._session.execute(
-                        delete(HttpBridgeOperationEvent).where(
-                            HttpBridgeOperationEvent.operation_id == operation.operation_id
-                        )
-                    )
+                    await self._delete_operation_spool_material((operation.operation_id,))
                     operation.event_bytes = 0
                     operation.event_spool_complete = False
+                    operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
                     operation.updated_at = utcnow()
                     rebound = True
                 if request_text is not None and operation.request_text is None:
@@ -1430,6 +1638,7 @@ class DurableBridgeRepository:
                 # relying on a backend-specific schema default (notably the
                 # pre-existing SQLite default on migrated databases).
                 event_spool_complete=False,
+                spool_format=HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
             )
             self._session.add(operation)
             try:
@@ -1497,11 +1706,10 @@ class DurableBridgeRepository:
             if owner_exists is None or operation is None:
                 await self._session.rollback()
                 return False
-            await self._session.execute(
-                delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id == operation_id)
-            )
+            await self._delete_operation_spool_material((operation_id,))
             operation.event_bytes = 0
             operation.event_spool_complete = False
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
             operation.updated_at = utcnow()
             await self._session.commit()
         return True
@@ -1548,14 +1756,13 @@ class DurableBridgeRepository:
             if max_recovery_dispatches is not None and operation.recovery_dispatch_count >= max_recovery_dispatches:
                 await self._session.rollback()
                 return False
-            await self._session.execute(
-                delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id == operation_id)
-            )
+            await self._delete_operation_spool_material((operation_id,))
             operation.state = "submitted"
             operation.response_id = None
             operation.recovery_dispatch_count += 1
             operation.event_bytes = 0
             operation.event_spool_complete = False
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
             operation.updated_at = utcnow()
             await self._session.commit()
         return True
@@ -1653,12 +1860,7 @@ class DurableBridgeRepository:
             if owner_exists is None or operation is None:
                 await self._session.rollback()
                 return False
-            has_events = await self._session.scalar(
-                select(HttpBridgeOperationEvent.event_id)
-                .where(HttpBridgeOperationEvent.operation_id == operation_id)
-                .limit(1)
-            )
-            if has_events is not None:
+            if await self._operation_has_spool_material(operation_id):
                 await self._session.rollback()
                 return False
             if restore_rebound:
@@ -1692,13 +1894,73 @@ class DurableBridgeRepository:
         operation = await self._session.scalar(statement)
         return _to_operation_snapshot(operation) if operation is not None else None
 
-    async def get_operation_events(self, *, operation_id: str) -> list[str]:
-        result = await self._session.execute(
-            select(HttpBridgeOperationEvent.event_text)
-            .where(HttpBridgeOperationEvent.operation_id == operation_id)
-            .order_by(HttpBridgeOperationEvent.sequence_number.asc())
-        )
-        return [str(value) for value in result.scalars().all()]
+    async def get_operation_events(self, *, operation_id: str, max_bytes: int = 8 * 1024 * 1024) -> list[str]:
+        operation = (
+            await self._session.execute(
+                select(
+                    HttpBridgeOperationRecord.spool_format,
+                    HttpBridgeOperationRecord.event_bytes,
+                ).where(HttpBridgeOperationRecord.operation_id == operation_id)
+            )
+        ).one_or_none()
+        if operation is None:
+            return []
+        spool_format = str(operation.spool_format)
+        if type(operation.event_bytes) is not int:
+            return []
+        expected_event_bytes = operation.event_bytes
+        if expected_event_bytes < 0 or expected_event_bytes > max_bytes:
+            return []
+        if spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1:
+            result = await self._session.execute(
+                select(HttpBridgeOperationEvent.event_text)
+                .where(HttpBridgeOperationEvent.operation_id == operation_id)
+                .order_by(HttpBridgeOperationEvent.sequence_number.asc())
+            )
+            events = [str(value) for value in result.scalars().all()]
+            if sum(len(event.encode("utf-8")) for event in events) != expected_event_bytes:
+                return []
+            return events
+        if spool_format != HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2:
+            return []
+
+        chunks = (
+            await self._session.execute(
+                select(HttpBridgeOperationEventChunk)
+                .where(HttpBridgeOperationEventChunk.operation_id == operation_id)
+                .order_by(HttpBridgeOperationEventChunk.first_sequence_number.asc())
+            )
+        ).scalars()
+        expected_sequence = 1
+        total_event_count = 0
+        remaining_bytes = expected_event_bytes
+        events: list[str] = []
+        for chunk in chunks:
+            if type(chunk.event_count) is not int or not isinstance(chunk.payload, bytes):
+                return []
+            if chunk.first_sequence_number != expected_sequence:
+                return []
+            total_event_count += chunk.event_count
+            if total_event_count > DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS:
+                return []
+            try:
+                decoded = decode_durable_bridge_transcript_chunk(
+                    codec=chunk.codec,
+                    payload=bytes(chunk.payload),
+                    event_count=chunk.event_count,
+                    uncompressed_bytes=chunk.uncompressed_bytes,
+                    payload_sha256=chunk.payload_sha256,
+                    max_uncompressed_bytes=remaining_bytes + 4 * chunk.event_count,
+                )
+            except DurableBridgeTranscriptDecodeError:
+                return []
+            decoded_bytes = sum(len(event.encode("utf-8")) for event in decoded)
+            if decoded_bytes > remaining_bytes:
+                return []
+            events.extend(decoded)
+            remaining_bytes -= decoded_bytes
+            expected_sequence += chunk.event_count
+        return events if remaining_bytes == 0 else []
 
     async def get_operation_by_response_id(self, *, response_id: str) -> DurableBridgeOperationSnapshot | None:
         operation = await self._session.scalar(
@@ -1732,7 +1994,13 @@ class DurableBridgeRepository:
             operation = await self.get_operation_by_response_id(response_id=current_response_id)
             if operation is None or operation.request_text is None or not operation.event_spool_complete:
                 return None
-            events = await self.get_operation_events(operation_id=operation.operation_id)
+            remaining_event_bytes = max_bytes - total_bytes - len(operation.request_text.encode("utf-8"))
+            if remaining_event_bytes < 0:
+                return None
+            events = await self.get_operation_events(
+                operation_id=operation.operation_id,
+                max_bytes=remaining_event_bytes,
+            )
             if not events or not any(
                 "response.completed" in event or "response.incomplete" in event for event in events
             ):
@@ -1748,7 +2016,12 @@ class DurableBridgeRepository:
         turns.reverse()
         return turns
 
-    async def purge_operation_spool(self, *, cutoff: datetime, batch_size: int = 500) -> int:
+    async def purge_operation_spool_batch(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    ) -> DurableBridgeOperationPurgeBatchResult:
         """Delete eligible transcript material past retention.
 
         Nonterminal rows are purgeable only after their owning session is
@@ -1797,7 +2070,10 @@ class DurableBridgeRepository:
             operation_ids = [str(operation.operation_id) for operation in selected.scalars().all()]
             if not operation_ids:
                 await self._session.commit()
-                return 0
+                return DurableBridgeOperationPurgeBatchResult(
+                    selected_operations=0,
+                    deleted_operations=0,
+                )
             deleted = await self._session.execute(
                 delete(HttpBridgeOperationRecord)
                 .where(
@@ -1809,11 +2085,185 @@ class DurableBridgeRepository:
             )
             deleted_ids = [str(value) for value in deleted.scalars().all()]
             if deleted_ids:
-                await self._session.execute(
-                    delete(HttpBridgeOperationEvent).where(HttpBridgeOperationEvent.operation_id.in_(deleted_ids))
-                )
+                await self._delete_operation_spool_material(deleted_ids)
             await self._session.commit()
-        return len(deleted_ids)
+        return DurableBridgeOperationPurgeBatchResult(
+            selected_operations=len(operation_ids),
+            deleted_operations=len(deleted_ids),
+        )
+
+    async def purge_operation_spool(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    ) -> int:
+        """Delete one eligible transcript batch and return actual deletes."""
+        result = await self.purge_operation_spool_batch(cutoff=cutoff, batch_size=batch_size)
+        return result.deleted_operations
+
+    async def append_operation_event_chunk(
+        self,
+        *,
+        events: Sequence[DurableBridgeOperationEventInput],
+        max_bytes: int,
+    ) -> bool:
+        """Append one compressed v2 chunk under the durable owner fence."""
+        if not events:
+            return True
+        first = events[0]
+        if any(
+            event.operation_id != first.operation_id
+            or event.session_id != first.session_id
+            or event.instance_id != first.instance_id
+            or event.owner_epoch != first.owner_epoch
+            for event in events
+        ):
+            return False
+        event_texts = [event.event_text for event in events]
+        event_bytes = sum(len(event_text.encode("utf-8")) for event_text in event_texts)
+        if event_bytes > max_bytes:
+            return False
+        if not await self._chunk_append_preflight_allows_encoding(
+            operation_id=first.operation_id,
+            session_id=first.session_id,
+            instance_id=first.instance_id,
+            owner_epoch=first.owner_epoch,
+            event_bytes=event_bytes,
+            event_count=len(event_texts),
+            max_bytes=max_bytes,
+        ):
+            return False
+        try:
+            encoded = await asyncio.to_thread(encode_durable_bridge_transcript_chunk, event_texts)
+        except ValueError:
+            return False
+        async with sqlite_writer_section():
+            locked_operation = await self._lock_operation_for_chunk_append(
+                operation_id=first.operation_id,
+                session_id=first.session_id,
+                instance_id=first.instance_id,
+                owner_epoch=first.owner_epoch,
+            )
+            if locked_operation is None:
+                return False
+            operation, append_allowed = locked_operation
+            if not append_allowed:
+                await self._session.rollback()
+                return False
+            if int(operation.event_bytes or 0) + event_bytes > max_bytes:
+                operation.event_spool_complete = False
+                await self._session.commit()
+                return False
+            first_sequence_number = await self._next_operation_chunk_sequence(first.operation_id)
+            if first_sequence_number - 1 + len(event_texts) > DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS:
+                operation.event_spool_complete = False
+                await self._session.commit()
+                return False
+            self._session.add(
+                HttpBridgeOperationEventChunk(
+                    operation_id=first.operation_id,
+                    first_sequence_number=first_sequence_number,
+                    event_count=encoded.event_count,
+                    codec=encoded.codec,
+                    uncompressed_bytes=encoded.uncompressed_bytes,
+                    payload=encoded.payload,
+                    payload_sha256=encoded.payload_sha256,
+                )
+            )
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+            operation.event_bytes = int(operation.event_bytes or 0) + event_bytes
+            await self._session.commit()
+        return True
+
+    async def append_terminal_operation_chunk(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_text: str,
+        max_bytes: int,
+        state: str,
+        expected_recovery_dispatch_count: int = 0,
+        response_id: str | None = None,
+    ) -> bool:
+        """Append a terminal v2 chunk and expose its outcome atomically."""
+        event_bytes = len(event_text.encode("utf-8"))
+        preflight_allows_encoding = await self._chunk_append_preflight_allows_encoding(
+            operation_id=operation_id,
+            session_id=session_id,
+            instance_id=instance_id,
+            owner_epoch=owner_epoch,
+            event_bytes=event_bytes,
+            event_count=1,
+            max_bytes=max_bytes,
+        )
+        try:
+            encoded = (
+                await asyncio.to_thread(encode_durable_bridge_transcript_chunk, (event_text,))
+                if preflight_allows_encoding
+                else None
+            )
+        except ValueError:
+            encoded = None
+        async with sqlite_writer_section():
+            locked_operation = await self._lock_operation_for_chunk_append(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+            )
+            if locked_operation is None:
+                return False
+            operation, append_allowed = locked_operation
+            if not append_allowed:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            if int(operation.event_bytes or 0) + event_bytes > max_bytes or encoded is None:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            first_sequence_number = await self._next_operation_chunk_sequence(operation_id)
+            if first_sequence_number > DURABLE_BRIDGE_TRANSCRIPT_MAX_EVENTS:
+                operation.event_spool_complete = False
+                operation.state = state
+                if response_id is not None:
+                    operation.response_id = response_id
+                operation.updated_at = utcnow()
+                await self._session.commit()
+                return False
+            self._session.add(
+                HttpBridgeOperationEventChunk(
+                    operation_id=operation_id,
+                    first_sequence_number=first_sequence_number,
+                    event_count=encoded.event_count,
+                    codec=encoded.codec,
+                    uncompressed_bytes=encoded.uncompressed_bytes,
+                    payload=encoded.payload,
+                    payload_sha256=encoded.payload_sha256,
+                )
+            )
+            operation.spool_format = HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2
+            operation.event_bytes = int(operation.event_bytes or 0) + event_bytes
+            operation.state = state
+            if response_id is not None:
+                operation.response_id = response_id
+            operation.event_spool_complete = True
+            operation.updated_at = utcnow()
+            await self._session.commit()
+        return True
 
     async def append_operation_event(
         self,
@@ -1841,6 +2291,7 @@ class DurableBridgeRepository:
                 .where(
                     HttpBridgeOperationRecord.operation_id == operation_id,
                     HttpBridgeOperationRecord.session_id == session_id,
+                    HttpBridgeOperationRecord.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
                 )
                 .with_for_update()
             )
@@ -1902,6 +2353,7 @@ class DurableBridgeRepository:
                     HttpBridgeOperationRecord.operation_id == operation_id,
                     HttpBridgeOperationRecord.session_id == session_id,
                     HttpBridgeOperationRecord.recovery_dispatch_count == expected_recovery_dispatch_count,
+                    HttpBridgeOperationRecord.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
                 )
                 .with_for_update()
             )
@@ -1979,6 +2431,7 @@ class DurableBridgeRepository:
                 .where(
                     HttpBridgeOperationRecord.operation_id == first.operation_id,
                     HttpBridgeOperationRecord.session_id == first.session_id,
+                    HttpBridgeOperationRecord.spool_format == HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
                 )
                 .with_for_update()
             )
@@ -3083,7 +3536,8 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "SELECT name FROM sqlite_master "
                 "WHERE type = 'table' "
                 "AND name IN ('http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events')"
+                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events', "
+                "'http_bridge_operation_event_chunks')"
             )
         )
     else:
@@ -3093,7 +3547,8 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "WHERE table_schema = 'public' "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events'"
+                "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events', "
+                "'http_bridge_operation_event_chunks'"
                 ")"
             )
         )

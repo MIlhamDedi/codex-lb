@@ -8,15 +8,18 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clients.proxy import ProxyResponseError
+from app.core.config.settings import get_settings
 from app.core.errors import openai_error
 from app.core.utils.time import to_utc_naive
 from app.db.models import HttpBridgeSessionState
 from app.db.session import close_session
 from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
 from app.modules.proxy.durable_bridge_repository import (
+    DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
     DurableBridgeOperationEventInput,
+    DurableBridgeOperationPurgeBatchResult,
     DurableBridgeOperationSnapshot,
     DurableBridgeRecoveryAttemptSnapshot,
     DurableBridgeRepository,
@@ -438,6 +441,27 @@ class DurableBridgeSessionCoordinator:
             return None
         return _to_lookup(snapshot)
 
+    async def clear_live_session_response_anchor_if_matches(
+        self,
+        *,
+        session_id: str,
+        api_key_id: str | None,
+        instance_id: str,
+        owner_epoch: int,
+        response_id: str,
+    ) -> DurableBridgeLookup | None:
+        async with self._session() as session:
+            snapshot = await DurableBridgeRepository(session).clear_latest_response_anchor_if_matches(
+                session_id=session_id,
+                api_key_scope=durable_bridge_api_key_scope(api_key_id),
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                response_id=response_id,
+            )
+        if snapshot is None:
+            return None
+        return _to_lookup(snapshot)
+
     async def record_recovery_attempt(
         self,
         *,
@@ -570,7 +594,14 @@ class DurableBridgeSessionCoordinator:
 
     async def get_operation_events(self, *, operation_id: str) -> list[str]:
         async with self._session() as session:
-            return await DurableBridgeRepository(session).get_operation_events(operation_id=operation_id)
+            return await DurableBridgeRepository(session).get_operation_events(
+                operation_id=operation_id,
+                max_bytes=int(
+                    getattr(
+                        get_settings(), "http_responses_session_bridge_operation_event_spool_max_bytes", 2 * 1024 * 1024
+                    )
+                ),
+            )
 
     async def get_replayable_transcript(
         self,
@@ -586,9 +617,22 @@ class DurableBridgeSessionCoordinator:
                 max_bytes=max_bytes,
             )
 
-    async def purge_operation_spool(self, *, cutoff: datetime, batch_size: int = 500) -> int:
+    async def purge_operation_spool(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    ) -> int:
+        return (await self.purge_operation_spool_batch(cutoff=cutoff, batch_size=batch_size)).deleted_operations
+
+    async def purge_operation_spool_batch(
+        self,
+        *,
+        cutoff: datetime,
+        batch_size: int = DURABLE_BRIDGE_OPERATION_SPOOL_PURGE_BATCH_SIZE,
+    ) -> DurableBridgeOperationPurgeBatchResult:
         async with self._session() as session:
-            return await DurableBridgeRepository(session).purge_operation_spool(
+            return await DurableBridgeRepository(session).purge_operation_spool_batch(
                 cutoff=cutoff,
                 batch_size=batch_size,
             )
@@ -649,6 +693,44 @@ class DurableBridgeSessionCoordinator:
             return await DurableBridgeRepository(session).append_operation_events(
                 events=events,
                 max_bytes=max_bytes,
+            )
+
+    async def append_operation_event_chunk(
+        self,
+        *,
+        events: Sequence[DurableBridgeOperationEventInput],
+        max_bytes: int,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).append_operation_event_chunk(
+                events=events,
+                max_bytes=max_bytes,
+            )
+
+    async def append_terminal_operation_chunk(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_text: str,
+        max_bytes: int,
+        state: str,
+        expected_recovery_dispatch_count: int = 0,
+        response_id: str | None = None,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).append_terminal_operation_chunk(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                event_text=event_text,
+                max_bytes=max_bytes,
+                state=state,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                response_id=response_id,
             )
 
     async def finalize_operation_event_spool(

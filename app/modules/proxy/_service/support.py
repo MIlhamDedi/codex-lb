@@ -17,7 +17,10 @@ import anyio
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import CodexControlRequestPrivacyPolicy, ProxyResponseError
-from app.core.clients.proxy_websocket import UpstreamWebSocket
+from app.core.clients.proxy_websocket import (
+    UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL,
+    UpstreamWebSocket,
+)
 from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.model_registry import get_model_registry
@@ -36,6 +39,7 @@ from app.modules.api_keys.service import (
     ApiKeyUsageReservationData,
 )
 from app.modules.proxy.affinity import _AffinityPolicy
+from app.modules.proxy.helpers import _normalize_error_code, _parse_openai_error
 from app.modules.proxy.load_balancer import (
     AccountLease,
     AccountSelection,
@@ -1025,6 +1029,17 @@ class _WebSocketRequestState:
     # genuine delta-only client has no other way to convey prior context and
     # must stay anchored.
     proxy_injected_anchor_had_full_resend_payload: bool = False
+    # Process-local denial generation captured before any canonical session
+    # exists. A detached predecessor can reject the anchor while the request
+    # is waiting for owner resolution; retain that generation through retries
+    # so the successor's final dispatch fence still fails closed.
+    denied_proxy_injected_anchor_fence_generation_at_prepare: int | None = None
+    # Generation equality alone cannot distinguish a request captured after a
+    # denial from one captured before it. Preserve the tombstone observation on
+    # the prepared request so a stale durable lookup cannot be redispatched.
+    denied_proxy_injected_anchor_fence_response_id: str | None = None
+    denied_proxy_injected_anchor_fence_request_id: str | None = None
+    denied_proxy_injected_anchor_fence_was_already_denied: bool = False
     expose_stale_previous_response_classifier: bool = False
     fresh_upstream_request_text: str | None = None
     # True only when ``fresh_upstream_request_text`` contains a *safe* pre-
@@ -1156,6 +1171,11 @@ class _WebSocketRequestState:
     useragent: str | None = None
     useragent_group: str | None = None
     conversation_id: str | None = None
+    # The Responses payload's own ``conversation``, distinct from the client
+    # log's ``conversation_id`` above. It is account-scoped continuity with no
+    # dedicated owner index, so the raw path cannot prove the bridge session's
+    # owner for it.
+    payload_conversation_bound: bool = False
     client_ip: str | None = None
     downstream_visible: bool = False
     last_downstream_sequence_number: int | None = None
@@ -1246,6 +1266,16 @@ class _HTTPBridgeSession:
     downstream_turn_state: str | None = None
     downstream_turn_state_aliases: set[str] = field(default_factory=set)
     previous_response_ids: set[str] = field(default_factory=set)
+    # The live session keeps only its current denial tombstone.  Historical
+    # ids remain in the process-local fence ledger while prepared requests pin
+    # them, so this carrier cannot grow with every denied sibling anchor.
+    denied_proxy_injected_anchor_ids: set[str] = field(default_factory=set)
+    # Denials whose durable or local alias cleanup still needs a retry.  This
+    # is separate from the current tombstone carrier: a sibling-advanced
+    # denial remains fenced for pinned requests, but is not unresolved cleanup
+    # and may be retired when the session closes.
+    denied_proxy_injected_anchor_cleanup_pending: set[str] = field(default_factory=set)
+    denied_proxy_injected_anchor_generation: int = 0
     alias_registration_generation: int = 0
     turn_state_alias_registration_generations: dict[str, int] = field(default_factory=dict)
     previous_response_alias_registration_generations: dict[str, int] = field(default_factory=dict)
@@ -1262,6 +1292,7 @@ class _HTTPBridgeSession:
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
+    last_upstream_event_generation: int = 0
     last_upstream_close_code: int | None = None
     last_upstream_close_generation: int = 0
     closed: bool = False
@@ -1294,6 +1325,11 @@ class _HTTPBridgeSession:
     upstream_proxy_endpoint_id: str | None = None
     upstream_proxy_fallback_used: bool | None = None
     upstream_proxy_fail_closed_reason: str | None = None
+    # Upstream frames that proved transport liveness but matched no pending
+    # request. They are dropped from the downstream queues, so without this
+    # counter a pre-response bridge timeout cannot tell "upstream said nothing"
+    # apart from "upstream spoke and our matching lost the frame".
+    unmatched_upstream_liveness_count: int = 0
 
     def claim_liveness_settlement(self) -> bool:
         """Claim whole-deque settlement for a liveness-failed submitter.
@@ -1784,3 +1820,61 @@ def _openai_error_envelope_from_response_failed_payload(
     if isinstance(resets_in, int | float):
         error_detail["resets_in_seconds"] = resets_in
     return envelope
+
+
+# --- Upstream websocket transport health -----------------------------------
+#
+# Codex clients only switch to the HTTP transport when the websocket
+# handshake is rejected with HTTP 426 (codex-rs checks
+# ``StatusCode::UPGRADE_REQUIRED`` on connect; in-band error events never
+# trigger the transport fallback). This per-instance marker remembers a
+# recent connect-phase upstream websocket transport failure so the websocket
+# routes can deny the next handshake with 426 and the HTTP paths can pin the
+# upstream transport to HTTP until the websocket upstream proves healthy
+# again.
+
+UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS = 60.0
+_upstream_ws_transport_failure_at: float | None = None
+
+
+def mark_upstream_websocket_transport_failure() -> None:
+    global _upstream_ws_transport_failure_at
+    _upstream_ws_transport_failure_at = time.monotonic()
+
+
+def clear_upstream_websocket_transport_failure() -> None:
+    global _upstream_ws_transport_failure_at
+    _upstream_ws_transport_failure_at = None
+
+
+def websocket_connect_transport_failure_code(
+    exc: ProxyResponseError,
+    *,
+    confirmed_pre_dispatch: bool,
+) -> str | None:
+    """Code of a host-scoped upstream websocket transport failure, else ``None``.
+
+    The discriminator is the provenance the direct upstream open stamps, not
+    the sanitized error code. Codes cannot carry it in either direction: the
+    responses policy preserves the upstream handshake body, so a direct 5xx
+    upgrade rejection surfaces as ``upstream_error`` or whatever the edge
+    returned, while OAuth refresh transport errors, routed-proxy handshakes,
+    TLS verification failures and host-wide network loss all share the
+    ``upstream_unavailable`` envelope and must keep their
+    classify-penalize-failover handling.
+    """
+
+    if confirmed_pre_dispatch or exc.failure_phase != "connect":
+        return None
+    if exc.failure_detail != UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL:
+        return None
+    connect_error = _parse_openai_error(exc.payload)
+    return _normalize_error_code(
+        connect_error.code if connect_error else None,
+        connect_error.type if connect_error else None,
+    )
+
+
+def upstream_websocket_transport_recently_failed() -> bool:
+    marked_at = _upstream_ws_transport_failure_at
+    return marked_at is not None and time.monotonic() - marked_at < UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS
