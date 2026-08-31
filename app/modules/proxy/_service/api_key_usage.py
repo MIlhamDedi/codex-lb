@@ -8,6 +8,7 @@ from collections.abc import Coroutine, Mapping
 from typing import Any, Protocol, cast
 
 import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
 
 from app.core.clients.proxy import ProxyResponseError
 from app.core.errors import openai_error
@@ -260,6 +261,15 @@ class _ApiKeyUsageMixin:
                             exc_info=True,
                         )
                         break
+        if deferred_cancellation is None:
+            # The shield also blocks the level cancellation this drain
+            # promises to re-raise after the queue empties. Probe without
+            # suspending so it surfaces here instead of at an arbitrary
+            # later checkpoint.
+            try:
+                await checkpoint_if_cancelled()
+            except asyncio.CancelledError as exc:
+                deferred_cancellation = exc
         if deferred_cancellation is not None:
             raise deferred_cancellation
 

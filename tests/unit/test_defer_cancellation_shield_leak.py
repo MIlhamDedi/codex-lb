@@ -276,3 +276,31 @@ async def test_keyed_health_drain_keeps_apply_task_callbacks_bounded():
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(waiter, timeout=1)
+
+
+async def test_keyed_health_drain_surfaces_level_cancellation_after_cleanup():
+    """The drain's shield blocks level cancellation; the post-shield probe
+    must still re-raise it once the queue empties (uniform marker contract)."""
+
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from app.modules.proxy._service import api_key_usage as aku
+
+    async def quick_penalty(*_args: object) -> None:
+        await asyncio.sleep(0)
+
+    penalty = SimpleNamespace(account=SimpleNamespace(id="acc"), error=RuntimeError("x"), code="c")
+    request_state = SimpleNamespace(deferred_keyed_stream_health=[penalty])
+    fake_self = SimpleNamespace(_handle_stream_error=quick_penalty)
+
+    async def run_in_cancelled_scope() -> None:
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await aku._ApiKeyUsageMixin._drain_deferred_keyed_stream_health(
+                    cast(Any, fake_self), cast(Any, request_state)
+                )
+
+    await asyncio.wait_for(asyncio.create_task(run_in_cancelled_scope()), timeout=1)
+    assert request_state.deferred_keyed_stream_health == []
