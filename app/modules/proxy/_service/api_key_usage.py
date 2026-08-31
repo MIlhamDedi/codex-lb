@@ -14,6 +14,7 @@ from app.core.errors import openai_error
 from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
 from app.core.openai.models import CompactResponsePayload
 from app.core.utils.request_id import get_request_id
+from app.core.utils.shared_future import wait_on_shared_future
 from app.db.models import Account
 from app.modules.api_keys.service import (
     API_KEY_USAGE_RESERVATION_DEFAULT_INPUT_TOKENS,
@@ -208,10 +209,11 @@ class _ApiKeyUsageMixin:
         drain the same request state concurrently without applying a penalty
         twice or corrupting the queue.
 
-        Each attempt runs as an owned task awaited through ``asyncio.shield``
-        (the ``_await_task_deferring_cancellation`` pattern; importing it from
-        ``http_bridge.helpers`` would cycle through that module's import of
-        this one). Caller cancellation therefore cannot abandon a
+        Each attempt runs as an owned task awaited through
+        ``wait_on_shared_future`` (the ``_await_task_deferring_cancellation``
+        pattern, inlined because the cancelled-attempt path must re-queue the
+        claimed penalty before re-raising). Caller cancellation therefore
+        cannot abandon a
         half-applied penalty for a later drain to replay: every claimed entry
         is drained to completion first — no later path owns the queue once
         terminal ownership is relinquished — and the cancellation re-raises
@@ -228,8 +230,8 @@ class _ApiKeyUsageMixin:
         penalties = request_state.deferred_keyed_stream_health
         # The anyio shield keeps a level-cancelled Starlette scope from
         # re-raising into every ``await``, which would otherwise busy-spin
-        # this loop until the owned task completes; the inner asyncio.shield
-        # loop defers edge task cancellation the same way.
+        # this loop until the owned task completes; the inner wait loop
+        # defers edge task cancellation the same way.
         with anyio.CancelScope(shield=True):
             while penalties:
                 penalty = penalties.pop(0)
@@ -238,7 +240,10 @@ class _ApiKeyUsageMixin:
                 )
                 while True:
                     try:
-                        await asyncio.shield(apply_task)
+                        # wait_on_shared_future keeps repeated waits off the
+                        # task's done-callback list (3.14 shield leaks one per
+                        # cancelled wait).
+                        await wait_on_shared_future(apply_task)
                         break
                     except asyncio.CancelledError as exc:
                         if apply_task.cancelled():
@@ -510,7 +515,7 @@ class _ApiKeyUsageMixin:
             )
             while not fallback_task.done():
                 try:
-                    await asyncio.shield(fallback_task)
+                    await wait_on_shared_future(fallback_task)
                 except asyncio.CancelledError:
                     # Keep waiting for the owned fallback. Cancellation is not
                     # a failed release; retry only when the fallback itself is
@@ -584,7 +589,7 @@ class _ApiKeyUsageMixin:
             with anyio.CancelScope(shield=True):
                 while True:
                     try:
-                        settlement_committed = await asyncio.shield(task)
+                        settlement_committed = await wait_on_shared_future(task)
                         break
                     except asyncio.CancelledError:
                         # Caller cancellation must not race fallback release

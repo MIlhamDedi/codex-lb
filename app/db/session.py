@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
 from app.core.config.settings import get_settings
+from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 from app.db.sqlite_utils import (
     IntegrityCheck,
     SqliteFileIdentity,
@@ -513,17 +514,7 @@ def mark_sqlite_shutdown_clean() -> None:
 
 
 async def _shielded(awaitable: Awaitable[object]) -> None:
-    task = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    with anyio.CancelScope(shield=True):
-        while True:
-            try:
-                await asyncio.shield(task)
-                break
-            except asyncio.CancelledError as exc:
-                if task.cancelled():
-                    raise
-                cancellation = cancellation or exc
+    cancellation = await _await_cleanup_deferring_cancellation(awaitable)
     if cancellation is not None:
         raise cancellation
 
