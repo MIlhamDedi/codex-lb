@@ -5856,7 +5856,7 @@ async def test_v1_responses_http_bridge_trims_replayed_tool_search_previous_resp
             "model": "gpt-5.1",
             "instructions": "Search the tools.",
             "previous_response_id": first_body["id"],
-            "input": [replayed_tool_search_call, replayed_tool_search_output, next_user_message],
+            "input": [replayed_tool_search_output, next_user_message],
             "prompt_cache_key": "http-bridge-tool-search-trim-1",
         },
     )
@@ -5875,6 +5875,7 @@ async def test_v1_responses_http_bridge_trims_replayed_tool_search_previous_resp
         },
         next_user_message,
     ]
+    assert replayed_tool_search_call["id"] == "tsc_replay"
 
 
 @pytest.mark.asyncio
