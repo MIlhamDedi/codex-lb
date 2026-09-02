@@ -18,4 +18,4 @@
 
 - [x] 4.1 Run focused unit and integration tests.
 - [x] 4.2 Run Ruff, type checks, and strict OpenSpec validation.
-- [ ] 4.3 Verify the fix against two live replicas and restore the shared deployment to one replica.
+- [x] 4.3 Verify the fix against two live replicas and restore the shared deployment to one replica.
