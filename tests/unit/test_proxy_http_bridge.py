@@ -18262,6 +18262,63 @@ async def test_get_or_create_http_bridge_session_returns_owner_forward_for_hard_
 
 
 @pytest.mark.asyncio
+async def test_get_or_create_http_bridge_session_forwards_canonical_prompt_cache_hard_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("prompt_cache", "canonical-cache-key", None)
+    durable_lookup = proxy_service.DurableBridgeLookup(
+        session_id="durable-canonical-cache",
+        canonical_kind="prompt_cache",
+        canonical_key="canonical-cache-key",
+        api_key_scope="__anonymous__",
+        account_id="acc-owner",
+        owner_instance_id="instance-b",
+        owner_epoch=2,
+        lease_expires_at=proxy_service.utcnow() + timedelta(seconds=60),
+        state=HttpBridgeSessionState.ACTIVE,
+        latest_turn_state="http_turn_canonical_cache",
+        latest_response_id="resp_canonical_cache",
+    )
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        proxy_service,
+        "_active_http_bridge_instance_ring",
+        AsyncMock(return_value=("instance-a", ["instance-a", "instance-b"])),
+    )
+    service._ring_membership = cast(Any, SimpleNamespace(resolve_endpoint=AsyncMock(return_value="http://instance-b")))
+    monkeypatch.setattr(
+        service,
+        "_select_account_with_budget",
+        AsyncMock(side_effect=AssertionError("hard continuation must forward before local account selection")),
+    )
+
+    resolved = await service._get_or_create_http_bridge_session(
+        key,
+        headers={"x-codex-turn-state": "http_turn_canonical_cache"},
+        affinity=proxy_service._AffinityPolicy(
+            key="http_turn_canonical_cache",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        api_key=None,
+        request_model="gpt-5.4",
+        idle_ttl_seconds=120.0,
+        max_sessions=8,
+        previous_response_id="resp_canonical_cache",
+        allow_forward_to_owner=True,
+        durable_lookup=durable_lookup,
+        request_stage="follow_up",
+        preferred_account_id="acc-owner",
+    )
+
+    assert isinstance(resolved, proxy_service._HTTPBridgeOwnerForward)
+    assert resolved.owner_instance == "instance-b"
+    assert resolved.owner_endpoint == "http://instance-b"
+    assert resolved.key == key
+
+
+@pytest.mark.asyncio
 async def test_get_or_create_http_bridge_session_forwards_durable_parallel_lane_to_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

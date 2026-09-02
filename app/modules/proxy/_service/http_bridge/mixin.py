@@ -818,7 +818,7 @@ class _HTTPBridgeMixin(
                 )
                 if owner_check_required or key.affinity_kind == "prompt_cache":
                     owner_instance = _durable_bridge_lookup_active_owner(durable_lookup)
-                    hard_continuity_lookup = owner_check_required or previous_response_id is not None
+                    hard_continuity_lookup = owner_check_required or bool(incoming_turn_state or previous_response_id)
                     ring_lookup_failed = False
                     if key == locally_owned_fork_key:
                         owner_instance = settings.http_responses_session_bridge_instance_id
@@ -887,7 +887,7 @@ class _HTTPBridgeMixin(
                         if PROMETHEUS_AVAILABLE and bridge_owner_mismatch_total is not None:
                             bridge_owner_mismatch_total.labels(strength=_http_bridge_key_strength(key)).inc()
                         if (
-                            owner_check_required
+                            hard_continuity_lookup
                             and not (previous_response_id is not None and allow_previous_response_recovery_rebind)
                             and not allow_bootstrap_owner_rebind
                         ):
