@@ -3342,22 +3342,23 @@ async def test_usage_updater_marks_session_failures_as_reauth_required(
     assert acc.status == AccountStatus.REAUTH_REQUIRED
 
 
+@pytest.mark.parametrize("status_code", [401, 404])
 @pytest.mark.asyncio
-async def test_usage_updater_deactivates_on_401_account_deactivated_code(monkeypatch) -> None:
+async def test_usage_updater_deactivates_on_account_deactivated_code(monkeypatch, status_code: int) -> None:
     monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
     from app.core.clients.usage import UsageFetchError
     from app.core.config.settings import get_settings
 
     get_settings.cache_clear()
 
-    async def stub_fetch_usage_401_deactivated(**_: Any) -> UsagePayload:
+    async def stub_fetch_usage_deactivated(**_: Any) -> UsagePayload:
         raise UsageFetchError(
-            401,
+            status_code,
             "Your OpenAI account has been deactivated, please check your email for more information.",
             code="account_deactivated",
         )
 
-    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_401_deactivated)
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_deactivated)
 
     usage_repo = StubUsageRepository()
     accounts_repo = StubAccountsRepository()
@@ -3371,7 +3372,7 @@ async def test_usage_updater_deactivates_on_401_account_deactivated_code(monkeyp
     assert len(accounts_repo.status_updates) == 1
     update = accounts_repo.status_updates[0]
     assert update["status"] == AccountStatus.DEACTIVATED
-    assert "401" in update["deactivation_reason"]
+    assert str(status_code) in update["deactivation_reason"]
     assert "deactivated" in update["deactivation_reason"].lower()
 
 
@@ -3434,6 +3435,39 @@ async def test_usage_updater_cools_down_repeated_403_failures(monkeypatch) -> No
 
     assert fetch_calls == 1
     assert len(accounts_repo.status_updates) == 0
+
+
+@pytest.mark.asyncio
+async def test_usage_updater_cools_down_ambiguous_404_without_deactivation(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_AUTH_FAILURE_COOLDOWN_SECONDS", "300")
+    from app.core.clients.usage import UsageFetchError
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    fetch_calls = 0
+
+    async def stub_fetch_usage_404(**_: Any) -> UsagePayload:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        raise UsageFetchError(404, "Usage fetch failed (404)")
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_404)
+
+    usage_repo = StubUsageRepository()
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+
+    acc = _make_account("acc_404_cooldown", "workspace_404_cooldown", email="missing@example.com")
+    accounts_repo.accounts_by_id[acc.id] = acc
+
+    await updater.refresh_accounts([acc], latest_usage={})
+    await updater.refresh_accounts([acc], latest_usage={})
+
+    assert fetch_calls == 1
+    assert len(accounts_repo.status_updates) == 0
+    assert acc.status == AccountStatus.ACTIVE
 
 
 @pytest.mark.asyncio
