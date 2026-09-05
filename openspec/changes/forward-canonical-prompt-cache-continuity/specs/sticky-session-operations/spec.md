@@ -21,6 +21,7 @@ behavior.
 - **WHEN** the continuation arrives on replica B
 - **THEN** replica B forwards the request internally to replica A
 - **AND** it does not attempt to claim the canonical bridge locally
+- **AND** replica B leaves no local inflight creation reservation for the forwarded bridge key
 
 #### Scenario: Previous-response continuation forwards to the canonical prompt-cache owner
 

@@ -1298,7 +1298,8 @@ class _HTTPBridgeMixin(
                                 model_class=_extract_model_class(request_model) if request_model else None,
                                 owner_check_applied=owner_check_required,
                             )
-                    elif session_to_return_after_close is None and inflight_future is None:
+                    elif session_to_return_after_close is None and inflight_future is None and owner_forward is None:
+                        # Owner forwards never resolve a local inflight reservation; skip admission.
                         # Detached generations remain globally capacity-owned
                         # until close finalization. This request may discount
                         # only the idle generations it has committed to close
